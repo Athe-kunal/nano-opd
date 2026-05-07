@@ -57,8 +57,7 @@ def load_sciknoweval(
 
 
 
-def split_tasks(json_path: str, output_dir: str, test_ratio: float = 0.1, seed: int = 42):
-    ds = datasets.load_dataset("json", data_files=json_path, split="train")
+def split_tasks(ds: Dataset, output_dir: str, test_ratio: float = 0.1, seed: int = 42):
     split_ds = ds.train_test_split(test_size=test_ratio, seed=seed)
 
     output_dir = pathlib.Path(output_dir)
@@ -71,22 +70,6 @@ def split_tasks(json_path: str, output_dir: str, test_ratio: float = 0.1, seed: 
     print(f"Test:  {len(split_ds['test'])} samples  → {output_dir / 'test.json'}")
 
 if __name__ == '__main__':
-    from datasets import load_dataset
-    import pathlib
-
-    # ── Step 1: Load each domain ──────────────────────────────────────────────────
-
-    def load_sciknoweval(domains=None, levels=None, types=None):
-        ds = load_dataset("hicai-zju/SciKnowEval", split="test")
-        if domains:
-            ds = ds.filter(lambda x: x["domain"] in domains)
-        if levels:
-            ds = ds.filter(lambda x: x["details"]["level"] in levels)
-        if types:
-            ds = ds.filter(lambda x: x["type"] in types)
-        return ds.map(format, remove_columns=ds.column_names)
-
-
     domains = ["Biology", "Chemistry", "Material", "Physics"]
 
     for domain in domains:
@@ -95,15 +78,6 @@ if __name__ == '__main__':
             levels=["L3"],
             types=["mcq-4-choices", "mcq-2-choices"],
         )
-        out_path = f"datasets/sciknoweval/{domain.lower()}/{domain.lower()}.json"
-        pathlib.Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-        ds.to_json(out_path)
-        print(f"{domain}: {len(ds)} samples saved to {out_path}")
-
-
-    # ── Step 2: Split each domain into train / test ───────────────────────────────
-
-    for domain in domains:
-        json_path = f"datasets/sciknoweval/{domain.lower()}/{domain.lower()}.json"
         output_dir = f"datasets/sciknoweval/{domain.lower()}"
-        split_tasks(json_path=json_path, output_dir=output_dir, test_ratio=0.1, seed=42)
+        split_tasks(ds, output_dir=output_dir, test_ratio=0.1, seed=42)
+        print(f"{domain}: {len(ds)} samples")

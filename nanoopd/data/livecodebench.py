@@ -89,16 +89,12 @@ def sample_tests(example):
     return example
 
 
-def main(data_path, output_dir):
+def main(ds: datasets.Dataset, output_dir: str):
     np.random.seed(0)
     os.makedirs(output_dir, exist_ok=True)
 
-    ds = datasets.load_dataset("json", data_files=data_path, split="train")
-
-    # test.json = full dataset (all tests)
     ds.to_json(os.path.join(output_dir, "test.json"))
 
-    # train.json = reduced dataset (50% of tests per problem)
     ds_reduced = ds.map(sample_tests)
     ds_reduced.to_json(os.path.join(output_dir, "train.json"))
 
@@ -108,13 +104,7 @@ def main(data_path, output_dir):
 if __name__ == '__main__':
     from datetime import datetime
 
-    # 1. Load the dataset
     ds = load_livecodebench(dataset_split="test", until=datetime(2025, 5, 1))
-
-    # 2. Save to JSON
-    ds.to_json("datasets/lcb_v6.json")
-
-    # 3. Split: test = all tests, train = 50% of tests per problem
-    main(data_path="datasets/lcb_v6.json", output_dir="datasets/lcb_v6")
+    main(ds, output_dir="datasets/lcb_v6")
     # → datasets/lcb_v6/train.json
     # → datasets/lcb_v6/test.json

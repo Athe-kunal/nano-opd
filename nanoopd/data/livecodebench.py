@@ -1,18 +1,22 @@
 import os, copy
 import numpy as np
-import datasets
-from datasets import concatenate_datasets, load_dataset, Dataset
 import base64, json, pickle, zlib
 from datetime import datetime
+from datasets import concatenate_datasets, load_dataset, Dataset
 
 LCB_TEST_CUTOFF = datetime(2025, 2, 1)
 LCB_TRAIN_CUTOFF = datetime(2025, 2, 1)
 TIME_LIMIT = 6
 PERCENTAGE_TO_KEEP = 0.5
 
+CODE_PROMPT = """You are a coding expert. You will be given a coding problem, and you need to write a correct Python program that matches the specification and passes all tests. The time limit is 1 second. You may start by outlining your thought process. In the end, please provide the complete code in a code block enclosed with ```.
+
+{problem}"""
+
 
 def _parse_signature(starter_code: str) -> str:
-    return "def " + starter_code.split("def ")[1].split("Input\n")[0].strip()
+    after_def = starter_code.split("def ")[1]
+    return "def " + (after_def.split("Input\n")[0] if "Input\n" in after_def else after_def).strip()
 
 
 def _translate_private_test_cases(encoded_data, fn_name: str):
@@ -29,7 +33,7 @@ def _translate_private_test_cases(encoded_data, fn_name: str):
     }, ensure_ascii=False)
 
 
-def load_livecodebench(dataset_split: str, until: datetime = None) -> Dataset:
+def load_livecodebench(dataset_split: str, until: datetime | None = None) -> Dataset:
     ds = load_dataset(
         "livecodebench/code_generation_lite",
         split="test",
@@ -59,6 +63,7 @@ def load_livecodebench(dataset_split: str, until: datetime = None) -> Dataset:
             "dataset": "livecodebench",
             "description": problem,
             "problem": problem,
+            "prompt": CODE_PROMPT.format(problem=problem),
             "tests": _translate_private_test_cases(ex["private_test_cases"], fn_name=fn_name),
         }
 
@@ -69,7 +74,6 @@ def load_livecodebench(dataset_split: str, until: datetime = None) -> Dataset:
         processed_shards.append(shard)
 
     return concatenate_datasets(processed_shards)
-
 
 
 def sample_tests(example):
@@ -89,7 +93,11 @@ def sample_tests(example):
     return example
 
 
-def main(ds: datasets.Dataset, output_dir: str):
+def split_and_save(ds: Dataset, output_dir: str):
+    """
+    test.json  → full test suite per problem (for evaluation)
+    train.json → 50% of tests per problem (for RL training)
+    """
     np.random.seed(0)
     os.makedirs(output_dir, exist_ok=True)
 
@@ -101,10 +109,9 @@ def main(ds: datasets.Dataset, output_dir: str):
     print(f"Test set:  {len(ds)} problems, full tests")
     print(f"Train set: {len(ds_reduced)} problems, {PERCENTAGE_TO_KEEP:.0%} of tests kept")
 
-if __name__ == '__main__':
-    from datetime import datetime
 
+if __name__ == "__main__":
     ds = load_livecodebench(dataset_split="test", until=datetime(2025, 5, 1))
-    main(ds, output_dir="datasets/lcb_v6")
-    # → datasets/lcb_v6/train.json
-    # → datasets/lcb_v6/test.json
+    split_and_save(ds, output_dir="datasets/lcb_v6")
+    # → datasets/lcb_v6/test.json   (full tests, for eval)
+    # → datasets/lcb_v6/train.json  (50% tests, for RL training)

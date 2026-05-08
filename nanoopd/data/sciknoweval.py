@@ -51,7 +51,19 @@ def load_sciknoweval(
     if types:
         ds = ds.filter(lambda x: x['type'] in types)
 
-    return ds.map(format, remove_columns=ds.column_names)
+    ds = ds.map(format, remove_columns=ds.column_names)
+
+    # The raw dataset generates multiple MCQ variants from the same question stem.
+    # Deduplicate by description so each underlying question appears only once.
+    seen = set()
+    def _is_unique(row):
+        if row["description"] in seen:
+            return False
+        seen.add(row["description"])
+        return True
+
+    return ds.filter(_is_unique)
+
 
 
 

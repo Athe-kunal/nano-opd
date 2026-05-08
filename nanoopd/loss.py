@@ -4,7 +4,7 @@ def _masked_token_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor
     """token-mean: sum over all response tokens / count of response tokens."""
     return (values * mask).sum() / mask.sum().clamp(min=1)
 
-def compute_opd_loss(
+def compute_reverse_kl_loss(
     student_logprobs: torch.Tensor,   # [B, seq_len-1, V] — log probs
     teacher_logprobs: torch.Tensor,   # [B, seq_len-1, V] — log probs
     response_mask: torch.Tensor,      # [B, seq_len-1]

@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 
 import json
 import random
@@ -47,7 +48,7 @@ _ADAPTERS: dict[str, Callable[[dict], Example]] = {
 }
 
 
-class JSONLDataset:
+class JSONLOPDDataset:
     """Loads a JSONL file and exposes Example items."""
 
     def __init__(self, path: str, adapter: str | None = None):
@@ -70,7 +71,7 @@ class JSONLDataset:
         return self._examples[idx]
 
 
-class _IndexedRLDataset:
+class _IndexedOPDDataset:
     """Wraps an existing list of Examples as an indexable dataset."""
 
     def __init__(self, examples: list[Example]):
@@ -83,8 +84,8 @@ class _IndexedRLDataset:
         return self._examples[idx]
 
 
-def distributed_loader(
-    dataset: JSONLDataset | _IndexedRLDataset,
+def distributed_opd_loader(
+    dataset: JSONLOPDDataset | _IndexedOPDDataset,
     prompts_per_step: int,
     world_size: int,
     rank: int,
@@ -121,3 +122,11 @@ def distributed_loader(
         examples = [dataset[i] for i in rank_idx]
         cursor += prompts_per_step
         yield examples, {"epoch": epoch, "cursor": cursor}
+
+OPD_DATASET_PATH = os.environ.get("OPD_DATASET_PATH", "/local-ssd/mh3897/data/rl/dapo_math_17k.jsonl")
+
+
+def build_opd_dataset() -> JSONLOPDDataset:
+    if not os.path.exists(OPD_DATASET_PATH):
+        raise FileNotFoundError(f"OPD dataset not found on disk: {OPD_DATASET_PATH}")
+    return JSONLOPDDataset(OPD_DATASET_PATH)

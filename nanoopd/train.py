@@ -7,12 +7,17 @@ from typing import Literal
 
 import torch
 import torch.distributed as dist
-import wandb
 from omegaconf import OmegaConf
 
 from nanoopd.common import compute_init, compute_cleanup, print0, autodetect_device_type
 from nanoopd.loss import compute_reverse_kl_loss, compute_forward_kl_loss, ALGORITHMS
 from nanoopd.fsdp.model import TeacherModel, StudentModel
+from nanoopd.fsdp.algorithms import (
+    student_topk_indices,
+    teacher_logprobs_at_indices,
+    teacher_topk_logprobs,
+    student_logprobs_at_indices,
+)
 from nanoopd.rollout import (
     generate_rollouts_remote,
     remote_vllm_init_weight_transfer,
@@ -71,6 +76,10 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
+    use_wandb = os.environ.get("USE_WANDB", "1").strip().lower() not in ("0", "false", "no")
+    if use_wandb:
+        import wandb
+
     # -----------------------------------------------------------------------------
     # Distributed init
     device_type = autodetect_device_type() if args.device_type == "" else args.device_type
@@ -93,7 +102,7 @@ if __name__ == "__main__":
     print0(f"Algorithm: {args.algorithm}  distill-top-k: {args.distill_top_k}")
     print0(f"Device: {device}  Student ranks: {train_world_size}  Total world: {ddp_world_size}")
 
-    if master_process:
+    if master_process and use_wandb:
         wandb.init(
             project="nano-opd",
             name=args.run_name,
@@ -281,32 +290,28 @@ if __name__ == "__main__":
                 # tensor, reducing per-minibatch communication by ~vocab/K (>1000×).
                 K = args.distill_top_k
                 T_shifted = T_mb - 1
+                s_chunk = args.student_chunk_size
+                t_chunk = args.teacher_chunk_size
 
                 if select_topk_by == "student":
                     # Student selects top-K indices; teacher gathers at those indices.
                     if is_student:
-                        with torch.no_grad():
-                            _, topk_idx = student_logits.topk(K, dim=-1)
+                        topk_idx = student_topk_indices(student_logits, K, s_chunk)
                     else:
                         topk_idx = torch.empty(B_mb, T_shifted, K, dtype=torch.long, device=device)
                     dist.broadcast(topk_idx, src=0, group=all_group)
 
                     if is_teacher:
-                        with torch.no_grad():
-                            t_logits = teacher.get_logits(mb_ids, mb_attn)[:, :-1]
-                            t_lse = torch.logsumexp(t_logits, dim=-1)
-                            t_logprobs = t_logits.gather(-1, topk_idx) - t_lse.unsqueeze(-1)
+                        t_logits = teacher.get_logits(mb_ids, mb_attn)[:, :-1]
+                        t_logprobs = teacher_logprobs_at_indices(t_logits, topk_idx, t_chunk)
                     else:
                         t_logprobs = torch.empty(B_mb, T_shifted, K, dtype=torch.bfloat16, device=device)
                     dist.broadcast(t_logprobs, src=teacher_global_rank, group=all_group)
 
                 else:  # forward_kl: teacher selects top-K
                     if is_teacher:
-                        with torch.no_grad():
-                            t_logits = teacher.get_logits(mb_ids, mb_attn)[:, :-1]
-                            t_lse = torch.logsumexp(t_logits, dim=-1)
-                            _, topk_idx = t_logits.topk(K, dim=-1)
-                            t_logprobs = t_logits.gather(-1, topk_idx) - t_lse.unsqueeze(-1)
+                        t_logits = teacher.get_logits(mb_ids, mb_attn)[:, :-1]
+                        topk_idx, t_logprobs = teacher_topk_logprobs(t_logits, K, t_chunk)
                     else:
                         topk_idx = torch.empty(B_mb, T_shifted, K, dtype=torch.long, device=device)
                         t_logprobs = torch.empty(B_mb, T_shifted, K, dtype=torch.bfloat16, device=device)
@@ -315,8 +320,7 @@ if __name__ == "__main__":
 
                 # -- Student: compute loss and backward --
                 if is_student:
-                    s_lse = torch.logsumexp(student_logits, dim=-1)        # [B, T-1] — keep grad
-                    s_logprobs = student_logits.gather(-1, topk_idx) - s_lse.unsqueeze(-1)
+                    s_logprobs = student_logprobs_at_indices(student_logits, topk_idx, s_chunk)
                     shift_mask = mb_mask[:, 1:]                             # [B, T-1]
                     loss = loss_fn(s_logprobs, t_logprobs, shift_mask)
                     student._scale_loss(loss).backward()
@@ -338,18 +342,19 @@ if __name__ == "__main__":
             dt = time.time() - t0
             avg_loss   = total_loss / max(n_batches, 1)
             current_lr = student.scheduler.get_last_lr()[0] if student.scheduler is not None else args.lr
+            tokens     = input_ids.numel()
             print0(
                 f"step {step + 1:4d}/{args.num_steps} | loss {avg_loss:.4f} "
-                f"| lr {current_lr:.2e} | dt {dt:.1f}s"
+                f"| lr {current_lr:.2e} | tokens {tokens} | dt {dt:.1f}s"
             )
 
-            if master_process:
+            if master_process and use_wandb:
                 wandb.log(
                     {
                         "train/loss": avg_loss,
                         "train/learning_rate": current_lr,
                         "train/step_time_s": dt,
-                        "train/tokens_per_step": input_ids.numel(),
+                        "train/tokens_per_step": tokens,
                     },
                     step=step + 1,
                 )
@@ -373,5 +378,5 @@ if __name__ == "__main__":
         dist.barrier(group=all_group)
 
     compute_cleanup()
-    if master_process:
+    if master_process and use_wandb:
         wandb.finish()

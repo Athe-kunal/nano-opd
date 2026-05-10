@@ -123,7 +123,7 @@ class RolloutState:
         logger.info("In-place vLLM update completed and prefix cache reset.")
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "nanochat-rollout-worker/0.1"
+    server_version = "nanoopd-rollout-worker/0.1"
 
     def _read_json(self):
         length = int(self.headers.get("Content-Length", "0"))
@@ -196,7 +196,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="nanochat rollout worker")
+    parser = argparse.ArgumentParser(description="nanoopd rollout worker")
     parser.add_argument("--model", type=str, required=True)
     parser.add_argument("--tokenizer", type=str, default="")
     parser.add_argument("--host", type=str, default="127.0.0.1")

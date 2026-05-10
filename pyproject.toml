@@ -1,5 +1,5 @@
 [project]
-name = "nanochat"
+name = "nanoopd"
 version = "0.1.0"
 description = "Nano library for On-policy distillation"
 readme = "README.md"

@@ -220,3 +220,5 @@ __marimo__/
 datasets/
 
 wandb/
+
+.nanoopd/

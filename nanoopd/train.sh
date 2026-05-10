@@ -10,17 +10,19 @@ BASE_DIR="${NANOCHAT_BASE_DIR:-$ROOT_DIR/.nanoopd}"
 STUDENT_MODEL="${STUDENT_MODEL:-Qwen/Qwen2.5-1.5B-Instruct}"
 TEACHER_MODEL="${TEACHER_MODEL:-open-thoughts/OpenThinker3-7B}"
 
-# GPU assignment (comma-separated physical GPU IDs, must not overlap)
+# GPU assignment (comma-separated physical GPU IDs)
+#   TRAIN_GPUS must not overlap ROLLOUT_GPUS or TEACHER_GPUS (enforced below).
+#   ROLLOUT_GPUS and TEACHER_GPUS may be the same list to colocate vLLM + teacher.
 #   ROLLOUT_GPUS  – vLLM rollout worker
 #   TRAIN_GPUS    – student FSDP training ranks
-#   TEACHER_GPUS  – teacher model ranks (fully separate from TRAIN_GPUS)
-ROLLOUT_GPUS="${ROLLOUT_GPUS:-1}"
+#   TEACHER_GPUS  – teacher model ranks
+ROLLOUT_GPUS="${ROLLOUT_GPUS:-2}"
 TRAIN_GPUS="${TRAIN_GPUS:-3}"
 TEACHER_GPUS="${TEACHER_GPUS:-2}"
 
 ROLLOUT_HOST="${ROLLOUT_HOST:-127.0.0.1}"
 ROLLOUT_PORT="${ROLLOUT_PORT:-8047}"
-ROLLOUT_GPU_MEM_UTIL="${ROLLOUT_GPU_MEM_UTIL:-0.9}"
+ROLLOUT_GPU_MEM_UTIL="${ROLLOUT_GPU_MEM_UTIL:-0.4}"
 WEIGHT_TRANSFER_BACKEND="${WEIGHT_TRANSFER_BACKEND:-nccl}"
 
 NUM_STEPS="${NUM_STEPS:-200}"
@@ -44,7 +46,7 @@ EVAL_MAX_TOKENS="${EVAL_MAX_TOKENS:-4096}"
 #   NO_SHARD            replicate everything (like DDP)
 #   HYBRID_SHARD        FULL_SHARD within a node, replicate across nodes
 #   _HYBRID_SHARD_ZERO2 SHARD_GRAD_OP within a node, replicate across nodes
-SHARDING_STRATEGY="${SHARDING_STRATEGY:-FULL_SHARD}"
+SHARDING_STRATEGY="${SHARDING_STRATEGY:-NO_SHARD}"
 
 RUN_DIR="$BASE_DIR/opd/$TAG"
 SAVE_DIR="$RUN_DIR/checkpoints"
@@ -67,7 +69,7 @@ ROLLOUT_TP="${#ROLLOUT_GPU_LIST[@]}"
 TEACHER_NPROC="${#TEACHER_GPU_LIST[@]}"
 TOTAL_NPROC=$(( TRAIN_NPROC + TEACHER_NPROC ))
 
-# All GPU lists must be pairwise disjoint
+# TRAIN_GPUS must be disjoint from ROLLOUT_GPUS and TEACHER_GPUS (rollout/teacher may share)
 for tgpu in "${TRAIN_GPU_LIST[@]}"; do
   for rgpu in "${ROLLOUT_GPU_LIST[@]}"; do
     if [[ "$tgpu" == "$rgpu" ]]; then

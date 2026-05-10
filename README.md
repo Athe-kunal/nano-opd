@@ -22,11 +22,17 @@ The script takes an optional **run tag** as the first argument (default: `defaul
 
 ### GPUs
 
-Comma-separated physical IDs; the three lists **must not overlap**.
+Comma-separated physical IDs. **`TRAIN_GPUS` must not overlap** with **`ROLLOUT_GPUS`** or **`TEACHER_GPUS`** (the launcher checks this). **`ROLLOUT_GPUS`** and **`TEACHER_GPUS`** **may reuse the same IDs** if you want to **colocate** the vLLM rollout worker and the teacher on the same GPUs; give them disjoint IDs if you want those roles on separate devices.
+
+Example (student on GPU 3; teacher and rollouts both on GPU 2):
+
+```bash
+ROLLOUT_GPUS=2 TRAIN_GPUS=3 TEACHER_GPUS=2 bash nanoopd/train.sh
+```
 
 - **`ROLLOUT_GPUS`** — GPUs for the vLLM rollout worker (student sampling). Multiple IDs set tensor-parallel size for rollout.
 - **`TRAIN_GPUS`** — GPUs for FSDP student training (`torchrun` ranks for the student).
-- **`TEACHER_GPUS`** — Separate GPUs for the teacher forward passes.
+- **`TEACHER_GPUS`** — GPUs for the teacher forward passes (can match `ROLLOUT_GPUS` to colocate with vLLM).
 
 ### Rollout worker
 

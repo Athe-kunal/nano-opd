@@ -123,7 +123,7 @@ echo "[launcher] sharding        : $SHARDING_STRATEGY"
 # Start vLLM rollout worker
 echo "[launcher] starting rollout worker -> $WORKER_LOG"
 CUDA_VISIBLE_DEVICES="$ROLLOUT_GPUS" \
-  python "$ROOT_DIR/nanoopd/rollout_worker.py" \
+  uv run --extra gpu python "$ROOT_DIR/nanoopd/rollout_worker.py" \
     --model "$STUDENT_MODEL" \
     --host "$ROLLOUT_HOST" \
     --port "$ROLLOUT_PORT" \
@@ -150,7 +150,7 @@ curl -sf "$HEALTH_URL" | grep -q '"ok": *true' \
 # Start student trainer
 echo "[launcher] starting trainer -> $TRAIN_LOG"
 CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" \
-  torchrun --standalone --nproc_per_node="$TRAIN_NPROC" \
+  uv run --extra gpu torchrun --standalone --nproc_per_node="$TRAIN_NPROC" \
     nanoopd/train.py \
     --student-model "$STUDENT_MODEL" \
     --teacher-model "$TEACHER_MODEL" \

@@ -3,19 +3,20 @@ set -euo pipefail
 
 TAG="${1:-default}"
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-BASE_DIR="${NANOCHAT_BASE_DIR:-$ROOT_DIR/.nanochat}"
+# Repo root is one level above this script (nanoopd/train.sh -> nano-opd/).
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BASE_DIR="${NANOCHAT_BASE_DIR:-$ROOT_DIR/.nanoopd}"
 
 STUDENT_MODEL="${STUDENT_MODEL:-Qwen/Qwen2.5-1.5B-Instruct}"
-TEACHER_MODEL="${TEACHER_MODEL:-Qwen/Qwen2.5-7B-Instruct}"
+TEACHER_MODEL="${TEACHER_MODEL:-open-thoughts/OpenThinker3-7B}"
 
 # GPU assignment (comma-separated physical GPU IDs, must not overlap)
 #   ROLLOUT_GPUS  – vLLM rollout worker
 #   TRAIN_GPUS    – student FSDP training ranks
 #   TEACHER_GPU   – single GPU (must be in TRAIN_GPUS) that loads the teacher
-ROLLOUT_GPUS="${ROLLOUT_GPUS:-0}"
-TRAIN_GPUS="${TRAIN_GPUS:-1,2,3,4}"
-TEACHER_GPU="${TEACHER_GPU:-1}"
+ROLLOUT_GPUS="${ROLLOUT_GPUS:-1}"
+TRAIN_GPUS="${TRAIN_GPUS:-2,3}"
+TEACHER_GPU="${TEACHER_GPU:-2}"
 
 ROLLOUT_HOST="${ROLLOUT_HOST:-127.0.0.1}"
 ROLLOUT_PORT="${ROLLOUT_PORT:-8047}"
@@ -32,6 +33,16 @@ MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-2048}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-3072}"
 ALGORITHM="${ALGORITHM:-reverse_kl}"
 DISTILL_TOP_K="${DISTILL_TOP_K:-100}"
+EVAL_EVERY="${EVAL_EVERY:-0}"
+EVAL_K="${EVAL_K:-4}"
+EVAL_MAX_TOKENS="${EVAL_MAX_TOKENS:-4096}"
+# FSDP sharding strategy — choose one of:
+#   FULL_SHARD          params+grads+optimizer sharded; unshard around fwd/bwd
+#   SHARD_GRAD_OP       params sharded; keep unsharded after fwd until bwd done
+#   NO_SHARD            replicate everything (like DDP)
+#   HYBRID_SHARD        FULL_SHARD within a node, replicate across nodes
+#   _HYBRID_SHARD_ZERO2 SHARD_GRAD_OP within a node, replicate across nodes
+SHARDING_STRATEGY="${SHARDING_STRATEGY:-FULL_SHARD}"
 
 RUN_DIR="$BASE_DIR/opd/$TAG"
 SAVE_DIR="$RUN_DIR/checkpoints"
@@ -106,6 +117,7 @@ echo "[launcher] teacher model   : $TEACHER_MODEL  (GPU $TEACHER_GPU → rank $T
 echo "[launcher] train GPUs      : $TRAIN_GPUS  ($TRAIN_NPROC ranks)"
 echo "[launcher] rollout GPUs    : $ROLLOUT_GPUS  (tp=$ROLLOUT_TP)"
 echo "[launcher] algorithm       : $ALGORITHM"
+echo "[launcher] sharding        : $SHARDING_STRATEGY"
 
 # ---------------------------------------------------------------------------
 # Start vLLM rollout worker
@@ -154,7 +166,11 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" \
     --max-new-tokens "$MAX_NEW_TOKENS" \
     --max-seq-len "$MAX_SEQ_LEN" \
     --lr "$LR" \
+    --sharding-strategy "$SHARDING_STRATEGY" \
     --save-dir "$SAVE_DIR" \
     --save-every "$SAVE_EVERY" \
+    --eval-every "$EVAL_EVERY" \
+    --eval-k "$EVAL_K" \
+    --eval-max-tokens "$EVAL_MAX_TOKENS" \
     --run-name "$TAG" \
     2>&1 | tee "$TRAIN_LOG"

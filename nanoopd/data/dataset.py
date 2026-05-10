@@ -10,7 +10,7 @@ from typing import Iterator, Callable
 @dataclass
 class Example:
     prompt: str
-    kind: str          # "mcq" | "code"
+    kind: str          # "mcq" | "code" | "math"
     dataset: str
     description: str
     system: str | None = None   # system prompt; present for sciknoweval
@@ -42,9 +42,22 @@ def _adapt_lcb(row: dict) -> Example:
     )
 
 
+def _adapt_dapo(row: dict) -> Example:
+    return Example(
+        prompt=row["prompt"],
+        kind=row["kind"],
+        dataset=row["dataset"],
+        description=row["description"],
+        system=row.get("system"),
+        answer=row.get("answer"),
+        tests=row.get("tests"),
+    )
+
+
 _ADAPTERS: dict[str, Callable[[dict], Example]] = {
     "sciknoweval": _adapt_sciknoweval,
     "livecodebench": _adapt_lcb,
+    "dapo": _adapt_dapo,
 }
 
 

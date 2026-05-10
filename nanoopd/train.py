@@ -1,5 +1,4 @@
 
-import os
 import time
 import argparse
 import socket as _socket
@@ -7,6 +6,7 @@ from typing import Literal
 
 import torch
 import torch.distributed as dist
+import wandb
 from omegaconf import OmegaConf
 
 from nanoopd.common import compute_init, compute_cleanup, print0, autodetect_device_type
@@ -21,6 +21,7 @@ from nanoopd.rollout import (
     wait_for_rollout_worker,
 )
 from nanoopd.data.dataset import distributed_opd_loader, build_opd_dataset
+from nanoopd.eval_aime import run_eval
 
 if __name__ == "__main__":
 
@@ -58,6 +59,9 @@ if __name__ == "__main__":
     parser.add_argument("--run-name", type=str, default="dummy")
     parser.add_argument("--save-dir", type=str, default="opd_checkpoints")
     parser.add_argument("--save-every", type=int, default=0)
+    parser.add_argument("--eval-every", type=int, default=0, help="Eval on AIME every N steps (0=disabled)")
+    parser.add_argument("--eval-k", type=int, default=4, help="Number of samples per problem for pass@k eval")
+    parser.add_argument("--eval-max-tokens", type=int, default=4096, help="Max tokens for eval generation")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
@@ -71,6 +75,30 @@ if __name__ == "__main__":
     print0(f"Teacher: {args.teacher_model}")
     print0(f"Algorithm: {args.algorithm}  distill-top-k: {args.distill_top_k}")
     print0(f"Device: {device}  World size: {ddp_world_size}")
+
+    if master_process:
+        wandb.init(
+            project="nano-opd",
+            name=args.run_name,
+            config={
+                "student_model": args.student_model,
+                "teacher_model": args.teacher_model,
+                "algorithm": args.algorithm,
+                "distill_top_k": args.distill_top_k,
+                "lr": args.lr,
+                "weight_decay": args.weight_decay,
+                "max_grad_norm": args.max_grad_norm,
+                "num_steps": args.num_steps,
+                "prompts_per_step": args.prompts_per_step,
+                "train_batch_size": args.train_batch_size,
+                "epochs": args.epochs,
+                "num_samples": args.num_samples,
+                "max_new_tokens": args.max_new_tokens,
+                "max_seq_len": args.max_seq_len,
+                "temperature": args.temperature,
+                "sharding_strategy": args.sharding_strategy,
+            },
+        )
 
     assert args.prompts_per_step % ddp_world_size == 0, (
         f"prompts_per_step ({args.prompts_per_step}) must be divisible by "
@@ -175,7 +203,7 @@ if __name__ == "__main__":
         total_loss = 0.0
         n_batches  = 0
 
-        for _ in range(args.epochs):
+        for _epoch in range(args.epochs):
             perm = torch.randperm(input_ids.shape[0], device=device)
             for start in range(0, input_ids.shape[0], args.train_batch_size):
                 idx     = perm[start : start + args.train_batch_size]
@@ -222,11 +250,36 @@ if __name__ == "__main__":
         )
 
         dt = time.time() - t0
-        print0(f"step {step + 1:4d}/{args.num_steps} | loss {total_loss / max(n_batches, 1):.4f} | dt {dt:.1f}s")
+        avg_loss = total_loss / max(n_batches, 1)
+        current_lr = student.scheduler.get_last_lr()[0] if student.scheduler is not None else args.lr
+        print0(f"step {step + 1:4d}/{args.num_steps} | loss {avg_loss:.4f} | lr {current_lr:.2e} | dt {dt:.1f}s")
+
+        if master_process:
+            wandb.log(
+                {
+                    "train/loss": avg_loss,
+                    "train/learning_rate": current_lr,
+                    "train/step_time_s": dt,
+                    "train/tokens_per_step": input_ids.numel(),
+                },
+                step=step + 1,
+            )
 
         if args.save_every > 0 and (step + 1) % args.save_every == 0:
             save_path = f"{args.save_dir}/step_{step + 1}"
             student.save_model(save_path)
             print0(f"Saved checkpoint to {save_path}")
 
+        if args.eval_every > 0 and (step + 1) % args.eval_every == 0:
+            if master_process:
+                run_eval(
+                    rollout_worker_url=args.rollout_worker_url,
+                    tokenizer=student.tokenizer,
+                    eval_k=args.eval_k,
+                    eval_max_tokens=args.eval_max_tokens,
+                    step=step + 1,
+                )
+
     compute_cleanup()
+    if master_process:
+        wandb.finish()

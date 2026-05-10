@@ -12,7 +12,6 @@ from torch.distributed.checkpoint.state_dict import (
 )
 from transformers import get_scheduler, AutoTokenizer
 from .data_parallelism import prepare_dp_model
-from .tensor_parallelism import prepare_tp_model
 
 class FSDPWoker:
     def __init__(self, config: DictConfig, train: bool):

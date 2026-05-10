@@ -5,7 +5,7 @@ TAG="${1:-default}"
 
 # Repo root is one level above this script (nanoopd/train.sh -> nano-opd/).
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BASE_DIR="${NANOCHAT_BASE_DIR:-$ROOT_DIR/.nanoopd}"
+BASE_DIR="${NANOOPD_BASE_DIR:-$ROOT_DIR/.nanoopd}"
 
 STUDENT_MODEL="${STUDENT_MODEL:-Qwen/Qwen2.5-1.5B-Instruct}"
 TEACHER_MODEL="${TEACHER_MODEL:-open-thoughts/OpenThinker3-7B}"
@@ -24,6 +24,8 @@ ROLLOUT_HOST="${ROLLOUT_HOST:-127.0.0.1}"
 ROLLOUT_PORT="${ROLLOUT_PORT:-8047}"
 ROLLOUT_GPU_MEM_UTIL="${ROLLOUT_GPU_MEM_UTIL:-0.95}"
 WEIGHT_TRANSFER_BACKEND="${WEIGHT_TRANSFER_BACKEND:-nccl}"
+
+USE_WANDB="${USE_WANDB:-1}"
 
 NUM_STEPS="${NUM_STEPS:-200}"
 SAVE_EVERY="${SAVE_EVERY:-20}"
@@ -54,9 +56,10 @@ WORKER_LOG="$RUN_DIR/rollout_worker.log"
 TRAIN_LOG="$RUN_DIR/train.log"
 
 export PYTHONPATH="$ROOT_DIR"
-export NANOCHAT_BASE_DIR="$BASE_DIR"
+export NANOOPD_BASE_DIR="$BASE_DIR"
 export ROLLOUT_HOST
 export ROLLOUT_PORT
+export USE_WANDB
 
 # ---------------------------------------------------------------------------
 # Parse GPU lists
@@ -68,6 +71,12 @@ TRAIN_NPROC="${#TRAIN_GPU_LIST[@]}"
 ROLLOUT_TP="${#ROLLOUT_GPU_LIST[@]}"
 TEACHER_NPROC="${#TEACHER_GPU_LIST[@]}"
 TOTAL_NPROC=$(( TRAIN_NPROC + TEACHER_NPROC ))
+
+# Exactly one teacher rank is supported; the broadcast src is hard-coded to train_world_size.
+if (( TEACHER_NPROC != 1 )); then
+  echo "TEACHER_GPUS must specify exactly 1 GPU (got $TEACHER_NPROC: $TEACHER_GPUS). Multi-teacher rank is not supported." >&2
+  exit 1
+fi
 
 # TRAIN_GPUS must be disjoint from ROLLOUT_GPUS and TEACHER_GPUS (rollout/teacher may share)
 for tgpu in "${TRAIN_GPU_LIST[@]}"; do

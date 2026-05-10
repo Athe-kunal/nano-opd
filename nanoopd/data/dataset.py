@@ -136,7 +136,13 @@ def distributed_opd_loader(
         cursor += prompts_per_step
         yield examples, {"epoch": epoch, "cursor": cursor}
 
-OPD_DATASET_PATH = os.environ.get("OPD_DATASET_PATH", "/local-ssd/mh3897/data/rl/dapo_math_17k.jsonl")
+_opd_path = os.environ.get("OPD_DATASET_PATH")
+if _opd_path is None:
+    raise EnvironmentError(
+        "OPD_DATASET_PATH environment variable is required. "
+        "Set it to the path of your JSONL dataset file."
+    )
+OPD_DATASET_PATH: str = _opd_path
 
 
 def build_opd_dataset() -> JSONLOPDDataset:

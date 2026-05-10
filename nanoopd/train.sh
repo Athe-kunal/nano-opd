@@ -13,10 +13,10 @@ TEACHER_MODEL="${TEACHER_MODEL:-open-thoughts/OpenThinker3-7B}"
 # GPU assignment (comma-separated physical GPU IDs, must not overlap)
 #   ROLLOUT_GPUS  – vLLM rollout worker
 #   TRAIN_GPUS    – student FSDP training ranks
-#   TEACHER_GPU   – single GPU (must be in TRAIN_GPUS) that loads the teacher
+#   TEACHER_GPUS  – teacher model ranks (fully separate from TRAIN_GPUS)
 ROLLOUT_GPUS="${ROLLOUT_GPUS:-1}"
-TRAIN_GPUS="${TRAIN_GPUS:-2,3}"
-TEACHER_GPU="${TEACHER_GPU:-2}"
+TRAIN_GPUS="${TRAIN_GPUS:-3}"
+TEACHER_GPUS="${TEACHER_GPUS:-2}"
 
 ROLLOUT_HOST="${ROLLOUT_HOST:-127.0.0.1}"
 ROLLOUT_PORT="${ROLLOUT_PORT:-8047}"
@@ -33,6 +33,8 @@ MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-2048}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-4096}"
 ALGORITHM="${ALGORITHM:-reverse_kl}"
 DISTILL_TOP_K="${DISTILL_TOP_K:-100}"
+STUDENT_CHUNK_SIZE="${STUDENT_CHUNK_SIZE:--1}"
+TEACHER_CHUNK_SIZE="${TEACHER_CHUNK_SIZE:--1}"
 EVAL_EVERY="${EVAL_EVERY:-20}"
 EVAL_K="${EVAL_K:-4}"
 EVAL_MAX_TOKENS="${EVAL_MAX_TOKENS:-4096}"
@@ -55,14 +57,17 @@ export ROLLOUT_HOST
 export ROLLOUT_PORT
 
 # ---------------------------------------------------------------------------
-# Validate GPU assignments
+# Parse GPU lists
 IFS=, read -r -a TRAIN_GPU_LIST   <<< "$TRAIN_GPUS"
 IFS=, read -r -a ROLLOUT_GPU_LIST <<< "$ROLLOUT_GPUS"
+IFS=, read -r -a TEACHER_GPU_LIST <<< "$TEACHER_GPUS"
 
 TRAIN_NPROC="${#TRAIN_GPU_LIST[@]}"
 ROLLOUT_TP="${#ROLLOUT_GPU_LIST[@]}"
+TEACHER_NPROC="${#TEACHER_GPU_LIST[@]}"
+TOTAL_NPROC=$(( TRAIN_NPROC + TEACHER_NPROC ))
 
-# Rollout and train GPUs must not overlap
+# All GPU lists must be pairwise disjoint
 for tgpu in "${TRAIN_GPU_LIST[@]}"; do
   for rgpu in "${ROLLOUT_GPU_LIST[@]}"; do
     if [[ "$tgpu" == "$rgpu" ]]; then
@@ -70,40 +75,46 @@ for tgpu in "${TRAIN_GPU_LIST[@]}"; do
       exit 1
     fi
   done
+  for cgpu in "${TEACHER_GPU_LIST[@]}"; do
+    if [[ "$tgpu" == "$cgpu" ]]; then
+      echo "TRAIN_GPUS ($TRAIN_GPUS) and TEACHER_GPUS ($TEACHER_GPUS) must not overlap" >&2
+      exit 1
+    fi
+  done
 done
-
-# Compute the rank ID of TEACHER_GPU within TRAIN_GPUS
-TEACHER_RANK_ID=""
-for i in "${!TRAIN_GPU_LIST[@]}"; do
-  if [[ "${TRAIN_GPU_LIST[$i]}" == "$TEACHER_GPU" ]]; then
-    TEACHER_RANK_ID="$i"
-    break
-  fi
-done
-if [[ -z "$TEACHER_RANK_ID" ]]; then
-  echo "TEACHER_GPU ($TEACHER_GPU) must be one of TRAIN_GPUS ($TRAIN_GPUS)" >&2
-  exit 1
-fi
 
 # ---------------------------------------------------------------------------
 WORKER_PID=""
 
-kill_subtree() {
-  local pid=$1
+# Send signal to pid and all descendants (deepest first). Handles vLLM/workers
+# that are not in the setsid process group.
+kill_subtree_sig() {
+  local sig=$1
+  local pid=$2
   local children
   children=$(pgrep -P "$pid" 2>/dev/null) || true
   for child in $children; do
-    kill_subtree "$child"
+    kill_subtree_sig "$sig" "$child"
   done
-  kill -TERM "$pid" 2>/dev/null || true
+  kill -s "$sig" "$pid" 2>/dev/null || true
 }
 
 cleanup() {
-  if [[ -n "$WORKER_PID" ]]; then
-    echo "[launcher] killing rollout worker subtree (root pid=$WORKER_PID)"
-    kill_subtree "$WORKER_PID"
-    wait "$WORKER_PID" 2>/dev/null || true
+  if [[ -z "${WORKER_PID:-}" ]]; then
+    return
   fi
+  echo "[launcher] stopping rollout worker (pid/pgid=$WORKER_PID)"
+  # setsid makes WORKER_PID the session/process-group leader; kill the whole group first.
+  kill -TERM -- "-${WORKER_PID}" 2>/dev/null || true
+  kill_subtree_sig TERM "$WORKER_PID"
+  local _i=0
+  while kill -0 "$WORKER_PID" 2>/dev/null && ((_i < 15)); do
+    sleep 1
+    _i=$((_i + 1))
+  done
+  kill -KILL -- "-${WORKER_PID}" 2>/dev/null || true
+  kill_subtree_sig KILL "$WORKER_PID"
+  wait "$WORKER_PID" 2>/dev/null || true
 }
 
 trap cleanup EXIT INT TERM
@@ -113,16 +124,19 @@ mkdir -p "$RUN_DIR" "$SAVE_DIR"
 echo "[launcher] run tag         : $TAG"
 echo "[launcher] run dir         : $RUN_DIR"
 echo "[launcher] student model   : $STUDENT_MODEL"
-echo "[launcher] teacher model   : $TEACHER_MODEL  (GPU $TEACHER_GPU → rank $TEACHER_RANK_ID)"
-echo "[launcher] train GPUs      : $TRAIN_GPUS  ($TRAIN_NPROC ranks)"
+echo "[launcher] teacher model   : $TEACHER_MODEL"
+echo "[launcher] train GPUs      : $TRAIN_GPUS  ($TRAIN_NPROC student ranks)"
+echo "[launcher] teacher GPUs    : $TEACHER_GPUS  ($TEACHER_NPROC teacher ranks)"
 echo "[launcher] rollout GPUs    : $ROLLOUT_GPUS  (tp=$ROLLOUT_TP)"
 echo "[launcher] algorithm       : $ALGORITHM"
 echo "[launcher] sharding        : $SHARDING_STRATEGY"
 
 # ---------------------------------------------------------------------------
 # Start vLLM rollout worker
+# setsid: new session so WORKER_PID is a process-group leader; cleanup can
+# signal the whole group (uv, Python, vLLM workers) with kill -TERM -- -PID.
 echo "[launcher] starting rollout worker -> $WORKER_LOG"
-CUDA_VISIBLE_DEVICES="$ROLLOUT_GPUS" \
+setsid env CUDA_VISIBLE_DEVICES="$ROLLOUT_GPUS" \
   uv run --extra gpu python "$ROOT_DIR/nanoopd/rollout_worker.py" \
     --model "$STUDENT_MODEL" \
     --host "$ROLLOUT_HOST" \
@@ -147,16 +161,20 @@ curl -sf "$HEALTH_URL" | grep -q '"ok": *true' \
   || { echo "[launcher] rollout worker did not become healthy" >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
-# Start student trainer
+# Start student trainer + teacher
+# torchrun world: ranks 0..(TRAIN_NPROC-1) = student, ranks TRAIN_NPROC..(TOTAL_NPROC-1) = teacher.
+# CUDA_VISIBLE_DEVICES maps logical device indices to physical GPUs in that order.
 echo "[launcher] starting trainer -> $TRAIN_LOG"
-CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" \
-  uv run --extra gpu torchrun --standalone --nproc_per_node="$TRAIN_NPROC" \
+CUDA_VISIBLE_DEVICES="$TRAIN_GPUS,$TEACHER_GPUS" \
+  uv run --extra gpu torchrun --standalone --nproc_per_node="$TOTAL_NPROC" \
     nanoopd/train.py \
     --student-model "$STUDENT_MODEL" \
     --teacher-model "$TEACHER_MODEL" \
-    --teacher-gpu-id "$TEACHER_RANK_ID" \
+    --train-world-size "$TRAIN_NPROC" \
     --algorithm "$ALGORITHM" \
     --distill-top-k "$DISTILL_TOP_K" \
+    --student-chunk-size "$STUDENT_CHUNK_SIZE" \
+    --teacher-chunk-size "$TEACHER_CHUNK_SIZE" \
     --rollout-worker-url "http://$ROLLOUT_HOST:$ROLLOUT_PORT" \
     --rollout-worker-world-size "$ROLLOUT_TP" \
     --num-steps "$NUM_STEPS" \

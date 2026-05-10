@@ -34,7 +34,8 @@ def prepare_dp_model(
     model: nn.Module,
     dtype: str,
     sync_module_states: bool,
-    device_mesh: dist.DeviceMesh,
+    device_mesh: dist.DeviceMesh = None,
+    process_group=None,
     sharding_strategy: str = "HYBRID_SHARD",
 ) -> FSDP:
     def _get_module_cls_from_name(name: str) -> type[nn.Module]:
@@ -73,5 +74,7 @@ def prepare_dp_model(
         param_init_fn=_param_init_fn,
         sync_module_states=sync_module_states,
         device_mesh=device_mesh,
-        device_id=torch.cuda.current_device()
+        process_group=process_group,
+        device_id=torch.cuda.current_device(),
+        use_orig_params=True,
     )

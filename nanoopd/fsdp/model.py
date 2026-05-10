@@ -1,4 +1,4 @@
-from typing import Dict, List, Optional, cast
+from typing import Dict, cast
 
 import torch
 import torch.distributed as dist
@@ -12,31 +12,23 @@ from .data_parallelism import prepare_dp_model
 
 class TeacherModel:
     """
-    Teacher model for computing reference log-probabilities.
+    Teacher model running on its own dedicated GPU process.
 
-    No tensor or sequence parallelism — each participant rank holds a full
-    model replica and runs inference independently.  Non-participant ranks
-    return ``None`` from all inference methods.
+    Loaded on the current CUDA device; the process that instantiates this
+    class must be the sole owner of the GPU (i.e. a dedicated teacher rank
+    in the torchrun world, separate from all FSDP student ranks).
 
     Args:
         model_name: HuggingFace model identifier or local path.
-        gpu_ids: Global ranks that will own the teacher weights.
         dtype: Parameter dtype, e.g. ``"bfloat16"``.
     """
 
     def __init__(
         self,
         model_name: str,
-        gpu_ids: List[int],
         dtype: str = "bfloat16",
     ):
         self._dtype = getattr(torch, dtype)
-        self._is_participant = dist.get_rank() in set(gpu_ids)
-
-        if not self._is_participant:
-            self.model = None
-            return
-
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
             torch_dtype=self._dtype,
@@ -44,44 +36,12 @@ class TeacherModel:
         ).to("cuda")
 
     @torch.no_grad()
-    def get_logprobs(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
-        """
-        Returns per-token log-probabilities ``(B, T-1)`` aligned with
-        ``input_ids[:, 1:]``.  Non-participant ranks return ``None``.
-        """
-        if not self._is_participant:
-            return None
-
-        assert self.model is not None
-        self.model.eval()
-        logits = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-        ).logits                                         # (B, T, V)
-        log_probs = logits[:, :-1].log_softmax(dim=-1)  # (B, T-1, V)
-        return log_probs.gather(
-            dim=-1,
-            index=input_ids[:, 1:].unsqueeze(-1),
-        ).squeeze(-1) * attention_mask[:, 1:]           # (B, T-1)
-
-    @torch.no_grad()
     def get_logits(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
-        """
-        Returns raw logits ``(B, T, V)``.  Non-participant ranks return ``None``.
-        Used with ``compute_topk_logprobs_for_distillation`` for top-K KL distillation.
-        """
-        if not self._is_participant:
-            return None
-
-        assert self.model is not None
+    ) -> torch.Tensor:
+        """Returns raw logits ``(B, T, V)`` for top-K KL distillation."""
         self.model.eval()
         return self.model(
             input_ids=input_ids,
@@ -96,31 +56,31 @@ class StudentModel(FSDPWoker):
     Args:
         config: Training configuration (must contain ``model_name``, ``dtype``,
             ``enable_gradient_checkpointing``, and ``optimizer`` keys).
-        data_parallel_size: Number of ranks across which FSDP shards parameters.
+        data_parallel_size: Number of student ranks across which FSDP shards.
+        process_group: The process group that spans exactly the student ranks.
+            FSDP and all student-side collectives use this group, so teacher
+            ranks (which live at higher global ranks in the same torchrun world)
+            are never involved in student-only barriers or all-reduces.
     """
 
     def __init__(
         self,
         config: DictConfig,
         data_parallel_size: int,
+        process_group=None,
     ):
-        assert dist.get_world_size() == data_parallel_size, (
-            f"world_size ({dist.get_world_size()}) must equal "
+        assert dist.get_world_size(group=process_group) == data_parallel_size, (
+            f"process_group size ({dist.get_world_size(group=process_group)}) must equal "
             f"data_parallel_size ({data_parallel_size})."
         )
 
         self.config = config
         self.train = True
         self.data_parallel_size = data_parallel_size
+        self._process_group = process_group
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             config.model_name, trust_remote_code=True
-        )
-
-        self.device_mesh = dist.device_mesh.init_device_mesh(
-            "cuda",
-            mesh_dim_names=("dp",),
-            mesh_shape=(data_parallel_size,),
         )
 
         with self._init_weight_context():
@@ -140,6 +100,7 @@ class StudentModel(FSDPWoker):
     # ------------------------------------------------------------------
 
     def _init_weight_context(self, use_meta_tensor: bool = True):
+        # Global rank 0 is always a student rank; load weights there on CPU.
         if any([
             dist.get_rank() == 0,
             getattr(self.config, "offload_model", False),
@@ -153,11 +114,12 @@ class StudentModel(FSDPWoker):
             self.model.gradient_checkpointing_enable()
 
         # sync_module_states=True broadcasts rank-0 weights to all FSDP ranks.
+        # Pass process_group (not device_mesh) so FSDP stays within student ranks.
         self.model = prepare_dp_model(
             self.model,
             self.config.dtype,
             sync_module_states=True,
-            device_mesh=self.device_mesh,
+            process_group=self._process_group,
             sharding_strategy=getattr(self.config, "sharding_strategy", "FULL_SHARD"),
         )
 
@@ -171,3 +133,12 @@ class StudentModel(FSDPWoker):
 
     def _scale_loss(self, loss: torch.Tensor) -> torch.Tensor:
         return self.data_parallel_size * loss
+
+    def save_model(self, save_dir: str):
+        # Override to barrier within student_group only; teacher ranks must not
+        # participate in this barrier (they don't call save_model).
+        state_dict = self._get_model_state_dict(full_state_dict=True)
+        if dist.get_rank() == 0:
+            self.tokenizer.save_pretrained(save_dir)
+            self.model.module.save_pretrained(save_dir, state_dict=state_dict)
+        dist.barrier(group=self._process_group)

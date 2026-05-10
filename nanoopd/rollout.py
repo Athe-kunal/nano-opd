@@ -17,6 +17,7 @@ from vllm import SamplingParams
 from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine, NCCLTrainerSendWeightsArgs
 
 import torch
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 def get_logprobs(model, input_ids, attention_mask, response_mask):
     """Compute per-response-token log-probs under `model`.
@@ -161,11 +162,11 @@ def _dtype_name(dtype: torch.dtype) -> str:
 
 
 def _iter_fsdp_full_params(model):
-    for name, param in model.named_parameters():
-        if hasattr(param, "full_tensor"):
-            yield name, param.full_tensor()
-            continue
-        yield name, param
+    # summon_full_params temporarily gathers shards and exposes parameters
+    # under their original (non-flattened) names instead of FSDP's _flat_param.
+    with FSDP.summon_full_params(model, writeback=False, recurse=True):
+        for name, param in model.named_parameters():
+            yield name, param.detach().clone()
 
 
 def _iter_model_parameters(model, fsdp: bool):
@@ -178,7 +179,9 @@ def collect_weight_metadata(model, fsdp: bool = False) -> dict[str, Any]:
     names: list[str] = []
     dtype_names: list[str] = []
     shapes: list[list[int]] = []
-    for name, param in _iter_model_parameters(model, fsdp=fsdp):
+    # Consume the generator fully so summon_full_params context stays open
+    # for the duration of metadata collection.
+    for name, param in list(_iter_model_parameters(model, fsdp=fsdp)):
         names.append(name)
         dtype_names.append(_dtype_name(param.dtype))
         shapes.append(list(param.shape))
@@ -223,7 +226,9 @@ def sync_weights_to_vllm_inplace(
 ):
     """Sync trainer weights into the running vLLM worker without checkpoints."""
 
-    if hasattr(train_model, "module"):
+    # For FSDP, keep the FSDP wrapper so summon_full_params can unshard params
+    # with their original names. For non-FSDP (e.g. DDP), unwrap .module.
+    if not fsdp and hasattr(train_model, "module"):
         train_model = train_model.module
 
     metadata = collect_weight_metadata(train_model, fsdp=fsdp)

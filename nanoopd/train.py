@@ -12,7 +12,6 @@ from omegaconf import OmegaConf
 
 from nanoopd.common import compute_init, compute_cleanup, print0, autodetect_device_type
 from nanoopd.loss import compute_reverse_kl_loss, compute_forward_kl_loss, ALGORITHMS
-from nanoopd.fsdp.algorithms import compute_topk_logprobs_for_distillation
 from nanoopd.fsdp.model import TeacherModel, StudentModel
 from nanoopd.rollout import (
     generate_rollouts_remote,
@@ -276,29 +275,49 @@ if __name__ == "__main__":
                         student_logits = student.model(
                             input_ids=mb_ids, attention_mask=mb_attn
                         ).logits[:, :-1]               # [B, T-1, V]
-                    V = student_logits.shape[-1]
 
-                # -- Teacher forward; broadcast logits to all student ranks --
-                if is_teacher:
-                    teacher_logits = teacher.get_logits(mb_ids, mb_attn)  # [B, T, V]
-                    V = teacher_logits.shape[-1]
-                else:
-                    teacher_logits = torch.empty(
-                        B_mb, T_mb, V, dtype=torch.bfloat16, device=device
-                    )
-                dist.broadcast(teacher_logits, src=teacher_global_rank, group=all_group)
+                # -- Teacher: compute top-K log-probs and broadcast --
+                # Broadcasts only [B, T-1, K] instead of the full [B, T-1, V] logit
+                # tensor, reducing per-minibatch communication by ~vocab/K (>1000×).
+                K = args.distill_top_k
+                T_shifted = T_mb - 1
+
+                if select_topk_by == "student":
+                    # Student selects top-K indices; teacher gathers at those indices.
+                    if is_student:
+                        with torch.no_grad():
+                            _, topk_idx = student_logits.topk(K, dim=-1)
+                    else:
+                        topk_idx = torch.empty(B_mb, T_shifted, K, dtype=torch.long, device=device)
+                    dist.broadcast(topk_idx, src=0, group=all_group)
+
+                    if is_teacher:
+                        with torch.no_grad():
+                            t_logits = teacher.get_logits(mb_ids, mb_attn)[:, :-1]
+                            t_lse = torch.logsumexp(t_logits, dim=-1)
+                            t_logprobs = t_logits.gather(-1, topk_idx) - t_lse.unsqueeze(-1)
+                    else:
+                        t_logprobs = torch.empty(B_mb, T_shifted, K, dtype=torch.bfloat16, device=device)
+                    dist.broadcast(t_logprobs, src=teacher_global_rank, group=all_group)
+
+                else:  # forward_kl: teacher selects top-K
+                    if is_teacher:
+                        with torch.no_grad():
+                            t_logits = teacher.get_logits(mb_ids, mb_attn)[:, :-1]
+                            t_lse = torch.logsumexp(t_logits, dim=-1)
+                            _, topk_idx = t_logits.topk(K, dim=-1)
+                            t_logprobs = t_logits.gather(-1, topk_idx) - t_lse.unsqueeze(-1)
+                    else:
+                        topk_idx = torch.empty(B_mb, T_shifted, K, dtype=torch.long, device=device)
+                        t_logprobs = torch.empty(B_mb, T_shifted, K, dtype=torch.bfloat16, device=device)
+                    dist.broadcast(topk_idx, src=teacher_global_rank, group=all_group)
+                    dist.broadcast(t_logprobs, src=teacher_global_rank, group=all_group)
 
                 # -- Student: compute loss and backward --
                 if is_student:
-                    t_logits_shifted = teacher_logits[:, :-1]   # [B, T-1, V]
-                    s_logprobs, t_logprobs, _ = compute_topk_logprobs_for_distillation(
-                        student_logits, t_logits_shifted,
-                        top_k=args.distill_top_k,
-                        select_topk_by=select_topk_by,
-                        student_chunk_size=args.student_chunk_size,
-                        teacher_chunk_size=args.teacher_chunk_size,
-                    )
-                    shift_mask = mb_mask[:, 1:]                 # [B, T-1]
+                    s_lse = torch.logsumexp(student_logits, dim=-1)        # [B, T-1] — keep grad
+                    s_logprobs = student_logits.gather(-1, topk_idx) - s_lse.unsqueeze(-1)
+                    shift_mask = mb_mask[:, 1:]                             # [B, T-1]
                     loss = loss_fn(s_logprobs, t_logprobs, shift_mask)
                     student._scale_loss(loss).backward()
                     total_loss += loss.item()

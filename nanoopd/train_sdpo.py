@@ -51,7 +51,7 @@ def update_teacher_ema(
     with FSDP.summon_full_params(student_fsdp_model, rank0_only=False, writeback=False):
         s_params = dict(student_fsdp_model.named_parameters())
         for name, t_param in teacher_model.named_parameters():
-            s_data = s_params[name].data.to(dtype=t_param.dtype)
+            s_data = s_params[name].data.to(dtype=t_param.dtype, device=t_param.device)
             if sync_method == "trust_region":
                 assert initial_teacher_params is not None
                 t_param.data.copy_(ema_alpha * s_data + (1.0 - ema_alpha) * initial_teacher_params[name])
@@ -109,6 +109,8 @@ if __name__ == "__main__":
     parser.add_argument("--eval-k", type=int, default=4, help="Number of samples per problem for pass@k eval")
     parser.add_argument("--eval-max-tokens", type=int, default=4096, help="Max tokens for eval generation")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--teacher-gpu-id", type=int, default=-1,
+                        help="CUDA device index for teacher model (-1 = same device as student)")
     args = parser.parse_args()
 
     use_wandb = os.environ.get("USE_WANDB", "1").strip().lower() not in ("0", "false", "no")
@@ -121,11 +123,13 @@ if __name__ == "__main__":
     ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
     master_process = ddp_rank == 0
 
+    teacher_device = torch.device(f"cuda:{args.teacher_gpu_id}") if args.teacher_gpu_id >= 0 else device
+
     print0(f"Student/Teacher model: {args.student_model}")
     print0(f"Algorithm: {args.algorithm}  distill-top-k: {args.distill_top_k}"
            + (f"  jsd-alpha: {args.jsd_alpha}" if args.algorithm == "jsd" else ""))
     print0(f"EMA α={args.ema_alpha}  method={args.ema_sync_method}")
-    print0(f"Device: {device}  World size: {ddp_world_size}")
+    print0(f"Device: {device}  Teacher device: {teacher_device}  World size: {ddp_world_size}")
 
     if master_process and use_wandb:
         wandb.init(
@@ -189,7 +193,7 @@ if __name__ == "__main__":
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
         attn_implementation="flash_attention_2",
-    ).to(device).eval()
+    ).to(teacher_device).eval()
     for p in teacher_model.parameters():
         p.requires_grad_(False)
 
@@ -301,14 +305,19 @@ if __name__ == "__main__":
 
                 with torch.no_grad():
                     t_logits = teacher_model(
-                        input_ids=mb_ids, attention_mask=mb_attn
-                    ).logits[:, :-1]               # [B, T-1, V]
+                        input_ids=mb_ids.to(teacher_device),
+                        attention_mask=mb_attn.to(teacher_device),
+                    ).logits[:, :-1]               # [B, T-1, V] on teacher_device
 
                 if select_topk_by == "student":
                     topk_idx   = student_topk_indices(student_logits, K, s_chunk)
-                    t_logprobs = teacher_logprobs_at_indices(t_logits, topk_idx, t_chunk)
+                    t_logprobs = teacher_logprobs_at_indices(
+                        t_logits, topk_idx.to(teacher_device), t_chunk
+                    ).to(device)
                 else:  # teacher selects (forward_kl)
                     topk_idx, t_logprobs = teacher_topk_logprobs(t_logits, K, t_chunk)
+                    topk_idx   = topk_idx.to(device)
+                    t_logprobs = t_logprobs.to(device)
 
                 # -- Loss and backward --
                 s_logprobs = student_logprobs_at_indices(student_logits, topk_idx, s_chunk)

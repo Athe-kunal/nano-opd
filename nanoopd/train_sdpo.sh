@@ -11,13 +11,16 @@ STUDENT_MODEL="${STUDENT_MODEL:-Qwen/Qwen2.5-1.5B-Instruct}"
 
 # GPU assignment (comma-separated physical GPU IDs).
 # TRAIN_GPUS and ROLLOUT_GPUS must not overlap.
-# In SDPO the EMA teacher runs on the same GPUs as the student — no TEACHER_GPUS.
+# TEACHER_GPU_ID: physical GPU for the EMA teacher (empty = same as student).
+# Setting it to a rollout GPU keeps trainer VRAM free; set ROLLOUT_GPU_MEM_UTIL=0.5
+# so vLLM and the teacher share the rollout GPU's memory.
 ROLLOUT_GPUS="${ROLLOUT_GPUS:-1}"
 TRAIN_GPUS="${TRAIN_GPUS:-0}"
+TEACHER_GPU_ID="${TEACHER_GPU_ID:-}"  # e.g. TEACHER_GPU_ID=1 to colocate with rollout
 
 ROLLOUT_HOST="${ROLLOUT_HOST:-127.0.0.1}"
 ROLLOUT_PORT="${ROLLOUT_PORT:-8047}"
-ROLLOUT_GPU_MEM_UTIL="${ROLLOUT_GPU_MEM_UTIL:-0.95}"
+ROLLOUT_GPU_MEM_UTIL="${ROLLOUT_GPU_MEM_UTIL:-0.5}"
 WEIGHT_TRANSFER_BACKEND="${WEIGHT_TRANSFER_BACKEND:-nccl}"
 
 USE_WANDB="${USE_WANDB:-1}"
@@ -84,6 +87,17 @@ for tgpu in "${TRAIN_GPU_LIST[@]}"; do
     fi
   done
 done
+
+# Build the trainer's CUDA_VISIBLE_DEVICES and teacher device index.
+# If TEACHER_GPU_ID is set, append it so the trainer process can access it;
+# the teacher's CUDA device index is then TRAIN_NPROC (after all train ranks).
+if [[ -n "${TEACHER_GPU_ID:-}" ]]; then
+  TRAINER_VISIBLE="${TRAIN_GPUS},${TEACHER_GPU_ID}"
+  TEACHER_DEVICE_IDX="${TRAIN_NPROC}"
+else
+  TRAINER_VISIBLE="${TRAIN_GPUS}"
+  TEACHER_DEVICE_IDX="-1"
+fi
 
 # ---------------------------------------------------------------------------
 WORKER_PID=""
@@ -161,9 +175,11 @@ curl -sf "$HEALTH_URL" | grep -q '"ok": *true' \
 # ---------------------------------------------------------------------------
 # Start student trainer (all ranks are student ranks — no separate teacher rank)
 echo "[launcher] starting trainer -> $TRAIN_LOG"
-CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" \
+echo "[launcher] teacher GPU      : ${TEACHER_GPU_ID:-<same as student>}  (device idx=${TEACHER_DEVICE_IDX})"
+CUDA_VISIBLE_DEVICES="$TRAINER_VISIBLE" \
   uv run --extra gpu torchrun --standalone --nproc_per_node="$TRAIN_NPROC" \
     nanoopd/train_sdpo.py \
+    --teacher-gpu-id "$TEACHER_DEVICE_IDX" \
     --student-model "$STUDENT_MODEL" \
     --algorithm "$ALGORITHM" \
     --distill-top-k "$DISTILL_TOP_K" \

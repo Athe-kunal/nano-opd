@@ -227,7 +227,6 @@ if __name__ == "__main__":
             )
             batch = prepare_batch(
                 rollouts,
-                rewards=[0.0] * len(rollouts),
                 tokenizer=student.tokenizer,
                 max_seq_len=args.max_seq_len,
                 device=device,

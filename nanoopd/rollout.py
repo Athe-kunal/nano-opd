@@ -19,30 +19,6 @@ from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngin
 import torch
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
-def get_logprobs(model, input_ids, attention_mask, response_mask):
-    """Compute per-response-token log-probs under `model`.
-
-    Returns a tuple ``(token_logprobs, shift_mask)`` each of shape ``[B, T-1]``:
-      - ``token_logprobs[b, t] = log π_θ(input_ids[b, t+1] | input_ids[b, :t+1])``
-      - ``shift_mask[b, t] = 1.0`` iff ``input_ids[b, t+1]`` is a response token.
-
-    Per-token (not per-sequence) log-probs are required so that PPO/DAPO/GRPO
-    can apply per-token importance ratios and per-token clipping — the
-    sample-level masked-mean form makes the clip bounds essentially non-
-    functional (the geometric mean of many per-token ratios is always ≈ 1).
-    """
-    with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-        logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
-    # Shift: logits[t] predicts token[t+1]
-    shift_logits = logits[:, :-1, :]
-    shift_labels = input_ids[:, 1:]
-    shift_mask = response_mask[:, 1:]
-    # log_softmax(x)[k] = x[k] - logsumexp(x). logsumexp saves only [B,T] for
-    # backward vs log_softmax's [B,T,V] — avoids a ~V× persistent allocation.
-    gathered = shift_logits.gather(-1, shift_labels.unsqueeze(-1)).squeeze(-1)
-    token_logprobs = gathered - torch.logsumexp(shift_logits, dim=-1)
-    return token_logprobs, shift_mask
-
 def generate_rollouts(vllm_engine, tokenizer, prompts, num_samples, max_new_tokens,
                       temperature, top_k):
     """Generate `num_samples` completions per prompt using vLLM.
@@ -129,13 +105,18 @@ def generate_rollouts_remote(base_url, prompts, num_samples, max_new_tokens,
     return resp["rollouts"]
 
 
-def prepare_batch(rollouts, rewards, tokenizer, max_seq_len, device):
+def prepare_batch(rollouts, tokenizer, max_seq_len, device):
     """Pack a list of rollouts into padded training tensors."""
     input_ids_list = []
     response_mask_list = []
     for rollout in rollouts:
         prompt_ids = rollout["prompt_ids"]
         response_ids = rollout["response_ids"]
+        if len(prompt_ids) >= max_seq_len:
+            raise ValueError(
+                f"Prompt length ({len(prompt_ids)}) >= max_seq_len ({max_seq_len}); "
+                "no space left for response tokens. Increase --max-seq-len."
+            )
         full_ids = prompt_ids + response_ids
         if len(full_ids) > max_seq_len:
             full_ids = full_ids[:max_seq_len]
@@ -154,7 +135,6 @@ def prepare_batch(rollouts, rewards, tokenizer, max_seq_len, device):
         "input_ids": torch.tensor(padded_ids, dtype=torch.long, device=device),
         "attention_mask": torch.tensor(attn_masks, dtype=torch.long, device=device),
         "response_mask": torch.tensor(padded_masks, dtype=torch.float, device=device),
-        "rewards": torch.tensor(rewards, dtype=torch.float, device=device),
     }
 
 def _dtype_name(dtype: torch.dtype) -> str:

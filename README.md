@@ -2,7 +2,7 @@
 
 **nano-opd** is a hackable library for on-policy distillation: you can swap models, data, and training knobs without fighting a monolithic stack.
 
-## Exporting training data (`dapo.py`)
+## Exporting training data (`dapo_dataset.py`)
 
 The DAPO exporter writes JSONL rows that match the `Example` type used by the trainer's dataset code. From the repo root (with `PYTHONPATH` set as you normally would for this package), you can run:
 
@@ -54,6 +54,14 @@ ROLLOUT_GPUS=2 TRAIN_GPUS=3 TEACHER_GPUS=2 bash nanoopd/train.sh
 - **`MAX_SEQ_LEN`** — Truncation / packing ceiling for training sequences.
 - **`ALGORITHM`** — Distillation loss variant (default: `reverse_kl`).
 - **`DISTILL_TOP_K`** — Top-k used when matching teacher distribution (semantics follow `train.py`).
+
+### Distillation health metrics (logged to W&B)
+
+Three token-level metrics are logged under `metrics/` each step:
+
+- **`overlap_ratio`** — fraction of tokens shared between student and teacher top-K sets. Rising over training indicates the student is finding the teacher's high-probability region. Stagnant overlap is a sign of a failing run.
+- **`overlap_token_advantage`** — within the shared tokens, measures whether the student's probability mass matches the teacher's. A value near zero means good calibration; negative means the student is overconfident relative to the teacher.
+- **`entropy_gap`** — absolute difference in entropy between teacher and student distributions at each token position. A narrowing gap means the student is matching the teacher's confidence level. A persistent gap means the student has collapsed to sharper modes than the teacher.
 
 ### Checkpointing and eval
 

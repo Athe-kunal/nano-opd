@@ -18,6 +18,11 @@ from nanoopd.fsdp.algorithms import (
     teacher_topk_logprobs,
     student_logprobs_at_indices,
 )
+from nanoopd.metrics import (
+    compute_overlap_ratio,
+    compute_overlap_token_advantage,
+    compute_entropy_gap,
+)
 from nanoopd.rollout import (
     generate_rollouts_remote,
     remote_vllm_init_weight_transfer,
@@ -236,8 +241,11 @@ if __name__ == "__main__":
             response_mask  = batch["response_mask"]
             student.model.train()
 
-        total_loss = 0.0
-        n_batches  = 0
+        total_loss       = 0.0
+        n_batches        = 0
+        overlap_ratio    = 0.0
+        overlap_advantage = 0.0
+        entropy_gap_val  = 0.0
 
         # ---- Distillation epochs ----
         for _epoch in range(args.epochs):
@@ -303,19 +311,41 @@ if __name__ == "__main__":
                     if is_teacher:
                         t_logits = teacher.get_logits(mb_ids, mb_attn)[:, :-1]
                         t_logprobs = teacher_logprobs_at_indices(t_logits, topk_idx, t_chunk)
+                        # Also compute teacher's own top-K for metrics
+                        teacher_topk_idx, teacher_own_logprobs = teacher_topk_logprobs(t_logits, K, t_chunk)
                     else:
                         t_logprobs = torch.empty(B_mb, T_shifted, K, dtype=torch.bfloat16, device=device)
+                        teacher_topk_idx = torch.empty(B_mb, T_shifted, K, dtype=torch.long, device=device)
+                        teacher_own_logprobs = torch.empty(B_mb, T_shifted, K, dtype=torch.bfloat16, device=device)
                     dist.broadcast(t_logprobs, src=teacher_global_rank, group=all_group)
+                    dist.broadcast(teacher_topk_idx, src=teacher_global_rank, group=all_group)
+                    dist.broadcast(teacher_own_logprobs, src=teacher_global_rank, group=all_group)
+                    student_topk_idx = topk_idx  # student selected; teacher_topk_idx already set
+                    t_logprobs_at_student = t_logprobs  # teacher already evaluated at student top-K
 
                 else:  # forward_kl: teacher selects top-K
+                    if is_student:
+                        student_topk_idx = student_topk_indices(student_logits, K, s_chunk)
+                    else:
+                        student_topk_idx = torch.empty(B_mb, T_shifted, K, dtype=torch.long, device=device)
+                    dist.broadcast(student_topk_idx, src=0, group=all_group)
+
                     if is_teacher:
                         t_logits = teacher.get_logits(mb_ids, mb_attn)[:, :-1]
-                        topk_idx, t_logprobs = teacher_topk_logprobs(t_logits, K, t_chunk)
+                        teacher_topk_idx, t_logprobs = teacher_topk_logprobs(t_logits, K, t_chunk)
+                        teacher_own_logprobs = t_logprobs
+                        # Teacher log-probs at student top-K for overlap-token advantage
+                        t_logprobs_at_student = teacher_logprobs_at_indices(t_logits, student_topk_idx, t_chunk)
                     else:
-                        topk_idx = torch.empty(B_mb, T_shifted, K, dtype=torch.long, device=device)
+                        teacher_topk_idx = torch.empty(B_mb, T_shifted, K, dtype=torch.long, device=device)
                         t_logprobs = torch.empty(B_mb, T_shifted, K, dtype=torch.bfloat16, device=device)
-                    dist.broadcast(topk_idx, src=teacher_global_rank, group=all_group)
+                        teacher_own_logprobs = torch.empty(B_mb, T_shifted, K, dtype=torch.bfloat16, device=device)
+                        t_logprobs_at_student = torch.empty(B_mb, T_shifted, K, dtype=torch.bfloat16, device=device)
+                    dist.broadcast(teacher_topk_idx, src=teacher_global_rank, group=all_group)
                     dist.broadcast(t_logprobs, src=teacher_global_rank, group=all_group)
+                    dist.broadcast(teacher_own_logprobs, src=teacher_global_rank, group=all_group)
+                    dist.broadcast(t_logprobs_at_student, src=teacher_global_rank, group=all_group)
+                    topk_idx = teacher_topk_idx
 
                 # -- Student: compute loss and backward --
                 if is_student:
@@ -325,6 +355,15 @@ if __name__ == "__main__":
                     student._scale_loss(loss).backward()
                     total_loss += loss.item()
                     n_batches  += 1
+
+                    # Compute distillation health metrics (no grad)
+                    with torch.no_grad():
+                        s_lp_for_metrics = student_logprobs_at_indices(student_logits, student_topk_idx, s_chunk)
+                        overlap_ratio     += compute_overlap_ratio(student_topk_idx, teacher_topk_idx).item()
+                        overlap_advantage += compute_overlap_token_advantage(
+                            student_topk_idx, teacher_topk_idx, s_lp_for_metrics, t_logprobs_at_student
+                        ).item()
+                        entropy_gap_val   += compute_entropy_gap(s_lp_for_metrics, teacher_own_logprobs).item()
 
             if is_student:
                 student._optimizer_step()
@@ -345,6 +384,9 @@ if __name__ == "__main__":
             print0(
                 f"step {step + 1:4d}/{args.num_steps} | loss {avg_loss:.4f} "
                 f"| lr {current_lr:.2e} | tokens {tokens} | dt {dt:.1f}s"
+                f"| overlap {overlap_ratio / max(n_batches, 1):.3f} "
+                f"| adv {overlap_advantage / max(n_batches, 1):.4f} "
+                f"| ent_gap {entropy_gap_val / max(n_batches, 1):.4f}"
             )
 
             if master_process and use_wandb:
@@ -354,6 +396,9 @@ if __name__ == "__main__":
                         "train/learning_rate": current_lr,
                         "train/step_time_s": dt,
                         "train/tokens_per_step": tokens,
+                        "metrics/overlap_ratio": overlap_ratio / max(n_batches, 1),
+                        "metrics/overlap_token_advantage": overlap_advantage / max(n_batches, 1),
+                        "metrics/entropy_gap": entropy_gap_val / max(n_batches, 1),
                     },
                     step=step + 1,
                 )

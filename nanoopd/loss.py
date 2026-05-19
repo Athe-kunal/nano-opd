@@ -1,6 +1,5 @@
 import torch
 
-
 def _masked_token_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return (values * mask).sum() / mask.sum().clamp(min=1)
 

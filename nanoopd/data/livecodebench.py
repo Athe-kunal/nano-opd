@@ -184,10 +184,12 @@ def _run_stdio(code: str, inputs: list, outputs: list, time_limit: int) -> list[
 
 class LiveCodeSelfDistillationDataset(SelfDistillationDatasetbase):
 
-    def save_dataset(self, hf_name: str, path: str) -> None:
-        ds = load_livecodebench(dataset_split="train")
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        ds.to_json(path)
+    def preprocess_dataset(self, test_size: float = 0.1, seed: int = 42) -> tuple[list, list]:
+        from nanoopd.data.base import InputExample
+        def _adapt(r): return InputExample(prompt=r["prompt"], kind=r["kind"], dataset=r["dataset"], description=r["description"], system=r.get("system"), metadata=r.get("tests"))
+        train = [_adapt(dict(r)) for r in load_livecodebench(dataset_split="train")]
+        test = [_adapt(dict(r)) for r in load_livecodebench(dataset_split="test")]
+        return train, test
 
     def get_feedback(self, result: Sequence[FeedBackExample]) -> list[FeedBackExample]:
         updated = []

@@ -86,8 +86,15 @@ def load_dapo_math(
 
 class DapoMathSelfDistillationDataset(SelfDistillationDatasetbase):
 
-    def save_dataset(self, hf_name: str, path: str) -> None:
-        export_dapo_math(output=Path(path), dataset_id=hf_name)
+    def preprocess_dataset(self, test_size: float = 0.1, seed: int = 42) -> tuple[list, list]:
+        import random as _random
+        from nanoopd.data.base import InputExample
+        def _adapt(r): return InputExample(prompt=r["prompt"], kind=r["kind"], dataset=r["dataset"], description=r["description"], system=r.get("system"), metadata=r.get("tests"))
+        rows = load_dapo_math()
+        rng = _random.Random(seed)
+        rng.shuffle(rows)
+        cut = int(len(rows) * (1 - test_size))
+        return [_adapt(r) for r in rows[:cut]], [_adapt(r) for r in rows[cut:]]
 
     def get_feedback(self, result: Sequence[FeedBackExample]) -> list[FeedBackExample]:
         updated = []

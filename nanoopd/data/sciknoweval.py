@@ -1,6 +1,9 @@
 import pathlib
+from dataclasses import replace
 from datasets import Dataset, load_dataset
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Sequence
+
+from nanoopd.data.base import FeedBackExample, SelfDistillationDatasetbase
 
 SYSTEM_PROMPT = """
 Given a question and four options, please select the right answer. Respond in the following format:
@@ -65,6 +68,27 @@ def load_sciknoweval(
 
 
 
+
+
+class SciKnowEvalSelfDistillationDataset(SelfDistillationDatasetbase):
+
+    def preprocess_dataset(self, test_size: float = 0.1, seed: int = 42) -> tuple[list, list]:
+        from nanoopd.data.base import InputExample
+        def _adapt(r): return InputExample(prompt=r["prompt"], kind=r["kind"], dataset=r["dataset"], description=r["description"], system=r.get("system"), metadata=r.get("tests"))
+        split = load_sciknoweval().train_test_split(test_size=test_size, seed=seed)
+        train = [_adapt(dict(r)) for r in split["train"]]
+        test = [_adapt(dict(r)) for r in split["test"]]
+        return train, test
+
+    def get_feedback(self, result: Sequence[FeedBackExample]) -> list[FeedBackExample]:
+        updated = []
+        for ex in result:
+            if ex.metadata is None:
+                updated.append(replace(ex, feedback="❌ Missing metadata"))
+                continue
+            answer_key = ex.metadata.get("answerKey", "")
+            updated.append(replace(ex, feedback=f"The answer is {answer_key}"))
+        return updated
 
 
 def split_tasks(ds: Dataset, output_dir: str, test_ratio: float = 0.1, seed: int = 42):

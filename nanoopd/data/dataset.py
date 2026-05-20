@@ -1,6 +1,6 @@
 from __future__ import annotations
 import json
-import random
+import random as _random
 from pathlib import Path
 from typing import Iterator, Callable, Literal
 
@@ -31,22 +31,29 @@ _ADAPTERS: dict[str, Callable[[dict], InputExample]] = {
 
 
 class LiveCodeBenchDataset(OPDDatasetbase):
-    def save_dataset(self, hf_name: str, path: str) -> None:
-        ds = load_livecodebench(dataset_split="train")
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        ds.to_json(path)
+    def preprocess_dataset(self, test_size: float = 0.1, seed: int = 42) -> tuple[list[InputExample], list[InputExample]]:
+        train = [_adapt_row(dict(r)) for r in load_livecodebench(dataset_split="train")]
+        test = [_adapt_row(dict(r)) for r in load_livecodebench(dataset_split="test")]
+        return train, test
 
 
 class SciKnowEvalDataset(OPDDatasetbase):
-    def save_dataset(self, hf_name: str, path: str) -> None:
-        ds = load_sciknoweval()
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        ds.to_json(path)
+    def preprocess_dataset(self, test_size: float = 0.1, seed: int = 42) -> tuple[list[InputExample], list[InputExample]]:
+        split = load_sciknoweval().train_test_split(test_size=test_size, seed=seed)
+        train = [_adapt_row(dict(r)) for r in split["train"]]
+        test = [_adapt_row(dict(r)) for r in split["test"]]
+        return train, test
 
 
 class DapoMathDataset(OPDDatasetbase):
-    def save_dataset(self, hf_name: str, path: str) -> None:
-        export_dapo_math(output=Path(path), dataset_id=hf_name)
+    def preprocess_dataset(self, test_size: float = 0.1, seed: int = 42) -> tuple[list[InputExample], list[InputExample]]:
+        rows = load_dapo_math()
+        rng = _random.Random(seed)
+        rng.shuffle(rows)
+        cut = int(len(rows) * (1 - test_size))
+        train = [_adapt_row(r) for r in rows[:cut]]
+        test = [_adapt_row(r) for r in rows[cut:]]
+        return train, test
 
 
 class JSONLOPDDataset:

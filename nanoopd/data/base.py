@@ -23,11 +23,15 @@ class FeedBackExample(InputExample):
 
 class OPDDatasetbase(abc.ABC):
     @abc.abstractmethod
-    def save_dataset(self, hf_name: str, path: str) -> None:...
+    def preprocess_dataset(self, test_size: float = 0.1, seed: int = 42) -> tuple[list[InputExample], list[InputExample]]:
+        """Return (train_examples, test_examples)."""
+        ...
 
 class SelfDistillationDatasetbase(abc.ABC):
     @abc.abstractmethod
-    def save_dataset(self, hf_name: str, path: str) -> None:...
-    
+    def preprocess_dataset(self, test_size: float = 0.1, seed: int = 42) -> tuple[list[InputExample], list[InputExample]]:
+        """Return (train_examples, test_examples)."""
+        ...
+
     @abc.abstractmethod
     def get_feedback(self, result: Sequence[FeedBackExample]) -> list[FeedBackExample]:...

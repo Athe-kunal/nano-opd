@@ -65,7 +65,9 @@ if __name__ == "__main__":
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--num-steps", type=int, default=200)
     parser.add_argument("--prompts-per-step", type=int, default=8)
-    parser.add_argument("--train-batch-size", type=int, default=4)
+    parser.add_argument("--train-batch-size", type=int, default=4,
+                        help="Sequences per gradient accumulation step. Optimizer updates after all "
+                             "prompts_per_step * num_samples sequences are processed.")
     parser.add_argument("--epochs", type=int, default=1, help="Optimizer steps per rollout batch")
     parser.add_argument("--max-seq-len", type=int, default=2048)
     parser.add_argument("--sharding-strategy", type=str, default="FULL_SHARD")
@@ -353,7 +355,7 @@ if __name__ == "__main__":
                 if is_student:
                     s_logprobs = student_logprobs_at_indices(student_logits, topk_idx, s_chunk)
                     shift_mask = mb_mask[:, 1:]                             # [B, T-1]
-                    loss = loss_fn(s_logprobs, t_logprobs, shift_mask)
+                    loss = loss_fn(s_logprobs, t_logprobs, shift_mask) / n_mb
                     student._scale_loss(loss).backward()
                     total_loss += loss.item()
                     n_batches  += 1

@@ -179,7 +179,7 @@ curl -sf "$HEALTH_URL" | grep -q '"ok": *true' \
 echo "[launcher] starting trainer -> $TRAIN_LOG"
 CUDA_VISIBLE_DEVICES="$TRAIN_GPUS,$TEACHER_GPUS" \
   uv run --extra gpu torchrun --standalone --nproc_per_node="$TOTAL_NPROC" \
-    nanoopd/train.py \
+    nanoopd/train_opd.py \
     --student-model "$STUDENT_MODEL" \
     --teacher-model "$TEACHER_MODEL" \
     --train-world-size "$TRAIN_NPROC" \

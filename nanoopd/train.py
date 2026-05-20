@@ -10,7 +10,7 @@ import torch.distributed as dist
 from omegaconf import OmegaConf
 
 from nanoopd.common import compute_init, compute_cleanup, print0, autodetect_device_type
-from nanoopd.loss import compute_reverse_kl_loss, compute_forward_kl_loss, ALGORITHMS
+from nanoopd.loss import ALGORITHMS
 from nanoopd.fsdp.model import TeacherModel, StudentModel
 from nanoopd.fsdp.algorithms import (
     student_topk_indices,
@@ -172,12 +172,12 @@ if __name__ == "__main__":
 
     # -----------------------------------------------------------------------------
     # Loss function and top-K selection
-    if args.algorithm == "reverse_kl":
-        loss_fn = compute_reverse_kl_loss
-        select_topk_by: Literal["student", "teacher"] = "student"
-    else:  # forward_kl
-        loss_fn = compute_forward_kl_loss
-        select_topk_by = "teacher"
+    loss_fn = ALGORITHMS[args.algorithm]
+    # reverse_kl and jsd weight by the student distribution → student selects top-K
+    # forward_kl weights by the teacher distribution → teacher selects top-K
+    select_topk_by: Literal["student", "teacher"] = (
+        "teacher" if args.algorithm == "forward_kl" else "student"
+    )
 
     # -----------------------------------------------------------------------------
     # vLLM weight-transfer setup (student ranks only; teacher is not involved)

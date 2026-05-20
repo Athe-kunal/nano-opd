@@ -32,7 +32,15 @@ from nanoopd.rollout import (
 )
 from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
 from nanoopd.data.dataset import distributed_opd_loader, build_opd_dataset, DatasetType
-from nanoopd.eval_aime import run_eval
+import nanoopd.eval_aime as _eval_aime
+import nanoopd.eval_livecodebench as _eval_lcb
+import nanoopd.eval_sciknoweval as _eval_sciknow
+
+_EVAL_FN = {
+    "dapo_math": _eval_aime.run_eval,
+    "livecodebench": _eval_lcb.run_eval,
+    "sciknoweval": _eval_sciknow.run_eval,
+}
 
 if __name__ == "__main__":
 
@@ -414,7 +422,7 @@ if __name__ == "__main__":
 
             if args.eval_every > 0 and (step + 1) % args.eval_every == 0:
                 if master_process:
-                    run_eval(
+                    _EVAL_FN[args.dataset](
                         rollout_worker_url=args.rollout_worker_url,
                         tokenizer=student.tokenizer,
                         eval_k=args.eval_k,

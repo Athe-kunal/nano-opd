@@ -46,14 +46,11 @@ class SciKnowEvalDataset(OPDDatasetbase):
 
 
 class DapoMathDataset(OPDDatasetbase):
-    def preprocess_dataset(self, test_size: float = 0.1, seed: int = 42) -> tuple[list[InputExample], list[InputExample]]:
+    def preprocess_dataset(self, test_size: float = 0.0, seed: int = 42) -> tuple[list[InputExample], list[InputExample]]:
+        # test_size=0.0: train on all data, evaluation is done on AIME (external benchmark)
         rows = load_dapo_math()
-        rng = _random.Random(seed)
-        rng.shuffle(rows)
-        cut = int(len(rows) * (1 - test_size))
-        train = [_adapt_row(r) for r in rows[:cut]]
-        test = [_adapt_row(r) for r in rows[cut:]]
-        return train, test
+        train = [_adapt_row(r) for r in rows]
+        return train, []
 
 
 class JSONLOPDDataset:

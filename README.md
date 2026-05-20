@@ -45,7 +45,7 @@ ROLLOUT_GPUS=2 TRAIN_GPUS=3 TEACHER_GPUS=2 bash nanoopd/train.sh
 - **`NUM_STEPS`** — Optimization steps.
 - **`PROMPTS_PER_STEP`** — How many prompts to roll out per step (on-policy data volume).
 - **`NUM_SAMPLES`** — Samples per prompt (for variance / ranking in the objective).
-- **`TRAIN_BATCH_SIZE`** — Per-step training microbatch behavior (as wired into `train.py`).
+- **`TRAIN_BATCH_SIZE`** — Per-step training microbatch behavior (as wired into `trrain_opd.py`).
 - **`LR`** — Learning rate.
 
 ### Sequence and objective
@@ -53,7 +53,7 @@ ROLLOUT_GPUS=2 TRAIN_GPUS=3 TEACHER_GPUS=2 bash nanoopd/train.sh
 - **`MAX_NEW_TOKENS`** — Generation cap for rollouts.
 - **`MAX_SEQ_LEN`** — Truncation / packing ceiling for training sequences.
 - **`ALGORITHM`** — Distillation loss variant (default: `reverse_kl`).
-- **`DISTILL_TOP_K`** — Top-k used when matching teacher distribution (semantics follow `train.py`).
+- **`DISTILL_TOP_K`** — Top-k used when matching teacher distribution (semantics follow `trrain_opd.py`).
 
 ### Distillation health metrics (logged to W&B)
 
@@ -74,7 +74,7 @@ Three token-level metrics are logged under `metrics/` each step:
 
 ### Chunking (optional)
 
-- **`STUDENT_CHUNK_SIZE`** / **`TEACHER_CHUNK_SIZE`** — Chunk sizes for long-sequence handling; `-1` typically means “don’t chunk” (see how `train.py` interprets them).
+- **`STUDENT_CHUNK_SIZE`** / **`TEACHER_CHUNK_SIZE`** — Chunk sizes for long-sequence handling; `-1` typically means “don’t chunk” (see how `trrain_opd.py` interprets them).
 
 ### Running
 

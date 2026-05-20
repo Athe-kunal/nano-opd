@@ -3,6 +3,7 @@ from einops import reduce
 
 
 def _masked_token_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    mask = mask.to(values.dtype)
     return (
         torch.einsum("bt,bt->", values, mask)
         / mask.sum().clamp(min=1)

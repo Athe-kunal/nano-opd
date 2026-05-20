@@ -107,7 +107,7 @@ def distributed_opd_loader(
     per_rank = prompts_per_step // world_size
 
     def _epoch_order(epoch_idx: int) -> list[int]:
-        rng = random.Random(seed * 1_000_003 + epoch_idx)
+        rng = _random.Random(seed * 1_000_003 + epoch_idx)
         order = list(range(n))
         rng.shuffle(order)
         return order

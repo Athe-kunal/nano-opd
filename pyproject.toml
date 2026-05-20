@@ -29,6 +29,7 @@ dependencies = [
     "omegaconf>=2.3.0",
     "accelerate>=1.13.0",
     "nvitop>=1.6.2",
+    "rich>=15.0.0",
 ]
 
 [dependency-groups]

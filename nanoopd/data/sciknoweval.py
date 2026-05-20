@@ -29,8 +29,7 @@ def format(row: dict) -> dict:
         "system": SYSTEM_PROMPT,
         "prompt": row['question'] + "\n\n" + format_choices(row['choices']) + "\nPlease reason step by step.",
         "answer": row['answerKey'],
-        # dummy fields
-        "tests": None,
+        "tests": {"answerKey": row['answerKey']},
         "description": row['question'],
         "kind": "mcq",
         "elo": 1500,
@@ -51,7 +50,7 @@ def load_sciknoweval(
     if types:
         ds = ds.filter(lambda x: x['type'] in types)
 
-    ds = ds.map(format, remove_columns=ds.column_names)
+    ds = ds.map(format, remove_columns=ds.column_names, load_from_cache_file=False)
 
     # The raw dataset generates multiple MCQ variants from the same question stem.
     # Deduplicate by description so each underlying question appears only once.

@@ -17,10 +17,13 @@ import argparse
 import json
 import logging
 import sys
+from dataclasses import replace
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from datasets import load_dataset
+
+from nanoopd.data.base import FeedBackExample, SelfDistillationDatasetbase
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +49,56 @@ def extract_last_boxed(text: str) -> str | None:
                 return text[start:i]
         i += 1
     return None
+
+def load_dapo_math(
+    dataset_id: str = "open-r1/DAPO-Math-17k-Processed",
+    config_name: str = "all",
+    split: str = "train",
+) -> list[dict[str, Any]]:
+    ds = load_dataset(dataset_id, config_name, split=split)
+    records: list[dict[str, Any]] = []
+    for i, row in enumerate(ds):
+        row: Mapping[str, Any]
+        prompt_text = (row.get("prompt") or "").strip()
+        reward_model = row.get("reward_model") or {}
+        top_extra = row.get("extra_info") or {}
+        nested_extra = reward_model.get("extra_info") or {}
+        raw_id = top_extra.get("index") or nested_extra.get("index")
+        row_label = f"dapo_math/{raw_id}" if raw_id and str(raw_id).strip() else f"dapo_math/row_{i}"
+
+        answer = ((row.get("solution") or "").strip()
+                  or (reward_model.get("ground_truth") or "").strip())
+
+        if not prompt_text or not answer:
+            logger.warning(f"Skipping row {i} ({row_label}): empty prompt or answer")
+            continue
+
+        records.append({
+            "dataset": "dapo",
+            "kind": "math",
+            "description": prompt_text,
+            "system": DEFAULT_SYSTEM_PROMPT,
+            "prompt": prompt_text,
+            "tests": {"answer": answer},
+        })
+    return records
+
+
+class DapoMathSelfDistillationDataset(SelfDistillationDatasetbase):
+
+    def save_dataset(self, hf_name: str, path: str) -> None:
+        export_dapo_math(output=Path(path), dataset_id=hf_name)
+
+    def get_feedback(self, result: Sequence[FeedBackExample]) -> list[FeedBackExample]:
+        updated = []
+        for ex in result:
+            if ex.metadata is None:
+                updated.append(replace(ex, feedback="❌ Missing metadata"))
+                continue
+            answer = ex.metadata.get("answer", "")
+            updated.append(replace(ex, feedback=f"The answer is {answer}"))
+        return updated
+
 
 def export_dapo_math(
     output: Path,

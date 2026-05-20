@@ -1,68 +1,56 @@
 from __future__ import annotations
-import os
-
 import json
 import random
-from dataclasses import dataclass
-from typing import Iterator, Callable
+from pathlib import Path
+from typing import Iterator, Callable, Literal
+
+from nanoopd.data.base import InputExample, OPDDatasetbase
+from nanoopd.data.livecodebench import load_livecodebench
+from nanoopd.data.sciknoweval import load_sciknoweval
+from nanoopd.data.dapo_dataset import load_dapo_math
+
+DatasetType = Literal["livecodebench", "sciknoweval", "dapo_math"]
 
 
-@dataclass
-class Example:
-    prompt: str
-    kind: str          # "mcq" | "code" | "math"
-    dataset: str
-    description: str
-    system: str | None = None   # system prompt; present for sciknoweval
-    answer: str | None = None   # ground-truth letter; present for sciknoweval MCQ
-    tests: str | None = None    # JSON-encoded test cases; present for lcb_v6
-
-
-def _adapt_sciknoweval(row: dict) -> Example:
-    return Example(
+def _adapt_row(row: dict) -> InputExample:
+    return InputExample(
         prompt=row["prompt"],
         kind=row["kind"],
         dataset=row["dataset"],
         description=row["description"],
         system=row.get("system"),
-        answer=row.get("answer"),
-        tests=row.get("tests"),
+        metadata=row.get("tests"),
     )
 
 
-def _adapt_lcb(row: dict) -> Example:
-    return Example(
-        prompt=row["prompt"],
-        kind=row["kind"],
-        dataset=row["dataset"],
-        description=row["description"],
-        system=None,
-        answer=None,
-        tests=row.get("tests"),
-    )
-
-
-def _adapt_dapo(row: dict) -> Example:
-    return Example(
-        prompt=row["prompt"],
-        kind=row["kind"],
-        dataset=row["dataset"],
-        description=row["description"],
-        system=row.get("system"),
-        answer=row.get("answer"),
-        tests=row.get("tests"),
-    )
-
-
-_ADAPTERS: dict[str, Callable[[dict], Example]] = {
-    "sciknoweval": _adapt_sciknoweval,
-    "livecodebench": _adapt_lcb,
-    "dapo": _adapt_dapo,
+_ADAPTERS: dict[str, Callable[[dict], InputExample]] = {
+    "sciknoweval": _adapt_row,
+    "livecodebench": _adapt_row,
+    "dapo": _adapt_row,
 }
 
 
+class LiveCodeBenchDataset(OPDDatasetbase):
+    def save_dataset(self, hf_name: str, path: str) -> None:
+        ds = load_livecodebench(dataset_split="train")
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        ds.to_json(path)
+
+
+class SciKnowEvalDataset(OPDDatasetbase):
+    def save_dataset(self, hf_name: str, path: str) -> None:
+        ds = load_sciknoweval()
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        ds.to_json(path)
+
+
+class DapoMathDataset(OPDDatasetbase):
+    def save_dataset(self, hf_name: str, path: str) -> None:
+        export_dapo_math(output=Path(path), dataset_id=hf_name)
+
+
 class JSONLOPDDataset:
-    """Loads a JSONL file and exposes Example items."""
+    """Loads a JSONL file and exposes InputExample items."""
 
     def __init__(self, path: str, adapter: str | None = None):
         with open(path) as f:
@@ -75,25 +63,25 @@ class JSONLOPDDataset:
         if adapt_fn is None:
             raise ValueError(f"Unknown adapter '{adapter}'. Known: {list(_ADAPTERS)}")
 
-        self._examples: list[Example] = [adapt_fn(r) for r in rows]
+        self._examples: list[InputExample] = [adapt_fn(r) for r in rows]
 
     def __len__(self) -> int:
         return len(self._examples)
 
-    def __getitem__(self, idx: int) -> Example:
+    def __getitem__(self, idx: int) -> InputExample:
         return self._examples[idx]
 
 
 class _IndexedOPDDataset:
-    """Wraps an existing list of Examples as an indexable dataset."""
+    """Wraps an existing list of InputExamples as an indexable dataset."""
 
-    def __init__(self, examples: list[Example]):
+    def __init__(self, examples: list[InputExample]):
         self._examples = examples
 
     def __len__(self) -> int:
         return len(self._examples)
 
-    def __getitem__(self, idx: int) -> Example:
+    def __getitem__(self, idx: int) -> InputExample:
         return self._examples[idx]
 
 
@@ -104,8 +92,8 @@ def distributed_opd_loader(
     rank: int,
     seed: int = 0,
     resume_state: dict | None = None,
-) -> Iterator[tuple[list[Example], dict]]:
-    """Yield (list[Example], state_dict) per step."""
+) -> Iterator[tuple[list[InputExample], dict]]:
+    """Yield (list[InputExample], state_dict) per step."""
     n = len(dataset)
     assert prompts_per_step % world_size == 0
     assert prompts_per_step <= n
@@ -136,16 +124,14 @@ def distributed_opd_loader(
         cursor += prompts_per_step
         yield examples, {"epoch": epoch, "cursor": cursor}
 
-_opd_path = os.environ.get("OPD_DATASET_PATH")
-if _opd_path is None:
-    raise EnvironmentError(
-        "OPD_DATASET_PATH environment variable is required. "
-        "Set it to the path of your JSONL dataset file."
-    )
-OPD_DATASET_PATH: str = _opd_path
 
-
-def build_opd_dataset() -> JSONLOPDDataset:
-    if not os.path.exists(OPD_DATASET_PATH):
-        raise FileNotFoundError(f"OPD dataset not found on disk: {OPD_DATASET_PATH}")
-    return JSONLOPDDataset(OPD_DATASET_PATH)
+def build_opd_dataset(dataset_type: DatasetType) -> _IndexedOPDDataset:
+    if dataset_type == "livecodebench":
+        rows = [dict(r) for r in load_livecodebench(dataset_split="train")]
+    elif dataset_type == "sciknoweval":
+        rows = [dict(r) for r in load_sciknoweval()]
+    elif dataset_type == "dapo_math":
+        rows = load_dapo_math()
+    else:
+        raise ValueError(f"Unsupported dataset type: {dataset_type!r}")
+    return _IndexedOPDDataset([_adapt_row(r) for r in rows])

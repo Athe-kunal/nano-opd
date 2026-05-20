@@ -35,6 +35,7 @@ PROMPTS_PER_STEP="${PROMPTS_PER_STEP:-16}"
 NUM_SAMPLES="${NUM_SAMPLES:-4}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-4096}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-8192}"
+DATASET="${DATASET:-dapo_math}"
 ALGORITHM="${ALGORITHM:-reverse_kl}"
 DISTILL_TOP_K="${DISTILL_TOP_K:-100}"
 STUDENT_CHUNK_SIZE="${STUDENT_CHUNK_SIZE:--1}"
@@ -182,6 +183,7 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS,$TEACHER_GPUS" \
     --student-model "$STUDENT_MODEL" \
     --teacher-model "$TEACHER_MODEL" \
     --train-world-size "$TRAIN_NPROC" \
+    --dataset "$DATASET" \
     --algorithm "$ALGORITHM" \
     --distill-top-k "$DISTILL_TOP_K" \
     --student-chunk-size "$STUDENT_CHUNK_SIZE" \

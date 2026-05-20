@@ -31,7 +31,7 @@ from nanoopd.rollout import (
     wait_for_rollout_worker,
 )
 from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
-from nanoopd.data.dataset import distributed_opd_loader, build_opd_dataset
+from nanoopd.data.dataset import distributed_opd_loader, build_opd_dataset, DatasetType
 from nanoopd.eval_aime import run_eval
 
 if __name__ == "__main__":
@@ -78,6 +78,8 @@ if __name__ == "__main__":
     parser.add_argument("--eval-every", type=int, default=0, help="Eval on AIME every N steps (0=disabled)")
     parser.add_argument("--eval-k", type=int, default=4, help="Number of samples per problem for pass@k eval")
     parser.add_argument("--eval-max-tokens", type=int, default=4096, help="Max tokens for eval generation")
+    parser.add_argument("--dataset", type=str, required=True,
+                        choices=["livecodebench", "sciknoweval", "dapo_math"])
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
@@ -206,7 +208,7 @@ if __name__ == "__main__":
     # -----------------------------------------------------------------------------
     # Dataset (student ranks only)
     if is_student:
-        dataset = build_opd_dataset()
+        dataset = build_opd_dataset(args.dataset)
         loader = distributed_opd_loader(
             dataset, args.prompts_per_step, train_world_size, ddp_rank, seed=args.seed
         )

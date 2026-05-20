@@ -222,3 +222,7 @@ datasets/
 wandb/
 
 .nanoopd/
+
+agent_shaper_tests/
+
+.mcp.json

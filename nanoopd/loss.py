@@ -2,8 +2,14 @@ import torch
 from einops import reduce
 
 
-def _masked_token_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+def _masked_token_mean(
+    values: torch.Tensor,
+    mask: torch.Tensor,
+    tis_weights: torch.Tensor | None = None,
+) -> torch.Tensor:
     mask = mask.to(values.dtype)
+    if tis_weights is not None:
+        values = values * tis_weights
     return (
         torch.einsum("bt,bt->", values, mask)
         / mask.sum().clamp(min=1)
@@ -11,37 +17,49 @@ def _masked_token_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor
 
 
 def compute_reverse_kl_loss(
-    student_logprobs: torch.Tensor,   # [B, T, K]
-    teacher_logprobs: torch.Tensor,   # [B, T, K]
-    response_mask: torch.Tensor,      # [B, T]
+    student_logprobs: torch.Tensor,         # [B, T, K]
+    teacher_logprobs: torch.Tensor,         # [B, T, K]
+    response_mask: torch.Tensor,            # [B, T]
+    tis_weights: torch.Tensor | None = None,  # [B, T]
     renormalize: bool = True,
 ) -> torch.Tensor:
-    """KL(p_student || p_teacher), truncated to top-K (selected by student)."""
+    """KL(p_student || p_teacher), truncated to top-K (selected by student).
+
+    tis_weights scales each token's KL contribution to correct for the gap
+    between vLLM inference log-probs and training-time log-probs (Eq. 12,
+    Appendix A.4 of the SDPO paper). When None, no correction is applied.
+    """
     student_probs = student_logprobs.exp()
     if renormalize:
         student_probs = student_probs / reduce(student_probs, "b t k -> b t 1", "sum").clamp(min=1e-8)
     per_token_kl = torch.einsum("btk,btk->bt", student_probs, student_logprobs - teacher_logprobs)
-    return _masked_token_mean(per_token_kl, response_mask)
+    return _masked_token_mean(per_token_kl, response_mask, tis_weights)
 
 
 def compute_forward_kl_loss(
-    student_logprobs: torch.Tensor,   # [B, T, K]
-    teacher_logprobs: torch.Tensor,   # [B, T, K]
-    response_mask: torch.Tensor,      # [B, T]
+    student_logprobs: torch.Tensor,         # [B, T, K]
+    teacher_logprobs: torch.Tensor,         # [B, T, K]
+    response_mask: torch.Tensor,            # [B, T]
+    tis_weights: torch.Tensor | None = None,  # [B, T]
     renormalize: bool = True,
 ) -> torch.Tensor:
-    """KL(p_teacher || p_student), truncated to top-K (ideally selected by teacher)."""
+    """KL(p_teacher || p_student), truncated to top-K (ideally selected by teacher).
+
+    tis_weights scales each token's KL contribution to correct for the gap
+    between vLLM inference log-probs and training-time log-probs.
+    """
     teacher_probs = teacher_logprobs.exp()
     if renormalize:
         teacher_probs = teacher_probs / reduce(teacher_probs, "b t k -> b t 1", "sum").clamp(min=1e-8)
     per_token_kl = torch.einsum("btk,btk->bt", teacher_probs, teacher_logprobs - student_logprobs)
-    return _masked_token_mean(per_token_kl, response_mask)
+    return _masked_token_mean(per_token_kl, response_mask, tis_weights)
 
 
 def compute_jsd_loss(
-    student_logprobs: torch.Tensor,   # [B, T, K]
-    teacher_logprobs: torch.Tensor,   # [B, T, K]
-    response_mask: torch.Tensor,      # [B, T]
+    student_logprobs: torch.Tensor,         # [B, T, K]
+    teacher_logprobs: torch.Tensor,         # [B, T, K]
+    response_mask: torch.Tensor,            # [B, T]
+    tis_weights: torch.Tensor | None = None,  # [B, T]
     jsd_alpha: float = 0.5,
     renormalize: bool = True,
 ) -> torch.Tensor:
@@ -49,6 +67,9 @@ def compute_jsd_loss(
 
     jsd_alpha=0.5 → symmetric JSD (SDPO default).
     jsd_alpha=0.0 → forward KL.  jsd_alpha=1.0 → reverse KL.
+
+    tis_weights scales each token's JSD contribution to correct for the gap
+    between vLLM inference log-probs and training-time log-probs.
     """
     student_probs = student_logprobs.exp()
     teacher_probs = teacher_logprobs.exp()
@@ -60,7 +81,7 @@ def compute_jsd_loss(
     kl_s = torch.einsum("btk,btk->bt", student_probs, student_logprobs - log_M)
     kl_t = torch.einsum("btk,btk->bt", teacher_probs, teacher_logprobs - log_M)
     per_token_jsd = jsd_alpha * kl_s + (1.0 - jsd_alpha) * kl_t
-    return _masked_token_mean(per_token_jsd, response_mask)
+    return _masked_token_mean(per_token_jsd, response_mask, tis_weights)
 
 
 ALGORITHMS = {

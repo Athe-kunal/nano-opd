@@ -17,6 +17,7 @@ from nanoopd.fsdp.algorithms import (
     teacher_logprobs_at_indices,
     teacher_topk_logprobs,
     student_logprobs_at_indices,
+    student_logprob_at_sampled_tokens,
 )
 from nanoopd.metrics import (
     compute_overlap_ratio,
@@ -60,6 +61,7 @@ if __name__ == "__main__":
                         help="Chunk size along T for student logits in top-K computation (-1 = no chunking)")
     parser.add_argument("--teacher-chunk-size", type=int, default=-1,
                         help="Chunk size along T for teacher logits in top-K computation (-1 = no chunking)")
+    parser.add_argument("--tis-clip", type=float, default=0.0, help="TIS importance-weight clip C (0 disables)")
     # Generation
     parser.add_argument("--num-samples", type=int, default=4, help="Completions per prompt")
     parser.add_argument("--max-new-tokens", type=int, default=256)
@@ -248,9 +250,10 @@ if __name__ == "__main__":
                 max_seq_len=args.max_seq_len,
                 device=device,
             )
-            input_ids      = batch["input_ids"]       # [N, T]
-            attention_mask = batch["attention_mask"]
-            response_mask  = batch["response_mask"]
+            input_ids         = batch["input_ids"]          # [N, T]
+            attention_mask    = batch["attention_mask"]
+            response_mask     = batch["response_mask"]
+            inference_logprobs = batch["inference_logprobs"] # [N, T]
             student.model.train()
 
         total_loss       = 0.0
@@ -279,9 +282,10 @@ if __name__ == "__main__":
                 if is_student:
                     start  = mb_idx * args.train_batch_size
                     idx    = perm[start : start + args.train_batch_size]
-                    mb_ids  = input_ids[idx]        # [B, T]
-                    mb_attn = attention_mask[idx]
-                    mb_mask = response_mask[idx]
+                    mb_ids   = input_ids[idx]          # [B, T]
+                    mb_attn  = attention_mask[idx]
+                    mb_mask  = response_mask[idx]
+                    mb_inf_lp = inference_logprobs[idx] # [B, T]
                     shape_t = torch.tensor(
                         [mb_ids.shape[0], mb_ids.shape[1]], dtype=torch.long, device=device
                     )
@@ -359,11 +363,23 @@ if __name__ == "__main__":
                     dist.broadcast(t_logprobs_at_student, src=teacher_global_rank, group=all_group)
                     topk_idx = teacher_topk_idx
 
-                # -- Student: compute loss and backward --
+                # -- Student: compute TIS weights then loss and backward --
                 if is_student:
                     s_logprobs = student_logprobs_at_indices(student_logits, topk_idx, s_chunk)
                     shift_mask = mb_mask[:, 1:]                             # [B, T-1]
-                    loss = loss_fn(s_logprobs, t_logprobs, shift_mask) / n_mb
+
+                    # TIS weight: corrects for numerical gap between vLLM inference
+                    # log-probs and training-time log-probs (SDPO paper, Eq. 12 / A.4).
+                    # w_t = exp(log π_train(y_t) − log π_vllm(y_t)), clipped to C.
+                    if args.tis_clip > 0.0:
+                        sampled_ids = mb_ids[:, 1:]                         # [B, T-1]
+                        s_lp_sampled = student_logprob_at_sampled_tokens(student_logits, sampled_ids)
+                        inf_lp_shifted = mb_inf_lp[:, 1:].to(s_lp_sampled.dtype)  # [B, T-1]
+                        tis_weights = (s_lp_sampled - inf_lp_shifted).exp().clamp(max=args.tis_clip)
+                    else:
+                        tis_weights = None
+
+                    loss = loss_fn(s_logprobs, t_logprobs, shift_mask, tis_weights=tis_weights) / n_mb
                     student._scale_loss(loss).backward()
                     total_loss += loss.item()
                     n_batches  += 1

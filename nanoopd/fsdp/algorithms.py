@@ -73,6 +73,23 @@ def teacher_topk_logprobs(
     return torch.cat(idx_parts, dim=1), torch.cat(lp_parts, dim=1)
 
 
+def student_logprob_at_sampled_tokens(
+    student_logits: torch.Tensor,   # [B, T, V]
+    token_ids: torch.Tensor,        # [B, T]
+) -> torch.Tensor:                  # [B, T]
+    """Log-prob of the specific sampled token at each position (no grad).
+
+    Used to compute per-token TIS weights:
+        w_t = exp(log π_train(y_t) − log π_vllm(y_t))
+    which correct for the numerical gap between vLLM inference log-probs and
+    the training-time forward pass (SDPO paper, Appendix A.4).
+    """
+    with torch.no_grad():
+        lse = torch.logsumexp(student_logits, dim=-1)          # [B, T]
+        gathered = student_logits.gather(-1, token_ids.unsqueeze(-1)).squeeze(-1)  # [B, T]
+        return gathered - lse
+
+
 def student_logprobs_at_indices(
     student_logits: torch.Tensor,   # [B, T, V]  — retains grad
     topk_idx: torch.Tensor,         # [B, T, K]

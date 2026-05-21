@@ -83,6 +83,9 @@ def test_dapo_math():
 
     sd = DapoMathSelfDistillationDataset()
     for split_name, examples in [("train", train), ("test", test)]:
+        if not examples:
+            print(f"\n  -- {split_name} feedback -- (skipped: empty split)")
+            continue
         print(f"\n  -- {split_name} feedback --")
         ex = examples[0]
         fb_ex = FeedBackExample(

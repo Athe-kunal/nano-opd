@@ -1,5 +1,5 @@
 [project]
-name = "nanoopd"
+name = "opd"
 version = "0.1.0"
 description = "Nano library for On-policy distillation"
 readme = "README.md"
@@ -30,6 +30,8 @@ dependencies = [
     "accelerate>=1.13.0",
     "nvitop>=1.6.2",
     "rich>=15.0.0",
+    "loguru>=0.7.3",
+    "skyrl-gym>=0.3.0",
 ]
 
 [dependency-groups]

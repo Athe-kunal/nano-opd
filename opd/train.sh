@@ -3,9 +3,9 @@ set -euo pipefail
 
 TAG="${1:-default}"
 
-# Repo root is one level above this script (nanoopd/train.sh -> nano-opd/).
+# Repo root is one level above this script (opd/train.sh -> nano-opd/).
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BASE_DIR="${NANOOPD_BASE_DIR:-$ROOT_DIR/.nanoopd}"
+BASE_DIR="${opd_BASE_DIR:-$ROOT_DIR/.opd}"
 
 STUDENT_MODEL="${STUDENT_MODEL:-Qwen/Qwen2.5-1.5B-Instruct}"
 TEACHER_MODEL="${TEACHER_MODEL:-open-thoughts/OpenThinker3-7B}"
@@ -57,7 +57,7 @@ WORKER_LOG="$RUN_DIR/rollout_worker.log"
 TRAIN_LOG="$RUN_DIR/train.log"
 
 export PYTHONPATH="$ROOT_DIR"
-export NANOOPD_BASE_DIR="$BASE_DIR"
+export opd_BASE_DIR="$BASE_DIR"
 export ROLLOUT_HOST
 export ROLLOUT_PORT
 export USE_WANDB
@@ -149,7 +149,7 @@ echo "[launcher] sharding        : $SHARDING_STRATEGY"
 # signal the whole group (uv, Python, vLLM workers) with kill -TERM -- -PID.
 echo "[launcher] starting rollout worker -> $WORKER_LOG"
 setsid env CUDA_VISIBLE_DEVICES="$ROLLOUT_GPUS" \
-  uv run --extra gpu python "$ROOT_DIR/nanoopd/rollout_worker.py" \
+  uv run --extra gpu python "$ROOT_DIR/opd/rollout_worker.py" \
     --model "$STUDENT_MODEL" \
     --host "$ROLLOUT_HOST" \
     --port "$ROLLOUT_PORT" \
@@ -179,7 +179,7 @@ curl -sf "$HEALTH_URL" | grep -q '"ok": *true' \
 echo "[launcher] starting trainer -> $TRAIN_LOG"
 CUDA_VISIBLE_DEVICES="$TRAIN_GPUS,$TEACHER_GPUS" \
   uv run --extra gpu torchrun --standalone --nproc_per_node="$TOTAL_NPROC" \
-    nanoopd/train_opd.py \
+    opd/train_opd.py \
     --student-model "$STUDENT_MODEL" \
     --teacher-model "$TEACHER_MODEL" \
     --train-world-size "$TRAIN_NPROC" \

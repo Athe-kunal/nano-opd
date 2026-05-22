@@ -6,9 +6,9 @@ from typing import Any
 import wandb
 from datasets import load_dataset
 
-from nanoopd.common import print0
-from nanoopd.data.dapo_dataset import extract_last_boxed
-from nanoopd.rollout import generate_rollouts_remote
+from opd.common import print0
+from opd.envs.dapo_dataset import extract_last_boxed
+from opd.generator.rollout import generate_rollouts_remote
 
 
 DEFAULT_SYSTEM_PROMPT = (

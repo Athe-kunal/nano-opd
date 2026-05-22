@@ -9,22 +9,22 @@ import torch
 import torch.distributed as dist
 from omegaconf import OmegaConf
 
-from nanoopd.common import compute_init, compute_cleanup, print0, autodetect_device_type
-from nanoopd.loss import ALGORITHMS
-from nanoopd.fsdp.model import TeacherModel, StudentModel
-from nanoopd.fsdp.algorithms import (
+from opd.common import compute_init, compute_cleanup, print0, autodetect_device_type
+from opd.loss import ALGORITHMS
+from opd.fsdp.model import TeacherModel, StudentModel
+from opd.fsdp.algorithms import (
     student_topk_indices,
     teacher_logprobs_at_indices,
     teacher_topk_logprobs,
     student_logprobs_at_indices,
     student_logprob_at_sampled_tokens,
 )
-from nanoopd.metrics import (
+from opd.fsdp.metrics import (
     compute_overlap_ratio,
     compute_overlap_token_advantage,
     compute_entropy_gap,
 )
-from nanoopd.rollout import (
+from opd.generator.rollout import (
     generate_rollouts_remote,
     remote_vllm_init_weight_transfer,
     sync_weights_to_vllm_inplace,
@@ -32,10 +32,10 @@ from nanoopd.rollout import (
     wait_for_rollout_worker,
 )
 from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
-from nanoopd.data.dataset import distributed_opd_loader, build_opd_dataset, DatasetType
-import nanoopd.eval_aime as _eval_aime
-import nanoopd.eval_livecodebench as _eval_lcb
-import nanoopd.eval_sciknoweval as _eval_sciknow
+from opd.envs.dataset import distributed_opd_loader, build_opd_dataset
+import opd.eval_aime as _eval_aime
+import opd.eval_livecodebench as _eval_lcb
+import opd.eval_sciknoweval as _eval_sciknow
 
 _EVAL_FN = {
     "dapo_math": _eval_aime.run_eval,

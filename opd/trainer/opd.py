@@ -19,7 +19,7 @@ from opd.fsdp.algorithms import (
     student_logprobs_at_indices,
     student_logprob_at_sampled_tokens,
 )
-from opd.fsdp.metrics import (
+from opd.metrics import (
     compute_overlap_ratio,
     compute_overlap_token_advantage,
     compute_entropy_gap,
@@ -33,14 +33,15 @@ from opd.generator.rollout import (
 )
 from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
 from opd.envs.dataset import distributed_opd_loader, build_opd_dataset
-import opd.eval_aime as _eval_aime
-import opd.eval_livecodebench as _eval_lcb
-import opd.eval_sciknoweval as _eval_sciknow
+from opd.envs.dapo_dataset import DapoMathEnv
+from opd.envs.livecodebench import LiveCodeBenchEnv
+from opd.envs.sciknoweval import SciKnowEvalEnv
+from opd.envs.base import OPDEnvBase
 
-_EVAL_FN = {
-    "dapo_math": _eval_aime.run_eval,
-    "livecodebench": _eval_lcb.run_eval,
-    "sciknoweval": _eval_sciknow.run_eval,
+_ENV_CLS = {
+    "dapo_math": DapoMathEnv,
+    "livecodebench": LiveCodeBenchEnv,
+    "sciknoweval": SciKnowEvalEnv,
 }
 
 if __name__ == "__main__":
@@ -235,7 +236,12 @@ if __name__ == "__main__":
         # ---- Rollout generation (student ranks only) ----
         if is_student:
             examples, _ = next(loader_iter)
-            prompts = [ex.prompt for ex in examples]
+            prompts = [
+                student.tokenizer.apply_chat_template(
+                    env.init([])[0], tokenize=False, add_generation_prompt=True
+                )
+                for env in examples
+            ]
             rollouts = generate_rollouts_remote(
                 args.rollout_worker_url,
                 prompts=prompts,
@@ -438,12 +444,12 @@ if __name__ == "__main__":
 
             if args.eval_every > 0 and (step + 1) % args.eval_every == 0:
                 if master_process:
-                    _EVAL_FN[args.dataset](
+                    _ENV_CLS[args.dataset].evaluate(
                         rollout_worker_url=args.rollout_worker_url,
+                        step=step + 1,
                         tokenizer=student.tokenizer,
                         eval_k=args.eval_k,
                         eval_max_tokens=args.eval_max_tokens,
-                        step=step + 1,
                     )
 
         # All ranks sync at the end of each step before the next n_mb broadcast.

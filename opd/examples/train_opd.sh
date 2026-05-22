@@ -149,7 +149,7 @@ echo "[launcher] sharding        : $SHARDING_STRATEGY"
 # signal the whole group (uv, Python, vLLM workers) with kill -TERM -- -PID.
 echo "[launcher] starting rollout worker -> $WORKER_LOG"
 setsid env CUDA_VISIBLE_DEVICES="$ROLLOUT_GPUS" \
-  uv run --extra gpu python "$ROOT_DIR/opd/rollout_worker.py" \
+  uv run --extra gpu python "$ROOT_DIR/opd/generator/rollout_worker.py" \
     --model "$STUDENT_MODEL" \
     --host "$ROLLOUT_HOST" \
     --port "$ROLLOUT_PORT" \
@@ -179,7 +179,7 @@ curl -sf "$HEALTH_URL" | grep -q '"ok": *true' \
 echo "[launcher] starting trainer -> $TRAIN_LOG"
 CUDA_VISIBLE_DEVICES="$TRAIN_GPUS,$TEACHER_GPUS" \
   uv run --extra gpu torchrun --standalone --nproc_per_node="$TOTAL_NPROC" \
-    opd/train_opd.py \
+    opd/trainer/opd.py \
     --student-model "$STUDENT_MODEL" \
     --teacher-model "$TEACHER_MODEL" \
     --train-world-size "$TRAIN_NPROC" \

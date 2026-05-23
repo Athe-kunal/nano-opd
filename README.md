@@ -9,12 +9,12 @@ The DAPO exporter writes JSONL rows that match the `Example` type used by the tr
 **English** (default Hugging Face config):
 
 ```bash
-python -m nanoopd.data.dapo -o datasets/dapo_math.jsonl
+python -m opd.envs.dapo -o datasets/dapo_math.jsonl
 ```
 
 ## Main parameters in `train.sh`
 
-The script takes an optional **run tag** as the first argument (default: `default`). Artifacts go under `NANOCHAT_BASE_DIR` (default: `.nanoopd` under the repo), in `opd/<tag>/` (logs, checkpoints).
+The script takes an optional **run tag** as the first argument (default: `default`). Artifacts go under `NANOCHAT_BASE_DIR` (default: `.opd` under the repo), in `opd/<tag>/` (logs, checkpoints).
 
 ### Models
 
@@ -27,7 +27,7 @@ Comma-separated physical IDs. **`TRAIN_GPUS` must not overlap** with **`ROLLOUT_
 Example (student on GPU 3; teacher and rollouts both on GPU 2):
 
 ```bash
-ROLLOUT_GPUS=2 TRAIN_GPUS=3 TEACHER_GPUS=2 bash nanoopd/train.sh
+ROLLOUT_GPUS=2 TRAIN_GPUS=3 TEACHER_GPUS=2 bash opd/train.sh
 ```
 
 - **`ROLLOUT_GPUS`** — GPUs for the vLLM rollout worker (student sampling). Multiple IDs set tensor-parallel size for rollout.
@@ -81,5 +81,5 @@ Three token-level metrics are logged under `metrics/` each step:
 Override variables as environment variables when invoking the script, for example:
 
 ```bash
-STUDENT_MODEL=... TRAIN_GPUS=0,1 bash nanoopd/train.sh my_run
+STUDENT_MODEL=... TRAIN_GPUS=0,1 bash opd/train.sh my_run
 ```

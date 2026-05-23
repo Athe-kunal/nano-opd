@@ -27,7 +27,7 @@ from loguru import logger
 from transformers import AutoTokenizer
 from vllm import LLM
 from vllm.config import WeightTransferConfig
-from nanoopd.rollout import generate_rollouts
+from opd.generator.rollout import generate_rollouts
 
 class RolloutState:
     def __init__(self, model_path, tokenizer_path, dtype, gpu_memory_utilization, tensor_parallel_size,weight_transfer_backend):
@@ -123,7 +123,7 @@ class RolloutState:
         logger.info("In-place vLLM update completed and prefix cache reset.")
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "nanoopd-rollout-worker/0.1"
+    server_version = "opd-rollout-worker/0.1"
 
     def _read_json(self):
         length = int(self.headers.get("Content-Length", "0"))
@@ -196,7 +196,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="nanoopd rollout worker")
+    parser = argparse.ArgumentParser(description="opd rollout worker")
     parser.add_argument("--model", type=str, required=True)
     parser.add_argument("--tokenizer", type=str, default="")
     parser.add_argument("--host", type=str, default="127.0.0.1")

@@ -50,7 +50,7 @@ There is **no separate teacher model**. The teacher is an EMA copy of the studen
 
 ---
 
-## Loss functions (`nanoopd/loss.py`)
+## Loss functions (`opd/loss.py`)
 
 All losses operate on **top-K truncated distributions**, not the full vocabulary. The tensors have shape `[B, T, K]` where K = `distill-top-k`.
 
@@ -173,20 +173,20 @@ The shift by 1 (`[:, 1:]` on mask, `[:, :-1]` on logits) aligns token t's logits
 
 | File | Purpose |
 |------|---------|
-| `nanoopd/loss.py` | Reverse KL, forward KL, JSD loss functions |
-| `nanoopd/train_opd.py` | OPD training loop (external frozen teacher) |
-| `nanoopd/train_sdpo.py` | SDPO training loop (EMA self-teacher) |
-| `nanoopd/rollout.py` | vLLM HTTP client, batch preparation, weight sync |
-| `nanoopd/rollout_worker.py` | The vLLM HTTP server that runs in a separate process |
-| `nanoopd/fsdp/algorithms.py` | Top-K log-prob selection (chunked, distributed) |
-| `nanoopd/fsdp/model.py` | Student (FSDP-wrapped) and Teacher model classes |
-| `nanoopd/data/dataset.py` | Dataset loading and distributed data loader |
-| `nanoopd/data/dapo.py` | DAPO math dataset exporter |
-| `nanoopd/eval_aime.py` | AIME evaluation (pass@k) |
+| `opd/loss.py` | Reverse KL, forward KL, JSD loss functions |
+| `opd/train_opd.py` | OPD training loop (external frozen teacher) |
+| `opd/train_sdpo.py` | SDPO training loop (EMA self-teacher) |
+| `opd/rollout.py` | vLLM HTTP client, batch preparation, weight sync |
+| `opd/rollout_worker.py` | The vLLM HTTP server that runs in a separate process |
+| `opd/fsdp/algorithms.py` | Top-K log-prob selection (chunked, distributed) |
+| `opd/fsdp/model.py` | Student (FSDP-wrapped) and Teacher model classes |
+| `opd/data/dataset.py` | Dataset loading and distributed data loader |
+| `opd/data/dapo.py` | DAPO math dataset exporter |
+| `opd/eval_aime.py` | AIME evaluation (pass@k) |
 
 ## Good entry points for hacking
 
 - **New loss function**: add a function to `loss.py`, register it in `ALGORITHMS`, add a choice to the `--algorithm` argparse argument in both training scripts.
-- **New dataset**: add a file in `nanoopd/data/`, make it produce `Example` objects (see `dataset.py`), wire it into `build_opd_dataset()`.
+- **New dataset**: add a file in `opd/data/`, make it produce `Example` objects (see `dataset.py`), wire it into `build_opd_dataset()`.
 - **Different EMA schedule**: the `update_teacher_ema` function in `train_sdpo.py` is self-contained — swap in a warmup, a cyclical schedule, or a per-layer alpha.
 - **Different top-K selection**: `fsdp/algorithms.py` contains the top-K helpers in isolation — easy to swap for top-p, nucleus sampling-style selection, or importance-weighted sampling.

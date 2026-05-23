@@ -9,22 +9,22 @@ import torch
 import torch.distributed as dist
 from omegaconf import OmegaConf
 
-from nanoopd.common import compute_init, compute_cleanup, print0, autodetect_device_type
-from nanoopd.loss import ALGORITHMS
-from nanoopd.fsdp.model import TeacherModel, StudentModel
-from nanoopd.fsdp.algorithms import (
+from opd.common import compute_init, compute_cleanup, print0, autodetect_device_type
+from opd.loss import ALGORITHMS
+from opd.fsdp.model import TeacherModel, StudentModel
+from opd.fsdp.algorithms import (
     student_topk_indices,
     teacher_logprobs_at_indices,
     teacher_topk_logprobs,
     student_logprobs_at_indices,
     student_logprob_at_sampled_tokens,
 )
-from nanoopd.metrics import (
+from opd.metrics import (
     compute_overlap_ratio,
     compute_overlap_token_advantage,
     compute_entropy_gap,
 )
-from nanoopd.rollout import (
+from opd.generator.rollout import (
     generate_rollouts_remote,
     remote_vllm_init_weight_transfer,
     sync_weights_to_vllm_inplace,
@@ -32,15 +32,15 @@ from nanoopd.rollout import (
     wait_for_rollout_worker,
 )
 from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
-from nanoopd.data.dataset import distributed_opd_loader, build_opd_dataset, DatasetType
-import nanoopd.eval_aime as _eval_aime
-import nanoopd.eval_livecodebench as _eval_lcb
-import nanoopd.eval_sciknoweval as _eval_sciknow
+from opd.envs.dataset import distributed_opd_loader, build_opd_dataset
+from opd.envs.dapo_dataset import DapoMathEnv
+from opd.envs.livecodebench import LiveCodeBenchEnv
+from opd.envs.sciknoweval import SciKnowEvalEnv
 
-_EVAL_FN = {
-    "dapo_math": _eval_aime.run_eval,
-    "livecodebench": _eval_lcb.run_eval,
-    "sciknoweval": _eval_sciknow.run_eval,
+_ENV_CLS = {
+    "dapo_math": DapoMathEnv,
+    "livecodebench": LiveCodeBenchEnv,
+    "sciknoweval": SciKnowEvalEnv,
 }
 
 if __name__ == "__main__":
@@ -235,7 +235,12 @@ if __name__ == "__main__":
         # ---- Rollout generation (student ranks only) ----
         if is_student:
             examples, _ = next(loader_iter)
-            prompts = [ex.prompt for ex in examples]
+            prompts = [
+                student.tokenizer.apply_chat_template(
+                    env.init([])[0], tokenize=False, add_generation_prompt=True
+                )
+                for env in examples
+            ]
             rollouts = generate_rollouts_remote(
                 args.rollout_worker_url,
                 prompts=prompts,
@@ -436,18 +441,20 @@ if __name__ == "__main__":
                 student.save_model(save_path)   # barriers within student_group only
                 print0(f"Saved checkpoint to {save_path}")
 
-            if args.eval_every > 0 and (step + 1) % args.eval_every == 0:
-                if master_process:
-                    _EVAL_FN[args.dataset](
-                        rollout_worker_url=args.rollout_worker_url,
-                        tokenizer=student.tokenizer,
-                        eval_k=args.eval_k,
-                        eval_max_tokens=args.eval_max_tokens,
-                        step=step + 1,
-                    )
-
-        # All ranks sync at the end of each step before the next n_mb broadcast.
+        # All ranks sync before eval so FSDP/NCCL state is settled.
+        # Eval only runs on rank 0 and can take minutes (vLLM generation);
+        # the barrier must fire first so other ranks don't time out waiting.
         dist.barrier(group=all_group)
+
+        if args.eval_every > 0 and (step + 1) % args.eval_every == 0:
+            if master_process:
+                _ENV_CLS[args.dataset].evaluate(
+                    rollout_worker_url=args.rollout_worker_url,
+                    step=step + 1,
+                    tokenizer=student.tokenizer,
+                    eval_k=args.eval_k,
+                    eval_max_tokens=args.eval_max_tokens,
+                )
 
     compute_cleanup()
     if master_process and use_wandb:

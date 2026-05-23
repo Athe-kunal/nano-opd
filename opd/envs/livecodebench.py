@@ -1,18 +1,25 @@
-import os, copy, re, subprocess, sys, tempfile, textwrap
-import numpy as np
-import base64, json, pickle, zlib
-from dataclasses import replace
-from datetime import datetime
-from pathlib import Path
-from typing import Sequence
-from datasets import concatenate_datasets, load_dataset, Dataset
+from __future__ import annotations
 
-from nanoopd.data.base import FeedBackExample, SelfDistillationDatasetbase
+import json
+import re
+import subprocess
+import sys
+import textwrap
+from datetime import datetime
+from typing import Any
+
+import wandb
+from datasets import Dataset, concatenate_datasets, load_dataset
+from skyrl_gym.envs.base_text_env import ConversationType
+
+from opd.common import print0
+from opd.envs.base import OPDEnvBase
+from opd.eval.eval_aime_2025 import pass_at_k
+from opd.generator.rollout import generate_rollouts_remote
 
 LCB_TEST_CUTOFF = datetime(2025, 2, 1)
 LCB_TRAIN_CUTOFF = datetime(2025, 2, 1)
 TIME_LIMIT = 6
-PERCENTAGE_TO_KEEP = 0.5
 
 CODE_PROMPT = """You are a coding expert. You will be given a coding problem, and you need to write a correct Python program that matches the specification and passes all tests. The time limit is 1 second. You may start by outlining your thought process. In the end, please provide the complete code in a code block enclosed with ```.
 
@@ -24,7 +31,8 @@ def _parse_signature(starter_code: str) -> str:
     return "def " + (after_def.split("Input\n")[0] if "Input\n" in after_def else after_def).strip()
 
 
-def _translate_private_test_cases(encoded_data, fn_name: str):
+def _translate_private_test_cases(encoded_data, fn_name: str) -> str:
+    import base64, pickle, zlib
     decoded_data = base64.b64decode(encoded_data)
     decompressed_data = zlib.decompress(decoded_data)
     original_data = pickle.loads(decompressed_data)
@@ -67,7 +75,6 @@ def load_livecodebench(dataset_split: str, until: datetime | None = None) -> Dat
             "kind": "code",
             "dataset": "livecodebench",
             "description": problem,
-            "problem": problem,
             "prompt": CODE_PROMPT.format(problem=problem),
             "tests": _translate_private_test_cases(ex["private_test_cases"], fn_name=fn_name),
         }
@@ -81,43 +88,8 @@ def load_livecodebench(dataset_split: str, until: datetime | None = None) -> Dat
     return concatenate_datasets(processed_shards)
 
 
-def sample_tests(example):
-    """Keep 50% of tests for the train set."""
-    tests = json.loads(example["tests"])
-    inputs, outputs = tests["inputs"], tests["outputs"]
-
-    num_tests = len(inputs)
-    keep_count = max(1, int(num_tests * PERCENTAGE_TO_KEEP))
-    keep_indices = np.sort(np.random.choice(num_tests, size=keep_count, replace=False))
-
-    reduced_tests = copy.deepcopy(tests)
-    reduced_tests["inputs"] = [inputs[i] for i in keep_indices]
-    reduced_tests["outputs"] = [outputs[i] for i in keep_indices]
-
-    example["tests"] = json.dumps(reduced_tests)
-    return example
-
-
-def split_and_save(ds: Dataset, output_dir: str):
-    """
-    test.json  → full test suite per problem (for evaluation)
-    train.json → 50% of tests per problem (for RL training)
-    """
-    np.random.seed(0)
-    os.makedirs(output_dir, exist_ok=True)
-
-    ds.to_json(os.path.join(output_dir, "test.json"))
-
-    ds_reduced = ds.map(sample_tests)
-    ds_reduced.to_json(os.path.join(output_dir, "train.json"))
-
-    print(f"Test set:  {len(ds)} problems, full tests")
-    print(f"Train set: {len(ds_reduced)} problems, {PERCENTAGE_TO_KEEP:.0%} of tests kept")
-
-
 def _extract_code(response: str) -> str | None:
     """Return the last Python code block from a model response, or None."""
-    # Match ```python ... ``` or ``` ... ```
     blocks = re.findall(r"```(?:python)?\s*\n(.*?)```", response, re.DOTALL)
     return blocks[-1].strip() if blocks else None
 
@@ -182,47 +154,117 @@ def _run_stdio(code: str, inputs: list, outputs: list, time_limit: int) -> list[
     return results
 
 
-class LiveCodeSelfDistillationDataset(SelfDistillationDatasetbase):
-
-    def preprocess_dataset(self, test_size: float = 0.1, seed: int = 42) -> tuple[list, list]:
-        from nanoopd.data.base import InputExample
-        def _adapt(r): return InputExample(prompt=r["prompt"], kind=r["kind"], dataset=r["dataset"], description=r["description"], system=r.get("system"), metadata=r.get("tests"))
-        train = [_adapt(dict(r)) for r in load_livecodebench(dataset_split="train")]
-        test = [_adapt(dict(r)) for r in load_livecodebench(dataset_split="test")]
-        return train, test
-
-    def get_feedback(self, result: Sequence[FeedBackExample]) -> list[FeedBackExample]:
-        updated = []
-        for ex in result:
-            if ex.answer is None or ex.metadata is None:
-                updated.append(replace(ex, feedback="❌ Missing model response or test metadata"))
-                continue
-
-            code = _extract_code(ex.answer)
-            if code is None:
-                updated.append(replace(ex, feedback="❌ No code block found in response"))
-                continue
-
-            tests = json.loads(ex.metadata) if isinstance(ex.metadata, str) else ex.metadata
-            inputs = tests["inputs"]
-            outputs = tests["outputs"]
-            fn_name = tests.get("fn_name", "")
-            testtype = tests.get("testtype", "stdin")
-            time_limit = tests.get("time_limit", TIME_LIMIT)
-
-            if testtype == "functional" and fn_name:
-                per_test = _run_functional(code, fn_name, inputs, outputs, time_limit)
-            else:
-                per_test = _run_stdio(code, inputs, outputs, time_limit)
-
-            feedback = "\n".join(f"Test {i + 1}: {r}" for i, r in enumerate(per_test))
-            updated.append(replace(ex, feedback=feedback))
-
-        return updated
+def _all_tests_pass(code: str, tests: dict) -> bool:
+    fn_name = tests.get("fn_name", "")
+    testtype = tests.get("testtype", "stdin")
+    time_limit = tests.get("time_limit", TIME_LIMIT)
+    if testtype == "functional" and fn_name:
+        results = _run_functional(code, fn_name, tests["inputs"], tests["outputs"], time_limit)
+    else:
+        results = _run_stdio(code, tests["inputs"], tests["outputs"], time_limit)
+    return all(r == "✅" for r in results)
 
 
-if __name__ == "__main__":
-    ds = load_livecodebench(dataset_split="test", until=datetime(2025, 5, 1))
-    split_and_save(ds, output_dir="datasets/lcb_v6")
-    # → datasets/lcb_v6/test.json   (full tests, for eval)
-    # → datasets/lcb_v6/train.json  (50% tests, for RL training)
+class LiveCodeBenchEnv(OPDEnvBase):
+    """
+    skyrl_gym environment for LiveCodeBench problems.
+
+    Each instance wraps a single (prompt, tests) pair. The reward is 1.0 if
+    all test cases pass, else 0.0. get_feedback returns per-test execution
+    results for SDPO self-distillation. evaluate runs the LCB test split.
+    """
+
+    def __init__(self, prompt: str, tests: dict[str, Any]) -> None:
+        super().__init__(kind="code", dataset="livecodebench")
+        self.prompt = prompt
+        self.tests = tests
+
+    def init(self, prompt: ConversationType) -> tuple[ConversationType, dict[str, Any]]:
+        return [{"role": "user", "content": self.prompt}], {}
+
+    def _run_tests(self, action: str) -> list[str] | None:
+        """Run all test cases for this action. Returns per-test results, or None if no code found."""
+        code = _extract_code(action)
+        if code is None:
+            return None
+        fn_name = self.tests.get("fn_name", "")
+        testtype = self.tests.get("testtype", "stdin")
+        time_limit = self.tests.get("time_limit", TIME_LIMIT)
+        if testtype == "functional" and fn_name:
+            return _run_functional(code, fn_name, self.tests["inputs"], self.tests["outputs"], time_limit)
+        return _run_stdio(code, self.tests["inputs"], self.tests["outputs"], time_limit)
+
+    def compute_reward(self, action: str) -> tuple[float, bool]:
+        results = self._run_tests(action)
+        if results is None:
+            return 0.0, True
+        return (1.0 if all(r == "✅" for r in results) else 0.0), True
+
+    def get_feedback(self, action: str) -> str:
+        results = self._run_tests(action)
+        if results is None:
+            return "❌ No code block found in response"
+        return "\n".join(f"Test {i + 1}: {r}" for i, r in enumerate(results))
+
+    @classmethod
+    def evaluate(
+        cls,
+        rollout_worker_url: str,
+        step: int,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        kwargs.pop("tokenizer", None)
+        return run_eval(rollout_worker_url=rollout_worker_url, step=step, **kwargs)
+
+    @classmethod
+    def load(cls, dataset_split: str = "train", until: datetime | None = None) -> list[LiveCodeBenchEnv]:
+        ds = load_livecodebench(dataset_split=dataset_split, until=until)
+        envs = []
+        for row in ds:
+            tests = json.loads(row["tests"]) if isinstance(row["tests"], str) else row["tests"]
+            envs.append(cls(prompt=row["prompt"], tests=tests))
+        return envs
+
+
+def run_eval(
+    rollout_worker_url: str,
+    eval_k: int,
+    eval_max_tokens: int,
+    step: int,
+    temperature: float = 0.6,
+    top_k: int = -1,
+) -> dict[str, Any]:
+    """Evaluate on LiveCodeBench test split (problems after LCB_TEST_CUTOFF)."""
+    test_ds = load_livecodebench(dataset_split="test")
+    problems = [dict(r) for r in test_ds]
+
+    prompts = [p["prompt"] for p in problems]
+    rollouts = generate_rollouts_remote(
+        rollout_worker_url, prompts, eval_k, eval_max_tokens, temperature, top_k
+    )
+
+    per_problem = []
+    for i, prob in enumerate(problems):
+        batch = rollouts[i * eval_k : (i + 1) * eval_k]
+        tests = json.loads(prob["tests"]) if isinstance(prob["tests"], str) else prob["tests"]
+        n_correct = sum(
+            1 for r in batch
+            if (code := _extract_code(r["response"])) is not None and _all_tests_pass(code, tests)
+        )
+        per_problem.append({
+            "problem_idx": i,
+            "n_correct": n_correct,
+            "pass_at_k": pass_at_k(eval_k, n_correct, eval_k),
+        })
+
+    overall = sum(r["pass_at_k"] for r in per_problem) / len(per_problem)
+    metrics = {f"eval/pass@{eval_k}": overall}
+
+    print0(f"[lcb eval step={step}] {json.dumps(metrics)}")
+    for r in per_problem:
+        print0(f"  problem {r['problem_idx']:03d}: {r['n_correct']}/{eval_k}  pass@{eval_k}={r['pass_at_k']:.3f}")
+
+    if wandb.run is not None:
+        wandb.log(metrics, step=step)
+
+    return metrics

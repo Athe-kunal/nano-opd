@@ -14,7 +14,7 @@ from skyrl_gym.envs.base_text_env import ConversationType
 
 from opd.common import print0
 from opd.envs.base import OPDEnvBase
-from opd.eval.eval_aime import pass_at_k
+from opd.eval.eval_aime_2025 import pass_at_k
 from opd.generator.rollout import generate_rollouts_remote
 
 LCB_TEST_CUTOFF = datetime(2025, 2, 1)

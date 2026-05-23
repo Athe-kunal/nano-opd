@@ -3,9 +3,10 @@ set -euo pipefail
 
 TAG="${1:-default}"
 
-# Repo root is one level above this script (opd/train.sh -> nano-opd/).
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BASE_DIR="${opd_BASE_DIR:-$ROOT_DIR/.opd}"
+# opd/examples/train_opd.sh -> OPD_DIR is the Python package tree, REPO_ROOT is nano-opd/.
+OPD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$OPD_DIR/.." && pwd)"
+BASE_DIR="${opd_BASE_DIR:-$REPO_ROOT/.opd}"
 
 STUDENT_MODEL="${STUDENT_MODEL:-Qwen/Qwen2.5-1.5B-Instruct}"
 TEACHER_MODEL="${TEACHER_MODEL:-open-thoughts/OpenThinker3-7B}"
@@ -56,7 +57,7 @@ SAVE_DIR="$RUN_DIR/checkpoints"
 WORKER_LOG="$RUN_DIR/rollout_worker.log"
 TRAIN_LOG="$RUN_DIR/train.log"
 
-export PYTHONPATH="$ROOT_DIR"
+export PYTHONPATH="$REPO_ROOT"
 export opd_BASE_DIR="$BASE_DIR"
 export ROLLOUT_HOST
 export ROLLOUT_PORT
@@ -149,7 +150,7 @@ echo "[launcher] sharding        : $SHARDING_STRATEGY"
 # signal the whole group (uv, Python, vLLM workers) with kill -TERM -- -PID.
 echo "[launcher] starting rollout worker -> $WORKER_LOG"
 setsid env CUDA_VISIBLE_DEVICES="$ROLLOUT_GPUS" \
-  uv run --extra gpu python "$ROOT_DIR/opd/generator/rollout_worker.py" \
+  uv run --extra gpu --directory "$REPO_ROOT" python "$OPD_DIR/generator/rollout_worker.py" \
     --model "$STUDENT_MODEL" \
     --host "$ROLLOUT_HOST" \
     --port "$ROLLOUT_PORT" \
@@ -178,8 +179,8 @@ curl -sf "$HEALTH_URL" | grep -q '"ok": *true' \
 # CUDA_VISIBLE_DEVICES maps logical device indices to physical GPUs in that order.
 echo "[launcher] starting trainer -> $TRAIN_LOG"
 CUDA_VISIBLE_DEVICES="$TRAIN_GPUS,$TEACHER_GPUS" \
-  uv run --extra gpu torchrun --standalone --nproc_per_node="$TOTAL_NPROC" \
-    opd/trainer/opd.py \
+  uv run --extra gpu --directory "$REPO_ROOT" torchrun --standalone --nproc_per_node="$TOTAL_NPROC" \
+    "$OPD_DIR/trainer/train_opd.py" \
     --student-model "$STUDENT_MODEL" \
     --teacher-model "$TEACHER_MODEL" \
     --train-world-size "$TRAIN_NPROC" \

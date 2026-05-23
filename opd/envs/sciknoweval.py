@@ -126,6 +126,7 @@ class SciKnowEvalEnv(OPDEnvBase):
         step: int,
         **kwargs: Any,
     ) -> dict[str, Any]:
+        kwargs.pop("tokenizer", None)
         return run_eval(rollout_worker_url=rollout_worker_url, step=step, **kwargs)
 
     @classmethod

@@ -36,7 +36,6 @@ from opd.envs.dataset import distributed_opd_loader, build_opd_dataset
 from opd.envs.dapo_dataset import DapoMathEnv
 from opd.envs.livecodebench import LiveCodeBenchEnv
 from opd.envs.sciknoweval import SciKnowEvalEnv
-from opd.envs.base import OPDEnvBase
 
 _ENV_CLS = {
     "dapo_math": DapoMathEnv,
@@ -442,18 +441,20 @@ if __name__ == "__main__":
                 student.save_model(save_path)   # barriers within student_group only
                 print0(f"Saved checkpoint to {save_path}")
 
-            if args.eval_every > 0 and (step + 1) % args.eval_every == 0:
-                if master_process:
-                    _ENV_CLS[args.dataset].evaluate(
-                        rollout_worker_url=args.rollout_worker_url,
-                        step=step + 1,
-                        tokenizer=student.tokenizer,
-                        eval_k=args.eval_k,
-                        eval_max_tokens=args.eval_max_tokens,
-                    )
-
-        # All ranks sync at the end of each step before the next n_mb broadcast.
+        # All ranks sync before eval so FSDP/NCCL state is settled.
+        # Eval only runs on rank 0 and can take minutes (vLLM generation);
+        # the barrier must fire first so other ranks don't time out waiting.
         dist.barrier(group=all_group)
+
+        if args.eval_every > 0 and (step + 1) % args.eval_every == 0:
+            if master_process:
+                _ENV_CLS[args.dataset].evaluate(
+                    rollout_worker_url=args.rollout_worker_url,
+                    step=step + 1,
+                    tokenizer=student.tokenizer,
+                    eval_k=args.eval_k,
+                    eval_max_tokens=args.eval_max_tokens,
+                )
 
     compute_cleanup()
     if master_process and use_wandb:

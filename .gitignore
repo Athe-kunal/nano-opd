@@ -228,3 +228,5 @@ agent_shaper_tests/
 .mcp.json
 
 notebooks/
+
+.opd/

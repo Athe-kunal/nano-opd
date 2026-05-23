@@ -114,10 +114,11 @@ class SciKnowEvalEnv(OPDEnvBase):
         return (1.0 if pred == self.answer_key else 0.0), True
 
     def get_feedback(self, action: str) -> str:
-        pred = _extract_answer(action)
-        if pred == self.answer_key:
-            return f"Correct! The answer is {self.answer_key}."
-        return f"Incorrect. The correct answer is {self.answer_key}."
+        # pred = _extract_answer(action)
+        # if pred == self.answer_key:
+        #     return f"Correct! The answer is {self.answer_key}."
+        # return f"Incorrect. The correct answer is {self.answer_key}."
+        return ""
 
     @classmethod
     def evaluate(

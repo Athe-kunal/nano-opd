@@ -110,10 +110,11 @@ class DapoMathEnv(OPDEnvBase):
         return (1.0 if correct else 0.0), True
 
     def get_feedback(self, action: str) -> str:
-        pred = extract_last_boxed(action)
-        if check_answer(pred, self.answer):
-            return f"Correct! The answer is {self.answer}."
-        return f"The correct answer is {self.answer}."
+        # pred = extract_last_boxed(action)
+        # if check_answer(pred, self.answer):
+        #     return f"Correct! The answer is {self.answer}."
+        # return f"The correct answer is {self.answer}."
+        return ""
 
     @classmethod
     def evaluate(

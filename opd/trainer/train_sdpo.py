@@ -517,13 +517,22 @@ if __name__ == "__main__":
                     t_shift_mask = t_mb_mask[:, 1:]
                     with torch.no_grad():
                         teacher_logits = teacher.get_logits(t_mb_ids, t_mb_attn)[:, :-1]
-                    t_resp, _ = pack_response_logits(teacher_logits, t_shift_mask)
-                    # Align teacher's compact tensor to student's R_max
+                    t_resp, t_compact_mask = pack_response_logits(teacher_logits, t_shift_mask)
+                    # Align teacher's compact tensors to student's R_max.
+                    # Positions padded with zeros would receive log_softmax(0) = -log(V)
+                    # (a spurious uniform distribution). The compact mask tracks which
+                    # positions are real vs. padded so the loss can exclude them.
                     if t_resp.shape[1] < R_max:
-                        pad = t_resp.new_zeros(t_resp.shape[0], R_max - t_resp.shape[1], t_resp.shape[-1])
-                        t_resp = torch.cat([t_resp, pad], dim=1)
+                        pad_len = R_max - t_resp.shape[1]
+                        t_resp = torch.cat(
+                            [t_resp, t_resp.new_zeros(t_resp.shape[0], pad_len, t_resp.shape[-1])], dim=1
+                        )
+                        t_compact_mask = torch.cat(
+                            [t_compact_mask, t_compact_mask.new_zeros(t_compact_mask.shape[0], pad_len)], dim=1
+                        )
                     elif t_resp.shape[1] > R_max:
                         t_resp = t_resp[:, :R_max]
+                        t_compact_mask = t_compact_mask[:, :R_max]
 
                 # -- Top-K selection and log-prob computation --
                 # Student selects top-K indices (reverse_kl / jsd); teacher selects
@@ -538,18 +547,20 @@ if __name__ == "__main__":
                     dist.broadcast(topk_idx, src=0, group=all_group)
 
                     if is_teacher:
-                        t_log_resp = F.log_softmax(t_resp, dim=-1)
-                        t_logprobs = t_log_resp.gather(-1, topk_idx)        # [B, R, K]
+                        t_log_resp = F.log_softmax(t_resp.float(), dim=-1)
+                        t_logprobs = t_log_resp.gather(-1, topk_idx)        # [B, R, K] fp32
                         _, t_topk_idx = t_resp.topk(K, dim=-1)
-                        t_own_logprobs = t_log_resp.gather(-1, t_topk_idx)  # [B, R, K]
+                        t_own_logprobs = t_log_resp.gather(-1, t_topk_idx)  # [B, R, K] fp32
                     else:
-                        t_logprobs     = torch.empty(B, R_max, K, dtype=torch.bfloat16, device=device)
-                        t_topk_idx     = torch.empty(B, R_max, K, dtype=torch.long,     device=device)
-                        t_own_logprobs = torch.empty(B, R_max, K, dtype=torch.bfloat16, device=device)
+                        t_logprobs     = torch.empty(B, R_max, K, dtype=torch.float32, device=device)
+                        t_topk_idx     = torch.empty(B, R_max, K, dtype=torch.long,    device=device)
+                        t_own_logprobs = torch.empty(B, R_max, K, dtype=torch.float32, device=device)
+                        t_compact_mask = torch.zeros(B, R_max,    dtype=torch.float32, device=device)
 
                     dist.broadcast(t_logprobs,     src=teacher_global_rank, group=all_group)
                     dist.broadcast(t_topk_idx,     src=teacher_global_rank, group=all_group)
                     dist.broadcast(t_own_logprobs, src=teacher_global_rank, group=all_group)
+                    dist.broadcast(t_compact_mask, src=teacher_global_rank, group=all_group)
 
                     student_topk_idx = topk_idx
                     teacher_topk_idx = t_topk_idx
@@ -563,28 +574,36 @@ if __name__ == "__main__":
                     dist.broadcast(student_topk_idx, src=0, group=all_group)
 
                     if is_teacher:
-                        t_log_resp = F.log_softmax(t_resp, dim=-1)
+                        t_log_resp = F.log_softmax(t_resp.float(), dim=-1)
                         _, teacher_topk_idx = t_resp.topk(K, dim=-1)
-                        t_logprobs      = t_log_resp.gather(-1, teacher_topk_idx)   # [B, R, K]
+                        t_logprobs      = t_log_resp.gather(-1, teacher_topk_idx)   # [B, R, K] fp32
                         t_own_logprobs  = t_logprobs
-                        t_lp_at_student = t_log_resp.gather(-1, student_topk_idx)  # [B, R, K]
+                        t_lp_at_student = t_log_resp.gather(-1, student_topk_idx)  # [B, R, K] fp32
                     else:
-                        teacher_topk_idx = torch.empty(B, R_max, K, dtype=torch.long,     device=device)
-                        t_logprobs       = torch.empty(B, R_max, K, dtype=torch.bfloat16, device=device)
-                        t_own_logprobs   = torch.empty(B, R_max, K, dtype=torch.bfloat16, device=device)
-                        t_lp_at_student  = torch.empty(B, R_max, K, dtype=torch.bfloat16, device=device)
+                        teacher_topk_idx = torch.empty(B, R_max, K, dtype=torch.long,    device=device)
+                        t_logprobs       = torch.empty(B, R_max, K, dtype=torch.float32, device=device)
+                        t_own_logprobs   = torch.empty(B, R_max, K, dtype=torch.float32, device=device)
+                        t_lp_at_student  = torch.empty(B, R_max, K, dtype=torch.float32, device=device)
+                        t_compact_mask   = torch.zeros(B, R_max,    dtype=torch.float32, device=device)
 
                     dist.broadcast(teacher_topk_idx, src=teacher_global_rank, group=all_group)
                     dist.broadcast(t_logprobs,       src=teacher_global_rank, group=all_group)
                     dist.broadcast(t_own_logprobs,   src=teacher_global_rank, group=all_group)
                     dist.broadcast(t_lp_at_student,  src=teacher_global_rank, group=all_group)
+                    dist.broadcast(t_compact_mask,   src=teacher_global_rank, group=all_group)
 
                     topk_idx = teacher_topk_idx
 
                 # -- Loss and backward (student ranks only) --
                 if is_student:
-                    s_log_resp = F.log_softmax(s_resp, dim=-1)
-                    s_logprobs = s_log_resp.gather(-1, topk_idx)   # [B, R, K]
+                    s_log_resp = F.log_softmax(s_resp.float(), dim=-1)
+                    s_logprobs = s_log_resp.gather(-1, topk_idx)   # [B, R, K] fp32
+
+                    # Exclude positions where the teacher sequence was truncated (due to
+                    # its longer feedback-augmented prompt hitting max_seq_len). Those
+                    # padded positions have log_softmax(0) = -log(V) — a spurious uniform
+                    # distribution that would corrupt the loss signal.
+                    effective_mask = s_compact_mask * t_compact_mask   # [B, R_max]
 
                     if args.tis_clip > 0.0:
                         sampled_ids    = mb_ids[:, 1:]
@@ -598,7 +617,7 @@ if __name__ == "__main__":
                     else:
                         tis_weights = None
 
-                    loss = loss_fn(s_logprobs, t_logprobs, s_compact_mask, tis_weights=tis_weights) / n_mb
+                    loss = loss_fn(s_logprobs, t_logprobs, effective_mask, tis_weights=tis_weights) / n_mb
                     student._scale_loss(loss).backward()
                     total_loss += loss.item()
                     n_batches  += 1

@@ -7,18 +7,15 @@ from typing import Literal
 
 import torch
 import torch.distributed as dist
-from omegaconf import OmegaConf
 
-from opd.common import compute_init, compute_cleanup, print0, autodetect_device_type
+from opd.common import compute_cleanup, print0
 from opd.loss import ALGORITHMS
-from opd.fsdp.model import TeacherModel, StudentModel
 from opd.fsdp.algorithms import (
-    student_topk_indices,
-    teacher_logprobs_at_indices,
-    teacher_topk_logprobs,
     student_logprobs_at_indices,
     student_logprob_at_sampled_tokens,
 )
+from opd.trainer.distillation_utils import broadcast_minibatch, exchange_topk
+from opd.trainer.setup_utils import init_distributed, build_student, build_teacher, init_vllm_transfer
 from opd.metrics import (
     compute_overlap_ratio,
     compute_overlap_token_advantage,
@@ -26,12 +23,9 @@ from opd.metrics import (
 )
 from opd.generator.rollout import (
     generate_rollouts_remote,
-    remote_vllm_init_weight_transfer,
     sync_weights_to_vllm_inplace,
     prepare_batch,
-    wait_for_rollout_worker,
 )
-from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
 from opd.envs.dataset import distributed_opd_loader, build_opd_dataset
 from opd.envs.dapo_dataset import DapoMathEnv
 from opd.envs.livecodebench import LiveCodeBenchEnv
@@ -101,20 +95,17 @@ if __name__ == "__main__":
 
     # -----------------------------------------------------------------------------
     # Distributed init
-    device_type = autodetect_device_type() if args.device_type == "" else args.device_type
-    ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
-
-    # Partition ranks: 0..train_world_size-1 are student (FSDP) ranks;
-    # train_world_size..ddp_world_size-1 are teacher ranks.
-    train_world_size = args.train_world_size
-    teacher_global_rank = train_world_size   # first (and typically only) teacher rank
-    is_student = ddp_rank < train_world_size
-    is_teacher = not is_student
-    master_process = ddp_rank == 0           # student rank 0 drives logging/eval/save
-
-    # Process groups
-    student_group = dist.new_group(list(range(train_world_size)))
-    all_group     = dist.new_group(list(range(ddp_world_size)))
+    ctx = init_distributed(args.device_type, args.train_world_size)
+    ddp_rank          = ctx.ddp_rank
+    ddp_world_size    = ctx.ddp_world_size
+    device            = ctx.device
+    train_world_size  = ctx.train_world_size
+    teacher_global_rank = ctx.teacher_global_rank
+    is_student        = ctx.is_student
+    is_teacher        = ctx.is_teacher
+    master_process    = ctx.master_process
+    student_group     = ctx.student_group
+    all_group         = ctx.all_group
 
     print0(f"Student: {args.student_model}")
     print0(f"Teacher: {args.teacher_model}")
@@ -153,34 +144,20 @@ if __name__ == "__main__":
     # -----------------------------------------------------------------------------
     # Model setup
     if is_student:
-        student_config = OmegaConf.create({
-            "model_name": args.student_model,
-            "dtype": "bfloat16",
-            "enable_gradient_checkpointing": args.gradient_checkpointing,
-            "max_grad_norm": args.max_grad_norm,
-            "attn_implementation": "flash_attention_2",
-            "sharding_strategy": args.sharding_strategy,
-            "optimizer": {
-                "lr": args.lr,
-                "weight_decay": args.weight_decay,
-            },
-            "scheduler": {
-                "name": "cosine",
-                "warmup_ratio": 0.05,
-            },
-        })
-        student = StudentModel(
-            student_config,
-            data_parallel_size=train_world_size,
-            process_group=student_group,
+        student = build_student(
+            args.student_model,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            max_grad_norm=args.max_grad_norm,
+            gradient_checkpointing=args.gradient_checkpointing,
+            sharding_strategy=args.sharding_strategy,
+            train_world_size=train_world_size,
+            student_group=student_group,
+            total_steps=args.num_steps * args.epochs,
         )
-        student.prepare_scheduler(total_steps=args.num_steps * args.epochs)
 
     if is_teacher:
-        teacher = TeacherModel(
-            model_name=args.teacher_model,
-            dtype="bfloat16",
-        )
+        teacher = build_teacher(args.teacher_model)
 
     # -----------------------------------------------------------------------------
     # Loss function and top-K selection
@@ -193,29 +170,13 @@ if __name__ == "__main__":
 
     # -----------------------------------------------------------------------------
     # vLLM weight-transfer setup (student ranks only; teacher is not involved)
-    wait_for_rollout_worker(args.rollout_worker_url)
-
-    master_addr = os.environ.get("NCCL_MASTER_ADDR", "127.0.0.1")
-    nccl_port = 29600
-    transfer_world_size = train_world_size + args.rollout_worker_world_size
-    if master_process:
-        remote_vllm_init_weight_transfer(
-            args.rollout_worker_url,
-            master_address=master_addr,
-            master_port=nccl_port,
-            rank_offset=train_world_size,   # vLLM joins after student ranks
-            world_size=transfer_world_size,
-        )
-        # Open the TCPStore server at nccl_port (rank 0) so the vLLM background
-        # thread (rank train_world_size) can complete the NCCL rendezvous.
-        model_update_group = NCCLWeightTransferEngine.trainer_init({
-            "master_address": master_addr,
-            "master_port": nccl_port,
-            "world_size": transfer_world_size,
-        })
-    else:
-        model_update_group = None
-    dist.barrier(group=all_group)
+    model_update_group = init_vllm_transfer(
+        args.rollout_worker_url,
+        rollout_worker_world_size=args.rollout_worker_world_size,
+        train_world_size=train_world_size,
+        master_process=master_process,
+        all_group=all_group,
+    )
 
     # -----------------------------------------------------------------------------
     # Dataset (student ranks only)
@@ -285,26 +246,18 @@ if __name__ == "__main__":
 
                 # -- Broadcast minibatch shape then data to teacher rank --
                 if is_student:
-                    start  = mb_idx * args.train_batch_size
-                    idx    = perm[start : start + args.train_batch_size]
-                    mb_ids   = input_ids[idx]          # [B, T]
-                    mb_attn  = attention_mask[idx]
-                    mb_mask  = response_mask[idx]
-                    mb_inf_lp = inference_logprobs[idx] # [B, T]
-                    shape_t = torch.tensor(
-                        [mb_ids.shape[0], mb_ids.shape[1]], dtype=torch.long, device=device
-                    )
+                    start     = mb_idx * args.train_batch_size
+                    idx       = perm[start : start + args.train_batch_size]
+                    mb_ids    = input_ids[idx]
+                    mb_attn   = attention_mask[idx]
+                    mb_mask   = response_mask[idx]
+                    mb_inf_lp = inference_logprobs[idx]
                 else:
-                    shape_t = torch.zeros(2, dtype=torch.long, device=device)
+                    mb_ids = mb_attn = None
 
-                dist.broadcast(shape_t, src=0, group=all_group)
-                B_mb, T_mb = int(shape_t[0].item()), int(shape_t[1].item())
-
-                if is_teacher:
-                    mb_ids  = torch.zeros(B_mb, T_mb, dtype=torch.long,  device=device)
-                    mb_attn = torch.zeros(B_mb, T_mb, dtype=torch.long,  device=device)
-                dist.broadcast(mb_ids,  src=0, group=all_group)
-                dist.broadcast(mb_attn, src=0, group=all_group)
+                mb_ids, mb_attn = broadcast_minibatch(
+                    is_student, mb_ids, mb_attn, device, all_group
+                )
 
                 # -- Student forward (with grad) --
                 if is_student:
@@ -316,61 +269,31 @@ if __name__ == "__main__":
                 # -- Teacher: compute top-K log-probs and broadcast --
                 # Broadcasts only [B, T-1, K] instead of the full [B, T-1, V] logit
                 # tensor, reducing per-minibatch communication by ~vocab/K (>1000×).
-                K = args.distill_top_k
-                T_shifted = T_mb - 1
-                s_chunk = args.student_chunk_size
-                t_chunk = args.teacher_chunk_size
-
-                if select_topk_by == "student":
-                    # Student selects top-K indices; teacher gathers at those indices.
-                    if is_student:
-                        topk_idx = student_topk_indices(student_logits, K, s_chunk)
-                    else:
-                        topk_idx = torch.empty(B_mb, T_shifted, K, dtype=torch.long, device=device)
-                    dist.broadcast(topk_idx, src=0, group=all_group)
-
-                    if is_teacher:
-                        t_logits = teacher.get_logits(mb_ids, mb_attn)[:, :-1]
-                        t_logprobs = teacher_logprobs_at_indices(t_logits, topk_idx, t_chunk)
-                        # Also compute teacher's own top-K for metrics
-                        teacher_topk_idx, teacher_own_logprobs = teacher_topk_logprobs(t_logits, K, t_chunk)
-                    else:
-                        t_logprobs = torch.empty(B_mb, T_shifted, K, dtype=torch.bfloat16, device=device)
-                        teacher_topk_idx = torch.empty(B_mb, T_shifted, K, dtype=torch.long, device=device)
-                        teacher_own_logprobs = torch.empty(B_mb, T_shifted, K, dtype=torch.bfloat16, device=device)
-                    dist.broadcast(t_logprobs, src=teacher_global_rank, group=all_group)
-                    dist.broadcast(teacher_topk_idx, src=teacher_global_rank, group=all_group)
-                    dist.broadcast(teacher_own_logprobs, src=teacher_global_rank, group=all_group)
-                    student_topk_idx = topk_idx  # student selected; teacher_topk_idx already set
-                    t_logprobs_at_student = t_logprobs  # teacher already evaluated at student top-K
-
-                else:  # forward_kl: teacher selects top-K
-                    if is_student:
-                        student_topk_idx = student_topk_indices(student_logits, K, s_chunk)
-                    else:
-                        student_topk_idx = torch.empty(B_mb, T_shifted, K, dtype=torch.long, device=device)
-                    dist.broadcast(student_topk_idx, src=0, group=all_group)
-
-                    if is_teacher:
-                        t_logits = teacher.get_logits(mb_ids, mb_attn)[:, :-1]
-                        teacher_topk_idx, t_logprobs = teacher_topk_logprobs(t_logits, K, t_chunk)
-                        teacher_own_logprobs = t_logprobs
-                        # Teacher log-probs at student top-K for overlap-token advantage
-                        t_logprobs_at_student = teacher_logprobs_at_indices(t_logits, student_topk_idx, t_chunk)
-                    else:
-                        teacher_topk_idx = torch.empty(B_mb, T_shifted, K, dtype=torch.long, device=device)
-                        t_logprobs = torch.empty(B_mb, T_shifted, K, dtype=torch.bfloat16, device=device)
-                        teacher_own_logprobs = torch.empty(B_mb, T_shifted, K, dtype=torch.bfloat16, device=device)
-                        t_logprobs_at_student = torch.empty(B_mb, T_shifted, K, dtype=torch.bfloat16, device=device)
-                    dist.broadcast(teacher_topk_idx, src=teacher_global_rank, group=all_group)
-                    dist.broadcast(t_logprobs, src=teacher_global_rank, group=all_group)
-                    dist.broadcast(teacher_own_logprobs, src=teacher_global_rank, group=all_group)
-                    dist.broadcast(t_logprobs_at_student, src=teacher_global_rank, group=all_group)
-                    topk_idx = teacher_topk_idx
+                topk = exchange_topk(
+                    select_topk_by=select_topk_by,
+                    is_student=is_student,
+                    is_teacher=is_teacher,
+                    student_logits=student_logits if is_student else None,
+                    teacher=teacher if is_teacher else None,
+                    mb_ids=mb_ids,
+                    mb_attn=mb_attn,
+                    K=args.distill_top_k,
+                    s_chunk=args.student_chunk_size,
+                    t_chunk=args.teacher_chunk_size,
+                    teacher_global_rank=teacher_global_rank,
+                    all_group=all_group,
+                    device=device,
+                )
+                topk_idx             = topk["topk_idx"]
+                t_logprobs           = topk["t_logprobs"]
+                student_topk_idx     = topk["student_topk_idx"]
+                teacher_topk_idx     = topk["teacher_topk_idx"]
+                t_logprobs_at_student = topk["t_logprobs_at_student"]
+                teacher_own_logprobs  = topk["teacher_own_logprobs"]
 
                 # -- Student: compute TIS weights then loss and backward --
                 if is_student:
-                    s_logprobs = student_logprobs_at_indices(student_logits, topk_idx, s_chunk)
+                    s_logprobs = student_logprobs_at_indices(student_logits, topk_idx, args.student_chunk_size)
                     shift_mask = mb_mask[:, 1:]                             # [B, T-1]
 
                     # TIS weight: corrects for numerical gap between vLLM inference
@@ -391,7 +314,7 @@ if __name__ == "__main__":
 
                     # Compute distillation health metrics (no grad)
                     with torch.no_grad():
-                        s_lp_for_metrics = student_logprobs_at_indices(student_logits, student_topk_idx, s_chunk)
+                        s_lp_for_metrics = student_logprobs_at_indices(student_logits, student_topk_idx, args.student_chunk_size)
                         overlap_ratio     += compute_overlap_ratio(student_topk_idx, teacher_topk_idx).item()
                         overlap_advantage += compute_overlap_token_advantage(
                             student_topk_idx, teacher_topk_idx, s_lp_for_metrics, t_logprobs_at_student

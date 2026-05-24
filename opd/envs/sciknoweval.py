@@ -114,10 +114,9 @@ class SciKnowEvalEnv(OPDEnvBase):
         return (1.0 if pred == self.answer_key else 0.0), True
 
     def get_feedback(self, action: str) -> str:
-        pred = _extract_answer(action)
-        if pred == self.answer_key:
-            return f"Correct! The answer is {self.answer_key}."
-        return f"Incorrect. The correct answer is {self.answer_key}."
+        if _extract_answer(action) is None:
+            return "Format error: response must contain an <answer>A/B/C/D</answer> tag with your final answer."
+        return ""
 
     @classmethod
     def evaluate(
@@ -127,7 +126,7 @@ class SciKnowEvalEnv(OPDEnvBase):
         **kwargs: Any,
     ) -> dict[str, Any]:
         kwargs.pop("tokenizer", None)
-        return run_eval(rollout_worker_url=rollout_worker_url, step=step, **kwargs)
+        return run_sciknow_eval(rollout_worker_url=rollout_worker_url, step=step, **kwargs)
 
     @classmethod
     def load(
@@ -144,9 +143,8 @@ class SciKnowEvalEnv(OPDEnvBase):
         return [cls(prompt=row["prompt"], answer_key=row["answer_key"]) for row in ds]
 
 
-def run_eval(
+def run_sciknow_eval(
     rollout_worker_url: str,
-    tokenizer: Any,
     eval_k: int,
     eval_max_tokens: int,
     step: int,

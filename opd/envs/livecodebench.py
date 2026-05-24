@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -94,8 +95,8 @@ def _extract_code(response: str) -> str | None:
     return blocks[-1].strip() if blocks else None
 
 
-def _run_functional(code: str, fn_name: str, inputs: list, outputs: list, time_limit: int) -> list[str]:
-    """Execute code as a function call per test case. Returns per-test feedback strings."""
+def _run_functional(code: str, fn_name: str, inputs: list, outputs: list, time_limit: int) -> list[dict]:
+    """Execute code as a function call per test case. Returns structured result dicts."""
     results = []
     for inp, expected in zip(inputs, outputs):
         driver = textwrap.dedent(f"""
@@ -106,29 +107,31 @@ _inp = json.loads(sys.stdin.read())
 _result = {fn_name}(*_inp)
 print(json.dumps(_result))
 """)
+        inp_str = json.dumps(inp)
         try:
             proc = subprocess.run(
                 [sys.executable, "-c", driver],
-                input=json.dumps(inp),
+                input=inp_str,
                 capture_output=True, text=True, timeout=time_limit,
             )
             if proc.returncode != 0:
-                results.append(f"❌ Runtime error: {proc.stderr.strip()}")
+                results.append({"status": "runtime_error", "input": inp_str, "stderr": proc.stderr.strip()})
                 continue
             got = json.loads(proc.stdout.strip())
             if got == expected:
-                results.append("✅")
+                results.append({"status": "pass"})
             else:
-                results.append(f"❌ Expected {expected!r}, got {got!r}")
+                results.append({"status": "wrong_answer", "input": inp_str,
+                                "expected": json.dumps(expected), "actual": json.dumps(got)})
         except subprocess.TimeoutExpired:
-            results.append(f"❌ Time limit exceeded ({time_limit}s)")
+            results.append({"status": "timeout", "input": inp_str, "time_limit": time_limit})
         except Exception as e:
-            results.append(f"❌ {e}")
+            results.append({"status": "runtime_error", "input": inp_str, "stderr": str(e)})
     return results
 
 
-def _run_stdio(code: str, inputs: list, outputs: list, time_limit: int) -> list[str]:
-    """Execute code with stdin per test case. Returns per-test feedback strings."""
+def _run_stdio(code: str, inputs: list, outputs: list, time_limit: int) -> list[dict]:
+    """Execute code with stdin per test case. Returns structured result dicts."""
     results = []
     for inp, expected in zip(inputs, outputs):
         stdin_text = inp if isinstance(inp, str) else "\n".join(str(x) for x in inp)
@@ -140,29 +143,107 @@ def _run_stdio(code: str, inputs: list, outputs: list, time_limit: int) -> list[
                 capture_output=True, text=True, timeout=time_limit,
             )
             if proc.returncode != 0:
-                results.append(f"❌ Runtime error: {proc.stderr.strip()}")
+                results.append({"status": "runtime_error", "input": stdin_text, "stderr": proc.stderr.strip()})
                 continue
             got = proc.stdout.strip()
             if got == expected_text.strip():
-                results.append("✅")
+                results.append({"status": "pass"})
             else:
-                results.append(f"❌ Expected {expected_text!r}, got {got!r}")
+                results.append({"status": "wrong_answer", "input": stdin_text,
+                                "expected": expected_text, "actual": got})
         except subprocess.TimeoutExpired:
-            results.append(f"❌ Time limit exceeded ({time_limit}s)")
+            results.append({"status": "timeout", "input": stdin_text, "time_limit": time_limit})
         except Exception as e:
-            results.append(f"❌ {e}")
+            results.append({"status": "runtime_error", "input": stdin_text, "stderr": str(e)})
     return results
 
 
-def _all_tests_pass(code: str, tests: dict) -> bool:
+def _execute_tests(code: str, tests: dict) -> list[dict]:
+    """
+    Dispatch to the FastAPI executor server (CODE_EXECUTOR_URL) or
+    fall back to local subprocesses.
+    """
+    if os.environ.get("CODE_EXECUTOR_URL"):
+        import httpx
+        url = os.environ["CODE_EXECUTOR_URL"].rstrip("/") + "/execute"
+        resp = httpx.post(url, json={"code": code, "tests": tests}, timeout=120.0)
+        resp.raise_for_status()
+        return resp.json()["results"]
+
     fn_name = tests.get("fn_name", "")
-    testtype = tests.get("testtype", "stdin")
+    testtype = tests.get("testtype", "stdio")
     time_limit = tests.get("time_limit", TIME_LIMIT)
     if testtype == "functional" and fn_name:
-        results = _run_functional(code, fn_name, tests["inputs"], tests["outputs"], time_limit)
-    else:
-        results = _run_stdio(code, tests["inputs"], tests["outputs"], time_limit)
-    return all(r == "✅" for r in results)
+        return _run_functional(code, fn_name, tests["inputs"], tests["outputs"], time_limit)
+    return _run_stdio(code, tests["inputs"], tests["outputs"], time_limit)
+
+
+def _all_tests_pass(code: str, tests: dict) -> bool:
+    return all(r["status"] == "pass" for r in _execute_tests(code, tests))
+
+
+def _cap(s: str, limit: int) -> str:
+    return s if len(s) <= limit else s[:limit] + "..."
+
+
+def _cap_lines(s: str, max_chars: int, max_lines: int) -> str:
+    lines = s.splitlines()
+    truncated = lines[:max_lines]
+    joined = "\n".join(_cap(ln, max_chars) for ln in truncated)
+    if len(lines) > max_lines:
+        joined += f"\n... ({len(lines) - max_lines} more lines)"
+    return joined
+
+
+def format_test_feedback(results: list[dict], n_total: int, max_tests_to_show: int = 2, max_length: int = 2000) -> str:
+    """
+    Produce compact, model-readable feedback from structured test results.
+
+    Priority rules:
+    - Errors and timeouts are shown first; wrong-answer cases are dropped when
+      any error/timeout exists (a crash is more actionable than a wrong answer).
+    - Among wrong-answer cases, shorter inputs are shown first.
+    - Each field is character-capped; total output is hard-capped at max_length.
+    """
+    n_pass = sum(1 for r in results if r["status"] == "pass")
+    failures = [r for r in results if r["status"] != "pass"]
+
+    if not failures:
+        return f"All {n_total} tests passed ✅"
+
+    header = f"{n_pass}/{n_total} tests passed."
+
+    # Errors/timeouts take priority; drop wrong-answer cases if any exist
+    priority = [r for r in failures if r["status"] in ("runtime_error", "timeout")]
+    candidates = priority if priority else sorted(
+        [r for r in failures if r["status"] == "wrong_answer"],
+        key=lambda r: len(r.get("input", "")) + len(r.get("actual", "")),
+    )
+    shown = candidates[:max_tests_to_show]
+
+    parts = [header]
+    for i, r in enumerate(shown, 1):
+        idx = results.index(r) + 1
+        if r["status"] == "timeout":
+            inp_fmt = _cap_lines(r.get("input", ""), max_chars=250, max_lines=8)
+            parts.append(f"\nTest {idx}: ❌ Time limit exceeded ({r.get('time_limit', TIME_LIMIT)}s)\nInput:\n{inp_fmt}")
+        elif r["status"] == "runtime_error":
+            inp_fmt = _cap_lines(r.get("input", ""), max_chars=250, max_lines=8)
+            stderr_fmt = _cap_lines(r.get("stderr", ""), max_chars=300, max_lines=10)
+            parts.append(f"\nTest {idx}: ❌ Runtime error\nInput:\n{inp_fmt}\nStderr:\n{stderr_fmt}")
+        else:  # wrong_answer
+            inp_fmt = _cap_lines(r.get("input", ""), max_chars=250, max_lines=8)
+            exp_fmt = _cap(r.get("expected", ""), 250)
+            act_fmt = _cap(r.get("actual", ""), 250)
+            parts.append(
+                f"\nTest {idx}: ❌ Wrong answer\nInput:\n{inp_fmt}\nExpected: {exp_fmt}\nActual:   {act_fmt}"
+            )
+
+    if len(candidates) > max_tests_to_show:
+        parts.append(f"\n... and {len(candidates) - max_tests_to_show} more failing test(s) not shown.")
+
+    full = "\n".join(parts)
+    return full if len(full) <= max_length else full[:max_length] + "..."
 
 
 class LiveCodeBenchEnv(OPDEnvBase):
@@ -182,29 +263,24 @@ class LiveCodeBenchEnv(OPDEnvBase):
     def init(self, prompt: ConversationType) -> tuple[ConversationType, dict[str, Any]]:
         return [{"role": "user", "content": self.prompt}], {}
 
-    def _run_tests(self, action: str) -> list[str] | None:
-        """Run all test cases for this action. Returns per-test results, or None if no code found."""
+    def _run_tests(self, action: str) -> list[dict] | None:
+        """Run all test cases for this action. Returns structured result dicts, or None if no code found."""
         code = _extract_code(action)
         if code is None:
             return None
-        fn_name = self.tests.get("fn_name", "")
-        testtype = self.tests.get("testtype", "stdin")
-        time_limit = self.tests.get("time_limit", TIME_LIMIT)
-        if testtype == "functional" and fn_name:
-            return _run_functional(code, fn_name, self.tests["inputs"], self.tests["outputs"], time_limit)
-        return _run_stdio(code, self.tests["inputs"], self.tests["outputs"], time_limit)
+        return _execute_tests(code, self.tests)
 
     def compute_reward(self, action: str) -> tuple[float, bool]:
         results = self._run_tests(action)
         if results is None:
             return 0.0, True
-        return (1.0 if all(r == "✅" for r in results) else 0.0), True
+        return (1.0 if all(r["status"] == "pass" for r in results) else 0.0), True
 
     def get_feedback(self, action: str) -> str:
         results = self._run_tests(action)
         if results is None:
             return "❌ No code block found in response"
-        return "\n".join(f"Test {i + 1}: {r}" for i, r in enumerate(results))
+        return format_test_feedback(results, n_total=len(results))
 
     @classmethod
     def evaluate(
@@ -214,7 +290,7 @@ class LiveCodeBenchEnv(OPDEnvBase):
         **kwargs: Any,
     ) -> dict[str, Any]:
         kwargs.pop("tokenizer", None)
-        return run_eval(rollout_worker_url=rollout_worker_url, step=step, **kwargs)
+        return run_livecodebench_eval(rollout_worker_url=rollout_worker_url, step=step, **kwargs)
 
     @classmethod
     def load(cls, dataset_split: str = "train", until: datetime | None = None) -> list[LiveCodeBenchEnv]:
@@ -226,7 +302,7 @@ class LiveCodeBenchEnv(OPDEnvBase):
         return envs
 
 
-def run_eval(
+def run_livecodebench_eval(
     rollout_worker_url: str,
     eval_k: int,
     eval_max_tokens: int,

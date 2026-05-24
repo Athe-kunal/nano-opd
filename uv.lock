@@ -2479,6 +2479,19 @@ wheels = [
 ]
 
 [[package]]
+name = "judge0"
+version = "0.0.8"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "httpx" },
+    { name = "pydantic" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/da/44/970491b9dd4679f643a4d032edf8e1612f42ac6b50b4c91c2b5983c56cab/judge0-0.0.8.tar.gz", hash = "sha256:f438b42f6cb85405f9c1d93758c73d55c3bd57dd41010ff8d3e2cf1e1647c875", size = 33213, upload-time = "2026-02-06T17:47:33.508Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/4c/4d/9b95d798fe28fe8788287437f3ba807b65d4b1e84330b8cb3145ed45dd8d/judge0-0.0.8-py3-none-any.whl", hash = "sha256:228fc84e2ff137d833f68dd06c586bc7f11d83f6d413a2535c7e03dbf18ccbb7", size = 27228, upload-time = "2026-02-06T17:47:32.19Z" },
+]
+
+[[package]]
 name = "jupyter-client"
 version = "8.8.0"
 source = { registry = "https://pypi.org/simple" }
@@ -3670,6 +3683,7 @@ dependencies = [
     { name = "diskcache" },
     { name = "fastapi" },
     { name = "ipykernel" },
+    { name = "judge0" },
     { name = "kernels" },
     { name = "loguru" },
     { name = "matplotlib" },
@@ -3719,6 +3733,7 @@ requires-dist = [
     { name = "diskcache", specifier = ">=5.6.3" },
     { name = "fastapi", specifier = ">=0.117.1" },
     { name = "ipykernel", specifier = ">=7.1.0" },
+    { name = "judge0", specifier = ">=0.0.8" },
     { name = "kernels", specifier = ">=0.11.7" },
     { name = "loguru", specifier = ">=0.7.3" },
     { name = "matplotlib", specifier = ">=3.10.8" },

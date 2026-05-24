@@ -230,3 +230,5 @@ agent_shaper_tests/
 notebooks/
 
 .opd/
+
+.judge0/

@@ -13,7 +13,7 @@ try:
     from rich.table import Table
     from rich.text import Text
     from rich import box
-    _rich_console = Console()
+    _rich_console = Console(soft_wrap=True)
 except ImportError:
     _rich_console = None  # type: ignore[assignment]
 
@@ -39,57 +39,62 @@ FAKE_MCQ_CORRECT = "<reasoning>It must be A</reasoning><answer>A</answer>"
 FAKE_MCQ_WRONG   = "<reasoning>I'll guess B</reasoning><answer>B</answer>"
 
 
-def _show_step(env, action: str, label: str):
+def _show_step(env, action: str, label: str, **extra_rows):
     env.init([])
     result = env.step(action)
-    print(f"  [{label}]")
-    print(f"    reward  : {result['reward']}")
-    print(f"    done    : {result['done']}")
-    print(f"    feedback: {result['metadata']['feedback']}")
+    if _rich_console is not None:
+        _render_trace(
+            _rich_console,
+            env_name=label,
+            idx=0,
+            prompt=getattr(env, "prompt", ""),
+            completion=action,
+            reward=result["reward"],
+            feedback=result["metadata"]["feedback"] or "(empty)",
+            **extra_rows,
+        )
+    else:
+        print(f"  [{label}]  reward={result['reward']}  done={result['done']}")
+        print(f"  feedback: {result['metadata']['feedback']}")
 
 
 def test_dapo_math():
-    print("\n" + "=" * 60)
-    print("DapoMathEnv")
-    print("=" * 60)
+    c = _rich_console
+    if c:
+        c.rule("[bold]DapoMathEnv[/bold]")
     envs = DapoMathEnv.load()
-    print(f"  loaded {len(envs)} envs")
-
+    if c:
+        c.print(f"  loaded [bold]{len(envs)}[/bold] envs")
     for i, env in enumerate(envs[:N_SHOW]):
-        print(f"\n  env[{i}] prompt: {env.prompt[:80]!r}...")
-        _show_step(env, FAKE_MATH_CORRECT.replace("42", env.answer), "correct answer")
-        _show_step(env, FAKE_MATH_WRONG, "wrong answer")
+        _show_step(env, FAKE_MATH_CORRECT.replace("42", env.answer), f"DapoMath [{i}] correct")
+        _show_step(env, FAKE_MATH_WRONG, f"DapoMath [{i}] wrong")
 
 
 def test_livecodebench():
-    print("\n" + "=" * 60)
-    print("LiveCodeBenchEnv")
-    print("=" * 60)
+    c = _rich_console
+    if c:
+        c.rule("[bold]LiveCodeBenchEnv[/bold]")
     envs = LiveCodeBenchEnv.load(dataset_split="train")
-    print(f"  loaded {len(envs)} envs")
-
+    if c:
+        c.print(f"  loaded [bold]{len(envs)}[/bold] envs")
     for i, env in enumerate(envs[:N_SHOW]):
-        print(f"\n  env[{i}] prompt: {env.prompt[:80]!r}...")
-        _show_step(env, FAKE_CODE_CORRECT, "fake correct code")
-        _show_step(env, FAKE_CODE_WRONG, "no code block")
+        _show_step(env, FAKE_CODE_CORRECT, f"LiveCodeBench [{i}] correct code")
+        _show_step(env, FAKE_CODE_WRONG, f"LiveCodeBench [{i}] no code block")
 
 
 def test_sciknoweval():
-    print("\n" + "=" * 60)
-    print("SciKnowEvalEnv")
-    print("=" * 60)
-    # load train split only (exclude held-out 10% test used by evaluate())
+    c = _rich_console
+    if c:
+        c.rule("[bold]SciKnowEvalEnv[/bold]")
     envs = SciKnowEvalEnv.load(test_size=0.1, seed=42)
-    print(f"  loaded {len(envs)} train envs")
-
+    if c:
+        c.print(f"  loaded [bold]{len(envs)}[/bold] train envs")
     for i, env in enumerate(envs[:N_SHOW]):
-        print(f"\n  env[{i}] prompt : {env.prompt[:80]!r}...")
-        print(f"           answer : {env.answer_key}")
         correct_action = f"<reasoning>must be {env.answer_key}</reasoning><answer>{env.answer_key}</answer>"
-        _show_step(env, correct_action, "correct answer")
+        _show_step(env, correct_action, f"SciKnowEval [{i}] correct")
         wrong_key = "B" if env.answer_key != "B" else "A"
         wrong_action = f"<reasoning>guessing</reasoning><answer>{wrong_key}</answer>"
-        _show_step(env, wrong_action, "wrong answer")
+        _show_step(env, wrong_action, f"SciKnowEval [{i}] wrong")
 
 
 def _render_trace(
@@ -100,24 +105,27 @@ def _render_trace(
     completion: str,
     reward: float,
     feedback: str,
+    **extra_rows: str,
 ) -> None:
     """Pretty-print a single prompt→completion→reward trace with Rich."""
     color = "green" if reward > 0 else "red"
     reward_badge = Text(f"  reward={reward:.2f}  ", style=f"bold white on {color}")
 
-    table = Table(box=box.SIMPLE, show_header=False, padding=(0, 1))
-    table.add_column("field", style="bold cyan", no_wrap=True)
-    table.add_column("value", overflow="fold")
-    table.add_row("prompt", prompt[:300] + ("…" if len(prompt) > 300 else ""))
-    table.add_row("completion", completion[:600] + ("…" if len(completion) > 600 else ""))
-    table.add_row("feedback", feedback)
-
     title = Text()
-    title.append(f"{env_name} ", style="bold yellow")
-    title.append(f"[{idx}] ")
+    title.append(f"{env_name}", style="bold yellow")
+    title.append("  ")
     title.append_text(reward_badge)
 
-    console.print(Panel(table, title=title, border_style="dim"))
+    table = Table(box=box.SIMPLE, show_header=False, padding=(0, 1), expand=True)
+    table.add_column("field", style="bold cyan", no_wrap=True, width=12)
+    table.add_column("value", overflow="fold", no_wrap=False)
+    table.add_row("prompt", prompt)
+    table.add_row("completion", completion)
+    table.add_row("feedback", feedback)
+    for key, val in extra_rows.items():
+        table.add_row(key, str(val))
+
+    console.print(Panel(table, title=title, border_style="dim", expand=True))
 
 
 def test_vllm_server(
@@ -229,7 +237,7 @@ if __name__ == "__main__":
     parser.add_argument("--model", default=None, help="Model name (auto-detected if omitted)")
     parser.add_argument("--n-prompts", type=int, default=3, help="Prompts per dataset")
     parser.add_argument("--temperature", type=float, default=0.7)
-    parser.add_argument("--max-tokens", type=int, default=512)
+    parser.add_argument("--max-tokens", type=int, default=4096)
     args = parser.parse_args()
 
     if args.vllm:

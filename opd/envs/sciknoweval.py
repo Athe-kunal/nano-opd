@@ -114,10 +114,8 @@ class SciKnowEvalEnv(OPDEnvBase):
         return (1.0 if pred == self.answer_key else 0.0), True
 
     def get_feedback(self, action: str) -> str:
-        # pred = _extract_answer(action)
-        # if pred == self.answer_key:
-        #     return f"Correct! The answer is {self.answer_key}."
-        # return f"Incorrect. The correct answer is {self.answer_key}."
+        if _extract_answer(action) is None:
+            return "Format error: response must contain an <answer>A/B/C/D</answer> tag with your final answer."
         return ""
 
     @classmethod

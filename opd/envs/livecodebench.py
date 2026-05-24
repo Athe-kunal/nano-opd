@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -157,15 +158,28 @@ def _run_stdio(code: str, inputs: list, outputs: list, time_limit: int) -> list[
     return results
 
 
-def _all_tests_pass(code: str, tests: dict) -> bool:
+def _execute_tests(code: str, tests: dict) -> list[dict]:
+    """
+    Dispatch to the FastAPI executor server (CODE_EXECUTOR_URL) or
+    fall back to local subprocesses.
+    """
+    if os.environ.get("CODE_EXECUTOR_URL"):
+        import httpx
+        url = os.environ["CODE_EXECUTOR_URL"].rstrip("/") + "/execute"
+        resp = httpx.post(url, json={"code": code, "tests": tests}, timeout=120.0)
+        resp.raise_for_status()
+        return resp.json()["results"]
+
     fn_name = tests.get("fn_name", "")
-    testtype = tests.get("testtype", "stdin")
+    testtype = tests.get("testtype", "stdio")
     time_limit = tests.get("time_limit", TIME_LIMIT)
     if testtype == "functional" and fn_name:
-        results = _run_functional(code, fn_name, tests["inputs"], tests["outputs"], time_limit)
-    else:
-        results = _run_stdio(code, tests["inputs"], tests["outputs"], time_limit)
-    return all(r["status"] == "pass" for r in results)
+        return _run_functional(code, fn_name, tests["inputs"], tests["outputs"], time_limit)
+    return _run_stdio(code, tests["inputs"], tests["outputs"], time_limit)
+
+
+def _all_tests_pass(code: str, tests: dict) -> bool:
+    return all(r["status"] == "pass" for r in _execute_tests(code, tests))
 
 
 def _cap(s: str, limit: int) -> str:
@@ -254,12 +268,7 @@ class LiveCodeBenchEnv(OPDEnvBase):
         code = _extract_code(action)
         if code is None:
             return None
-        fn_name = self.tests.get("fn_name", "")
-        testtype = self.tests.get("testtype", "stdin")
-        time_limit = self.tests.get("time_limit", TIME_LIMIT)
-        if testtype == "functional" and fn_name:
-            return _run_functional(code, fn_name, self.tests["inputs"], self.tests["outputs"], time_limit)
-        return _run_stdio(code, self.tests["inputs"], self.tests["outputs"], time_limit)
+        return _execute_tests(code, self.tests)
 
     def compute_reward(self, action: str) -> tuple[float, bool]:
         results = self._run_tests(action)

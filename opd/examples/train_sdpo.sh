@@ -60,6 +60,7 @@ HARD_SYNC_EVERY_N="${HARD_SYNC_EVERY_N:-5}"
 EVAL_EVERY="${EVAL_EVERY:-20}"
 EVAL_K="${EVAL_K:-4}"
 EVAL_MAX_TOKENS="${EVAL_MAX_TOKENS:-4096}"
+SCIKNOWEVAL_TEST_SIZE="${SCIKNOWEVAL_TEST_SIZE:-0.01}"  # fraction held out for eval (sciknoweval only)
 SEED="${SEED:-0}"
 
 # FSDP sharding strategy — choose one of:
@@ -232,6 +233,7 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS,$TEACHER_GPUS" \
     --eval-every "$EVAL_EVERY" \
     --eval-k "$EVAL_K" \
     --eval-max-tokens "$EVAL_MAX_TOKENS" \
+    --sciknoweval-test-size "$SCIKNOWEVAL_TEST_SIZE" \
     --seed "$SEED" \
     --run-name "$TAG" \
     "${EXTRA_FLAGS[@]}" \

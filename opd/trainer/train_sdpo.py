@@ -265,6 +265,7 @@ if __name__ == "__main__":
     parser.add_argument("--eval-every", type=int, default=0)
     parser.add_argument("--eval-k", type=int, default=4)
     parser.add_argument("--eval-max-tokens", type=int, default=4096)
+    parser.add_argument("--sciknoweval-test-size", type=float, default=0.1)
     parser.add_argument("--dataset", type=str, required=True, choices=list(_ENV_CLS.keys()))
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
@@ -382,7 +383,7 @@ if __name__ == "__main__":
     # -------------------------------------------------------------------------
     # Dataset (student ranks only)
     if is_student:
-        dataset = build_opd_dataset(args.dataset)
+        dataset = build_opd_dataset(args.dataset, eval_test_size=args.sciknoweval_test_size, seed=args.seed)
         loader = distributed_opd_loader(
             dataset, args.prompts_per_step, train_world_size, ddp_rank, seed=args.seed
         )
@@ -711,7 +712,11 @@ if __name__ == "__main__":
                     tokenizer=student.tokenizer,
                     eval_k=args.eval_k,
                     eval_max_tokens=args.eval_max_tokens,
+                    test_size=args.sciknoweval_test_size,
                 )
+            # All ranks wait so non-master ranks don't race ahead into the next
+            # step's collectives while rank 0 is still running eval.
+            dist.barrier(group=all_group)
 
     compute_cleanup()
     if master_process and use_wandb:

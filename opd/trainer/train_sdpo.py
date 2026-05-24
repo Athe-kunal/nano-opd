@@ -12,7 +12,11 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from opd.common import compute_cleanup, print0
 from opd.loss import ALGORITHMS
-from opd.fsdp.algorithms import student_logprob_at_sampled_tokens
+from opd.fsdp.algorithms import (
+    student_logprob_at_sampled_tokens,
+    teacher_logprobs_at_indices,
+    teacher_topk_logprobs,
+)
 from opd.trainer.distillation_utils import broadcast_minibatch
 from opd.trainer.setup_utils import init_distributed, build_student, build_teacher, init_vllm_transfer
 from opd.trainer.sync_teacher import SYNC_METHODS, build_syncer
@@ -71,13 +75,17 @@ def _build_teacher_messages(init_messages, env_output, successful_rollout):
     return teacher_messages
 
 
-def prepare_teacher_batch(rollouts, tokenizer, max_seq_len, device):
+def prepare_teacher_batch(rollouts, tokenizer, device):
     """Build padded teacher sequences from feedback-augmented prompts.
 
     Each rollout must have a ``teacher_prompt`` string (chat template applied
     to feedback-augmented messages). The same response token IDs as the student
     are appended after the teacher prompt, so the teacher re-evaluates the
     student's exact response from a better-informed context.
+
+    No max_seq_len cap is applied here: the teacher never generates tokens, so
+    memory is bounded by the sequence length alone (no KV cache growth during
+    decoding). The student batch enforces max_seq_len separately.
     """
     input_ids_list, response_mask_list = [], []
 
@@ -85,14 +93,8 @@ def prepare_teacher_batch(rollouts, tokenizer, max_seq_len, device):
         t_prompt_ids = tokenizer.encode(r["teacher_prompt"], add_special_tokens=False)
         response_ids = list(r["response_ids"])
 
-        if len(t_prompt_ids) >= max_seq_len:
-            t_prompt_ids = t_prompt_ids[:max_seq_len - 1]
-
         full_ids = t_prompt_ids + response_ids
-        if len(full_ids) > max_seq_len:
-            full_ids = full_ids[:max_seq_len]
-
-        r_len = len(full_ids) - len(t_prompt_ids)
+        r_len = len(response_ids)
         input_ids_list.append(full_ids)
         response_mask_list.append([0] * len(t_prompt_ids) + [1] * r_len)
 
@@ -199,9 +201,10 @@ def sync_student_to_teacher(
             buf = torch.empty_like(t_param.data)
             dist.broadcast(buf, src=0, group=all_group)
             received.append(buf)
-        # Wrap in Parameter objects so syncer.step() can call .data on them
         student_proxy = (torch.nn.Parameter(r, requires_grad=False) for r in received)
         syncer.step(student_proxy, teacher.model.parameters(), global_step)
+        # print directly — this runs only on the teacher rank, not rank 0
+        print(f"[sync step={global_step}] teacher updated via {syncer.__class__.__name__}", flush=True)
 
 
 if __name__ == "__main__":
@@ -433,8 +436,7 @@ if __name__ == "__main__":
                 max_seq_len=args.max_seq_len, device=device,
             )
             teacher_batch = prepare_teacher_batch(
-                rollouts, tokenizer=student.tokenizer,
-                max_seq_len=args.max_seq_len, device=device,
+                rollouts, tokenizer=student.tokenizer, device=device,
             )
 
             input_ids          = batch["input_ids"]           # [N, T_s]
@@ -547,10 +549,17 @@ if __name__ == "__main__":
                     dist.broadcast(topk_idx, src=0, group=all_group)
 
                     if is_teacher:
-                        t_log_resp = F.log_softmax(t_resp.float(), dim=-1)
-                        t_logprobs = t_log_resp.gather(-1, topk_idx)        # [B, R, K] fp32
-                        _, t_topk_idx = t_resp.topk(K, dim=-1)
-                        t_own_logprobs = t_log_resp.gather(-1, t_topk_idx)  # [B, R, K] fp32
+                        # teacher_logprobs_at_indices: chunked logsumexp, stays bfloat16
+                        # internally, returns [B, R_max, K] — never materialises [B, R, V]
+                        # in float32, avoiding the OOM on the shared rollout+teacher GPU.
+                        t_logprobs = teacher_logprobs_at_indices(
+                            t_resp, topk_idx, chunk_size=args.teacher_chunk_size
+                        ).float()
+                        t_topk_idx, t_own_logprobs = teacher_topk_logprobs(
+                            t_resp, K, chunk_size=args.teacher_chunk_size
+                        )
+                        t_own_logprobs = t_own_logprobs.float()
+                        del t_resp
                     else:
                         t_logprobs     = torch.empty(B, R_max, K, dtype=torch.float32, device=device)
                         t_topk_idx     = torch.empty(B, R_max, K, dtype=torch.long,    device=device)
@@ -574,11 +583,15 @@ if __name__ == "__main__":
                     dist.broadcast(student_topk_idx, src=0, group=all_group)
 
                     if is_teacher:
-                        t_log_resp = F.log_softmax(t_resp.float(), dim=-1)
-                        _, teacher_topk_idx = t_resp.topk(K, dim=-1)
-                        t_logprobs      = t_log_resp.gather(-1, teacher_topk_idx)   # [B, R, K] fp32
-                        t_own_logprobs  = t_logprobs
-                        t_lp_at_student = t_log_resp.gather(-1, student_topk_idx)  # [B, R, K] fp32
+                        teacher_topk_idx, t_logprobs = teacher_topk_logprobs(
+                            t_resp, K, chunk_size=args.teacher_chunk_size
+                        )
+                        t_logprobs     = t_logprobs.float()
+                        t_own_logprobs = t_logprobs
+                        t_lp_at_student = teacher_logprobs_at_indices(
+                            t_resp, student_topk_idx, chunk_size=args.teacher_chunk_size
+                        ).float()
+                        del t_resp
                     else:
                         teacher_topk_idx = torch.empty(B, R_max, K, dtype=torch.long,    device=device)
                         t_logprobs       = torch.empty(B, R_max, K, dtype=torch.float32, device=device)
@@ -604,6 +617,8 @@ if __name__ == "__main__":
                     # padded positions have log_softmax(0) = -log(V) — a spurious uniform
                     # distribution that would corrupt the loss signal.
                     effective_mask = s_compact_mask * t_compact_mask   # [B, R_max]
+                    if effective_mask.sum() == 0:
+                        print0(f"[warn mb] effective_mask is all-zero: s_mask={s_compact_mask.sum().item():.0f} t_mask={t_compact_mask.sum().item():.0f}", flush=True)
 
                     if args.tis_clip > 0.0:
                         sampled_ids    = mb_ids[:, 1:]

@@ -31,6 +31,7 @@ from typing import Any
 
 from datasets import load_dataset
 from openai import AsyncOpenAI
+from tqdm.asyncio import tqdm
 from pydantic import BaseModel
 
 RESULTS_PATH = Path(__file__).parent / "rubric_results.jsonl"
@@ -137,7 +138,7 @@ async def _extract_rubric_for_chunk(client: AsyncOpenAI, model: str, chunk: str)
             {"role": "user", "content": CHUNK_PROMPT.format(chunk=chunk)},
         ],
         response_format=RubricOutput,
-        max_tokens=256,
+        max_tokens=1024,
     )
     result = response.choices[0].message.parsed
     return result.rubric[0] if result.rubric else ""
@@ -151,7 +152,7 @@ async def _extract_rubrics_free_form(client: AsyncOpenAI, model: str, rational: 
             {"role": "user", "content": FREE_FORM_PROMPT.format(rational=rational)},
         ],
         response_format=RubricOutput,
-        max_tokens=512,
+        max_tokens=1024,
     )
     result = response.choices[0].message.parsed
     return result.rubric
@@ -198,7 +199,7 @@ def _append_result(path: Path, prompt: str, rubric: list[str]) -> None:
 
 async def process_dataset(
     model: str | None = None,
-    max_concurrent: int = 32,
+    max_concurrent: int = 64,
     num_samples: int | None = None,
     results_path: Path = RESULTS_PATH,
 ) -> list[dict[str, Any]]:
@@ -227,7 +228,11 @@ async def process_dataset(
             return {"prompt": prompt, "rubric": rubric_out.rubric}
 
     tasks = [_bounded(row) for row in ds]
-    new_results = [r for r in await asyncio.gather(*tasks) if r is not None]
+    new_results = [
+        r
+        for r in await tqdm.gather(*tasks, desc="Extracting rubrics", unit="prompt")
+        if r is not None
+    ]
     print(f"Newly processed: {len(new_results)}")
 
     # Return everything (old + new)

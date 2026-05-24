@@ -232,3 +232,5 @@ notebooks/
 .opd/
 
 .judge0/
+
+*.jsonl

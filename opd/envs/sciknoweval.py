@@ -126,7 +126,14 @@ class SciKnowEvalEnv(OPDEnvBase):
         **kwargs: Any,
     ) -> dict[str, Any]:
         kwargs.pop("tokenizer", None)
-        return run_sciknow_eval(rollout_worker_url=rollout_worker_url, step=step, **kwargs)
+        return run_sciknow_eval(
+            rollout_worker_url=rollout_worker_url,
+            step=step,
+            eval_k=kwargs["eval_k"],
+            eval_max_tokens=kwargs["eval_max_tokens"],
+            temperature=kwargs.get("temperature", 0.6),
+            top_k=kwargs.get("top_k", -1),
+        )
 
     @classmethod
     def load(

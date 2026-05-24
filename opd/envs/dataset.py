@@ -11,12 +11,12 @@ from opd.envs.sciknoweval import SciKnowEvalEnv
 DatasetType = Literal["livecodebench", "sciknoweval", "dapo_math"]
 
 
-def build_opd_dataset(dataset_type: DatasetType) -> list[OPDEnvBase]:
+def build_opd_dataset(dataset_type: DatasetType, eval_test_size: float = 0.1, seed: int = 42) -> list[OPDEnvBase]:
     envs: list[OPDEnvBase]
     if dataset_type == "livecodebench":
         envs = LiveCodeBenchEnv.load(dataset_split="train")  # type: ignore[assignment]
     elif dataset_type == "sciknoweval":
-        envs = SciKnowEvalEnv.load(test_size=0.1, seed=42)  # type: ignore[assignment]
+        envs = SciKnowEvalEnv.load(test_size=eval_test_size, seed=seed)  # type: ignore[assignment]
     elif dataset_type == "dapo_math":
         envs = DapoMathEnv.load()  # type: ignore[assignment]
     else:

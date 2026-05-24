@@ -86,6 +86,19 @@ def load_sciknoweval(
     return ds.filter(_is_unique)
 
 
+def load_sciknoweval_split(
+    test_size: float,
+    seed: int = 42,
+    domains: Optional[List[str]] = None,
+    levels: Optional[List[str]] = None,
+    types: Optional[List[str]] = None,
+) -> tuple[list[dict], list[dict]]:
+    """Return (train_rows, test_rows) as plain lists. Split is deterministic."""
+    ds = load_sciknoweval(domains=domains, levels=levels, types=types)
+    split = ds.train_test_split(test_size=test_size, seed=seed)
+    return [dict(r) for r in split["train"]], [dict(r) for r in split["test"]]
+
+
 class SciKnowEvalEnv(OPDEnvBase):
     """
     skyrl_gym environment for SciKnowEval MCQ problems.
@@ -95,6 +108,8 @@ class SciKnowEvalEnv(OPDEnvBase):
     get_feedback reveals the correct answer for SDPO self-distillation.
     evaluate runs the held-out 10% test split via the rollout worker.
     """
+
+    _test_rows: list[dict] = []
 
     def __init__(self, prompt: str, answer_key: str, system: str = SYSTEM_PROMPT) -> None:
         super().__init__(kind="mcq", dataset="sciknoweval")
@@ -126,9 +141,12 @@ class SciKnowEvalEnv(OPDEnvBase):
         **kwargs: Any,
     ) -> dict[str, Any]:
         kwargs.pop("tokenizer", None)
+        test_size = kwargs.pop("test_size", 0.1)
+        _, test_rows = load_sciknoweval_split(test_size=test_size)
         return run_sciknow_eval(
             rollout_worker_url=rollout_worker_url,
             step=step,
+            test_rows=test_rows,
             eval_k=kwargs["eval_k"],
             eval_max_tokens=kwargs["eval_max_tokens"],
             temperature=kwargs.get("temperature", 0.6),
@@ -138,56 +156,54 @@ class SciKnowEvalEnv(OPDEnvBase):
     @classmethod
     def load(
         cls,
+        test_size: float = 0.01,
         domains: Optional[List[str]] = None,
         levels: Optional[List[str]] = None,
         types: Optional[List[str]] = None,
-        test_size: float = 0.0,
         seed: int = 42,
     ) -> list[SciKnowEvalEnv]:
-        ds = load_sciknoweval(domains=domains, levels=levels, types=types)
-        if test_size > 0:
-            ds = ds.train_test_split(test_size=test_size, seed=seed)["train"]
-        return [cls(prompt=row["prompt"], answer_key=row["answer_key"]) for row in ds]
+        train_rows, _ = load_sciknoweval_split(test_size=test_size, seed=seed, domains=domains, levels=levels, types=types)
+        return [cls(prompt=row["prompt"], answer_key=row["answer_key"]) for row in train_rows]
 
 
 def run_sciknow_eval(
     rollout_worker_url: str,
+    test_rows: list[dict],
     eval_k: int,
     eval_max_tokens: int,
     step: int,
     temperature: float = 0.6,
     top_k: int = -1,
 ) -> dict[str, Any]:
-    """Evaluate on SciKnowEval test split (10% held-out, seed=42)."""
-    full_ds = load_sciknoweval()
-    split = full_ds.train_test_split(test_size=0.1, seed=42)
-    test_rows = [dict(r) for r in split["test"]]
-
+    """Evaluate on the pre-split SciKnowEval test rows."""
     prompts = [r["prompt"] for r in test_rows]
     rollouts = generate_rollouts_remote(
         rollout_worker_url, prompts, eval_k, eval_max_tokens, temperature, top_k
     )
 
+    total_correct = 0
     per_problem = []
     for i, row in enumerate(test_rows):
         answer_key = row["answer_key"].strip().upper()
         batch = rollouts[i * eval_k : (i + 1) * eval_k]
         n_correct = sum(_extract_answer(r["response"]) == answer_key for r in batch)
+        total_correct += n_correct
         per_problem.append({
             "problem_idx": i,
             "answer_key": answer_key,
             "n_correct": n_correct,
-            "pass_at_k": pass_at_k(eval_k, n_correct, eval_k),
+            "accuracy": n_correct / eval_k,
         })
 
-    overall = sum(r["pass_at_k"] for r in per_problem) / len(per_problem)
-    metrics = {f"eval/pass@{eval_k}": overall}
+    total_responses = len(test_rows) * eval_k
+    accuracy = total_correct / total_responses
+    metrics = {"eval/accuracy": accuracy}
 
     print0(f"[sciknoweval eval step={step}] {json.dumps(metrics)}")
     for r in per_problem:
         print0(
             f"  problem {r['problem_idx']:04d} (ans={r['answer_key']}): "
-            f"{r['n_correct']}/{eval_k}  pass@{eval_k}={r['pass_at_k']:.3f}"
+            f"{r['n_correct']}/{eval_k}  acc={r['accuracy']:.3f}"
         )
 
     if wandb.run is not None:

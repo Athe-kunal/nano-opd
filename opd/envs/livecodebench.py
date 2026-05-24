@@ -290,7 +290,7 @@ class LiveCodeBenchEnv(OPDEnvBase):
         **kwargs: Any,
     ) -> dict[str, Any]:
         kwargs.pop("tokenizer", None)
-        return run_eval(rollout_worker_url=rollout_worker_url, step=step, **kwargs)
+        return run_livecodebench_eval(rollout_worker_url=rollout_worker_url, step=step, **kwargs)
 
     @classmethod
     def load(cls, dataset_split: str = "train", until: datetime | None = None) -> list[LiveCodeBenchEnv]:
@@ -302,7 +302,7 @@ class LiveCodeBenchEnv(OPDEnvBase):
         return envs
 
 
-def run_eval(
+def run_livecodebench_eval(
     rollout_worker_url: str,
     eval_k: int,
     eval_max_tokens: int,

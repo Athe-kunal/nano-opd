@@ -421,6 +421,8 @@ if __name__ == "__main__":
                     (group[j]["response"] for j, rw in enumerate(rewards) if rw > 0), None
                 )
                 init_msgs, _ = env.init([])
+                if i == 0:
+                    print0(f"[debug step={step}] rewards={rewards} has_success={successful_text is not None}", flush=True)
                 for j, r in enumerate(group):
                     env_output   = env.get_feedback(r["response"]) if rewards[j] == 0 else ""
                     # Paper Table 2: successful attempts pass their own response as the correct

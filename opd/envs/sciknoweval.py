@@ -126,7 +126,7 @@ class SciKnowEvalEnv(OPDEnvBase):
         **kwargs: Any,
     ) -> dict[str, Any]:
         kwargs.pop("tokenizer", None)
-        return run_eval(rollout_worker_url=rollout_worker_url, step=step, **kwargs)
+        return run_sciknow_eval(rollout_worker_url=rollout_worker_url, step=step, **kwargs)
 
     @classmethod
     def load(
@@ -143,9 +143,8 @@ class SciKnowEvalEnv(OPDEnvBase):
         return [cls(prompt=row["prompt"], answer_key=row["answer_key"]) for row in ds]
 
 
-def run_eval(
+def run_sciknow_eval(
     rollout_worker_url: str,
-    tokenizer: Any,
     eval_k: int,
     eval_max_tokens: int,
     step: int,

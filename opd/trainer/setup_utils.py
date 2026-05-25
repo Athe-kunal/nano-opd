@@ -79,7 +79,7 @@ def build_student(
         "attn_implementation": "flash_attention_2",
         "sharding_strategy": sharding_strategy,
         "optimizer": {"lr": lr, "weight_decay": weight_decay},
-        "scheduler": {"name": "cosine", "warmup_ratio": 0.05},
+        "scheduler": {"name": "cosine", "warmup_ratio": 0.01},
     })
     student = StudentModel(config, data_parallel_size=train_world_size, process_group=student_group)
     student.prepare_scheduler(total_steps=total_steps)

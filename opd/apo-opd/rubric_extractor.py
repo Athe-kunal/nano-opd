@@ -35,6 +35,7 @@ from tqdm.asyncio import tqdm
 from pydantic import BaseModel
 
 RESULTS_PATH = Path(__file__).parent / "rubric_results.jsonl"
+JUDGE_RUBRICS_PATH = Path(__file__).parent / "judge_rubrics.jsonl"
 
 # ── sample rationals for smoke testing ────────────────────────────────────────
 
@@ -111,6 +112,21 @@ Feedback:
 
 Extract a list of rubrics from this feedback. Each rubric is one short, actionable sentence."""
 
+JUDGE_SYSTEM_PROMPT = """\
+You are an expert evaluator. Given a task description and a user's question, \
+devise exactly 5 rubrics that should be used to judge the quality of a response.
+Each rubric is one short, actionable criterion (one sentence) focused purely on \
+what a good response to this specific question should satisfy.
+Do not evaluate any response — only produce the rubrics."""
+
+JUDGE_USER_PROMPT = """\
+User question:
+\"\"\"
+{user_message}
+\"\"\"
+
+Devise exactly 5 rubrics to judge a response to this question."""
+
 # ── parsing ───────────────────────────────────────────────────────────────────
 
 
@@ -138,7 +154,7 @@ async def _extract_rubric_for_chunk(client: AsyncOpenAI, model: str, chunk: str)
             {"role": "user", "content": CHUNK_PROMPT.format(chunk=chunk)},
         ],
         response_format=RubricOutput,
-        max_tokens=1024,
+        max_tokens=16384,
     )
     result = response.choices[0].message.parsed
     return result.rubric[0] if result.rubric else ""
@@ -152,7 +168,7 @@ async def _extract_rubrics_free_form(client: AsyncOpenAI, model: str, rational: 
             {"role": "user", "content": FREE_FORM_PROMPT.format(rational=rational)},
         ],
         response_format=RubricOutput,
-        max_tokens=1024,
+        max_tokens=16384,
     )
     result = response.choices[0].message.parsed
     return result.rubric
@@ -170,6 +186,39 @@ async def extract_rubrics(client: AsyncOpenAI, model: str, rational: str) -> Rub
         return RubricOutput(rubric=list(rubrics))
     rubrics = await _extract_rubrics_free_form(client, model, rational)
     return RubricOutput(rubric=rubrics)
+
+
+async def generate_judge_rubrics(
+    client: AsyncOpenAI,
+    model: str,
+    prompt: str,
+    user_message: str,
+) -> RubricOutput:
+    """Devise 5 rubrics for judging a response, given only the prompt and user message."""
+    response = await client.beta.chat.completions.parse(
+        model=model,
+        messages=[
+            {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": JUDGE_USER_PROMPT.format(
+                    user_message=user_message
+                ),
+            },
+        ],
+        response_format=RubricOutput,
+        max_tokens=1024,
+    )
+    result = response.choices[0].message.parsed
+    return result
+
+
+def _get_user_message(conversation: list[dict[str, str]]) -> str:
+    """Extract the first user turn content from a chosen/rejected conversation."""
+    for msg in conversation:
+        if msg.get("role") == "user":
+            return msg["content"]
+    return ""
 
 
 # ── persistence ───────────────────────────────────────────────────────────────
@@ -217,15 +266,21 @@ async def process_dataset(
 
     client = _make_client()
     semaphore = asyncio.Semaphore(max_concurrent)
+    errors: list[str] = []
 
     async def _bounded(row: dict[str, Any]) -> dict[str, Any] | None:
         prompt = row["prompt"]
         if prompt in done:
             return None
         async with semaphore:
-            rubric_out = await extract_rubrics(client, model, row["rational"])
-            _append_result(results_path, prompt, rubric_out.rubric)
-            return {"prompt": prompt, "rubric": rubric_out.rubric}
+            try:
+                rubric_out = await extract_rubrics(client, model, row["rational"])
+                _append_result(results_path, prompt, rubric_out.rubric)
+                return {"prompt": prompt, "rubric": rubric_out.rubric}
+            except Exception as e:
+                errors.append(prompt)
+                tqdm.write(f"[ERROR] {prompt[:60]!r}: {e}")
+                return None
 
     tasks = [_bounded(row) for row in ds]
     new_results = [
@@ -233,9 +288,74 @@ async def process_dataset(
         for r in await tqdm.gather(*tasks, desc="Extracting rubrics", unit="prompt")
         if r is not None
     ]
-    print(f"Newly processed: {len(new_results)}")
 
-    # Return everything (old + new)
+    print(f"\nNewly processed : {len(new_results)}")
+    print(f"Errored (skipped): {len(errors)} — will retry on next run")
+    if errors:
+        print("  First 5 errors:")
+        for p in errors[:5]:
+            print(f"    {p[:80]!r}")
+
+    all_done = _load_done(results_path)
+    return [{"prompt": p, "rubric": r} for p, r in all_done.items()]
+
+
+# ── judge rubric generation ───────────────────────────────────────────────────
+
+
+async def process_judge_rubrics(
+    model: str | None = None,
+    max_concurrent: int = 64,
+    num_samples: int | None = None,
+    results_path: Path = JUDGE_RUBRICS_PATH,
+) -> list[dict[str, Any]]:
+    """
+    For each row, use only the prompt and the first user message from `chosen`
+    to devise 5 judging rubrics. Skips already-processed prompts.
+    """
+    model = model or _default_model()
+    ds = load_dataset("ContextualAI/ultrafeedback_clair_32k", split="train")
+    if num_samples is not None:
+        ds = ds.select(range(min(num_samples, len(ds))))
+
+    done = _load_done(results_path)
+    print(f"Already done: {len(done)} / {len(ds)}")
+
+    client = _make_client()
+    semaphore = asyncio.Semaphore(max_concurrent)
+    errors: list[str] = []
+
+    async def _bounded(row: dict[str, Any]) -> dict[str, Any] | None:
+        prompt = row["prompt"]
+        if prompt in done:
+            return None
+        user_message = _get_user_message(row["chosen"])
+        if not user_message:
+            return None
+        async with semaphore:
+            try:
+                rubric_out = await generate_judge_rubrics(client, model, prompt, user_message)
+                _append_result(results_path, prompt, rubric_out.rubric)
+                return {"prompt": prompt, "rubric": rubric_out.rubric}
+            except Exception as e:
+                errors.append(prompt)
+                tqdm.write(f"[ERROR] {prompt[:60]!r}: {e}")
+                return None
+
+    tasks = [_bounded(row) for row in ds]
+    new_results = [
+        r
+        for r in await tqdm.gather(*tasks, desc="Generating judge rubrics", unit="prompt")
+        if r is not None
+    ]
+
+    print(f"\nNewly processed : {len(new_results)}")
+    print(f"Errored (skipped): {len(errors)} — will retry on next run")
+    if errors:
+        print("  First 5 errors:")
+        for p in errors[:5]:
+            print(f"    {p[:80]!r}")
+
     all_done = _load_done(results_path)
     return [{"prompt": p, "rubric": r} for p, r in all_done.items()]
 
@@ -276,11 +396,15 @@ async def _smoke_test() -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--smoke", action="store_true", help="Run smoke test")
+    parser.add_argument("--judge", action="store_true", help="Generate judge rubrics from prompt + user message")
     parser.add_argument("--samples", type=int, default=None, help="Limit to N rows")
     args = parser.parse_args()
 
     if args.smoke:
         asyncio.run(_smoke_test())
+    elif args.judge:
+        results = asyncio.run(process_judge_rubrics(num_samples=args.samples))
+        print(f"Total results: {len(results)}")
     else:
         results = asyncio.run(process_dataset(num_samples=args.samples))
         print(f"Total results: {len(results)}")

@@ -235,7 +235,7 @@ if __name__ == "__main__":
     parser.add_argument("--rollout-worker-url", type=str, default="http://127.0.0.1:8047")
     parser.add_argument("--rollout-worker-world-size", type=int, default=1)
     # Training
-    parser.add_argument("--lr", type=float, default=1e-6)
+    parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--num-steps", type=int, default=200)

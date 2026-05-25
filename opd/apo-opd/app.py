@@ -427,8 +427,11 @@ def main():
                 raise
 
     if run_rubric:
-        with st.spinner("Running rejected + rubric forward pass..."):
+        with st.spinner("Running chosen + rubric and rejected + rubric forward passes..."):
             try:
+                st.session_state["chosen_rubric_results"] = get_topk_logprobs(
+                    model, tokenizer, prompt, rubric_text, chosen_text, top_k
+                )
                 st.session_state["rejected_rubric_results"] = get_topk_logprobs(
                     model, tokenizer, prompt, rubric_text, rejected_text, top_k
                 )
@@ -439,8 +442,9 @@ def main():
 
     if "chosen_results" in st.session_state:
         chosen_results = st.session_state["chosen_results"]
-        rejected_rubric_results = st.session_state["rejected_rubric_results"]
         rejected_no_rubric_results = st.session_state["rejected_no_rubric_results"]
+        chosen_rubric_results = st.session_state.get("chosen_rubric_results")
+        rejected_rubric_results = st.session_state.get("rejected_rubric_results")
 
         legend_items = "".join(
             f'<span style="background:{_score_color(v)};'
@@ -453,38 +457,55 @@ def main():
             "padding:8px;border:1px solid #e0e0e0;border-radius:6px;margin-top:6px;"
         )
         header_style = "font-size:1em;font-weight:bold;margin-bottom:4px;color:#333;"
+        section_style = "font-size:1.05em;font-weight:bold;margin:16px 0 8px;color:#555;border-bottom:1px solid #ddd;padding-bottom:4px;"
 
-        # KL highlight for rejected+rubric vs rejected baseline.
-        rejected_rubric_html = _render_highlighted_response(
-            rejected_rubric_results, top_k, reference_results=rejected_no_rubric_results
-        )
-        # Entropy fallback for the two no-rubric responses.
         chosen_html = _render_highlighted_response(chosen_results, top_k)
         rejected_no_rubric_html = _render_highlighted_response(rejected_no_rubric_results, top_k)
 
         rubric_escaped = rubric_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
+        # Build rubric panels only if available.
+        rubric_section = ""
+        if chosen_rubric_results and rejected_rubric_results:
+            chosen_rubric_html = _render_highlighted_response(
+                chosen_rubric_results, top_k, reference_results=chosen_results
+            )
+            rejected_rubric_html = _render_highlighted_response(
+                rejected_rubric_results, top_k, reference_results=rejected_no_rubric_results
+            )
+            rubric_section = f"""
+            <div style="{section_style}">With rubric: <em>{rubric_escaped}</em></div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px;">
+              <div>
+                <div style="{header_style}">Chosen + rubric</div>
+                <div style="{div_style}">{chosen_rubric_html}</div>
+              </div>
+              <div>
+                <div style="{header_style}">Rejected + rubric</div>
+                <div style="{div_style}">{rejected_rubric_html}</div>
+              </div>
+            </div>
+            """
+
         full_html = f"""
         <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px;font-size:0.85em;">
           {legend_items}
         </div>
+        <div style="{section_style}">Baseline (no rubric)</div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px;">
           <div>
-            <div style="{header_style}">Rejected (no rubric)</div>
-            <div style="{div_style}">{rejected_no_rubric_html}</div>
-          </div>
-          <div>
-            <div style="{header_style}">Rejected + rubric: <em>{rubric_escaped}</em></div>
-            <div style="{div_style}">{rejected_rubric_html}</div>
-          </div>
-          <div>
-            <div style="{header_style}">Chosen (no rubric)</div>
+            <div style="{header_style}">Chosen</div>
             <div style="{div_style}">{chosen_html}</div>
           </div>
+          <div>
+            <div style="{header_style}">Rejected</div>
+            <div style="{div_style}">{rejected_no_rubric_html}</div>
+          </div>
         </div>
+        {rubric_section}
         """
         height = max(len(chosen_text), len(rejected_text)) // 2 + 500
-        components.html(full_html, height=min(height, 1600), scrolling=True)
+        components.html(full_html, height=min(height, 2400), scrolling=True)
 
 
 if __name__ == "__main__":

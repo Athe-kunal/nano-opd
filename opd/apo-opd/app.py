@@ -406,11 +406,21 @@ def main():
         st.warning("Load a model first using the sidebar.")
         return
 
-    col_run_base, col_run_rubric = st.columns(2)
+    judge_rubrics = sources.get("judge", [])
+    all_judge_rubric_text = "\n".join(f"{i+1}. {r}" for i, r in enumerate(judge_rubrics)) if judge_rubrics else ""
+
+    col_run_base, col_run_rubric, col_run_all = st.columns(3)
     with col_run_base:
         run_base = st.button("Run baseline passes (chosen + rejected, no rubric)", type="secondary")
     with col_run_rubric:
         run_rubric = st.button("Run rejected + rubric", type="primary")
+    with col_run_all:
+        run_all_judge = st.button(
+            "Run with all judge rubrics",
+            type="primary",
+            disabled=not bool(judge_rubrics),
+            help=all_judge_rubric_text if judge_rubrics else "No judge rubrics for this prompt",
+        )
 
     if run_base:
         with st.spinner("Running 2 baseline forward passes..."):
@@ -424,6 +434,21 @@ def main():
                 st.success("Baseline passes done.")
             except Exception as e:
                 st.error(f"Error during baseline pass: {e}")
+                raise
+
+    if run_all_judge:
+        with st.spinner("Running with all judge rubrics combined..."):
+            try:
+                st.session_state["chosen_all_judge_results"] = get_topk_logprobs(
+                    model, tokenizer, prompt, all_judge_rubric_text, chosen_text, top_k
+                )
+                st.session_state["rejected_all_judge_results"] = get_topk_logprobs(
+                    model, tokenizer, prompt, all_judge_rubric_text, rejected_text, top_k
+                )
+                st.session_state["all_judge_rubric_used"] = all_judge_rubric_text
+                st.success("Done.")
+            except Exception as e:
+                st.error(f"Error during all-judge-rubric pass: {e}")
                 raise
 
     if run_rubric:
@@ -445,6 +470,8 @@ def main():
         rejected_no_rubric_results = st.session_state["rejected_no_rubric_results"]
         chosen_rubric_results = st.session_state.get("chosen_rubric_results")
         rejected_rubric_results = st.session_state.get("rejected_rubric_results")
+        chosen_all_judge_results = st.session_state.get("chosen_all_judge_results")
+        rejected_all_judge_results = st.session_state.get("rejected_all_judge_results")
 
         legend_items = "".join(
             f'<span style="background:{_score_color(v)};'
@@ -465,7 +492,8 @@ def main():
         rubric_escaped = rubric_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
         # Build rubric panels only if available.
-        rubric_section = ""
+        rejected_rubric_section = ""
+        chosen_rubric_section = ""
         if chosen_rubric_results and rejected_rubric_results:
             chosen_rubric_html = _render_highlighted_response(
                 chosen_rubric_results, top_k, reference_results=chosen_results
@@ -473,16 +501,44 @@ def main():
             rejected_rubric_html = _render_highlighted_response(
                 rejected_rubric_results, top_k, reference_results=rejected_no_rubric_results
             )
-            rubric_section = f"""
-            <div style="{section_style}">With rubric: <em>{rubric_escaped}</em></div>
+            rejected_rubric_section = f"""
+            <div>
+              <div style="{header_style}">Rejected + rubric: <em>{rubric_escaped}</em></div>
+              <div style="{div_style}">{rejected_rubric_html}</div>
+            </div>
+            """
+            chosen_rubric_section = f"""
+            <div>
+              <div style="{header_style}">Chosen + rubric: <em>{rubric_escaped}</em></div>
+              <div style="{div_style}">{chosen_rubric_html}</div>
+            </div>
+            """
+
+        # Build all-judge-rubric section if available.
+        all_judge_section = ""
+        if chosen_all_judge_results and rejected_all_judge_results:
+            chosen_all_judge_html = _render_highlighted_response(
+                chosen_all_judge_results, top_k, reference_results=chosen_results
+            )
+            rejected_all_judge_html = _render_highlighted_response(
+                rejected_all_judge_results, top_k, reference_results=rejected_no_rubric_results
+            )
+            used_rubric_escaped = (
+                st.session_state.get("all_judge_rubric_used", "")
+                .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                .replace("\n", "<br>")
+            )
+            all_judge_section = f"""
+            <div style="{section_style}">All judge rubrics combined</div>
+            <div style="font-size:0.8em;color:#666;margin-bottom:8px;font-family:monospace;">{used_rubric_escaped}</div>
             <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px;">
               <div>
-                <div style="{header_style}">Chosen + rubric</div>
-                <div style="{div_style}">{chosen_rubric_html}</div>
+                <div style="{header_style}">Rejected + all judge rubrics</div>
+                <div style="{div_style}">{rejected_all_judge_html}</div>
               </div>
               <div>
-                <div style="{header_style}">Rejected + rubric</div>
-                <div style="{div_style}">{rejected_rubric_html}</div>
+                <div style="{header_style}">Chosen + all judge rubrics</div>
+                <div style="{div_style}">{chosen_all_judge_html}</div>
               </div>
             </div>
             """
@@ -491,18 +547,23 @@ def main():
         <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px;font-size:0.85em;">
           {legend_items}
         </div>
-        <div style="{section_style}">Baseline (no rubric)</div>
+        <div style="{section_style}">Rejected</div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px;">
           <div>
-            <div style="{header_style}">Chosen</div>
-            <div style="{div_style}">{chosen_html}</div>
-          </div>
-          <div>
-            <div style="{header_style}">Rejected</div>
+            <div style="{header_style}">Rejected (no rubric)</div>
             <div style="{div_style}">{rejected_no_rubric_html}</div>
           </div>
+          {rejected_rubric_section}
         </div>
-        {rubric_section}
+        <div style="{section_style}">Chosen</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px;">
+          <div>
+            <div style="{header_style}">Chosen (no rubric)</div>
+            <div style="{div_style}">{chosen_html}</div>
+          </div>
+          {chosen_rubric_section}
+        </div>
+        {all_judge_section}
         """
         height = max(len(chosen_text), len(rejected_text)) // 2 + 500
         components.html(full_html, height=min(height, 2400), scrolling=True)

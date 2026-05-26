@@ -33,6 +33,7 @@ dependencies = [
     "loguru>=0.7.3",
     "skyrl-gym>=0.3.0",
     "judge0>=0.0.8",
+    "nltk>=3.9.4",
 ]
 
 [dependency-groups]

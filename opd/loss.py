@@ -5,8 +5,15 @@ def _masked_token_mean(
     values: torch.Tensor,
     mask: torch.Tensor,
     tis_weights: torch.Tensor | None = None,
+    kl_clip: float | None = None,
 ) -> torch.Tensor:
     mask = mask.to(values.dtype)
+    # Per-token pointwise KL clipping (OPSD paper Section 3.2).
+    # Stylistic tokens can dominate the gradient signal with very high divergence
+    # values. Clamping each token's contribution to τ before the masked mean
+    # prevents this heavy-tail effect from overwhelming math-relevant tokens.
+    if kl_clip is not None:
+        values = values.clamp(max=kl_clip)
     if tis_weights is not None:
         values = values * tis_weights
     return (
@@ -25,6 +32,7 @@ def compute_reverse_kl_loss(
     teacher_logprobs: torch.Tensor,         # [B, T, K]
     response_mask: torch.Tensor,            # [B, T]
     tis_weights: torch.Tensor | None = None,  # [B, T]
+    kl_clip: float | None = None,
 ) -> torch.Tensor:
     """KL(p_student || p_teacher), top-K truncated with tail term (Eq. 11, Appendix A.3).
 
@@ -43,7 +51,7 @@ def compute_reverse_kl_loss(
 
     per_token_kl = torch.einsum("btk,btk->bt", student_probs, student_logprobs - teacher_logprobs)
     per_token_kl = per_token_kl + s_tail * (s_tail.log() - t_tail.log())
-    return _masked_token_mean(per_token_kl, response_mask, tis_weights)
+    return _masked_token_mean(per_token_kl, response_mask, tis_weights, kl_clip)
 
 
 def compute_forward_kl_loss(
@@ -51,6 +59,7 @@ def compute_forward_kl_loss(
     teacher_logprobs: torch.Tensor,         # [B, T, K]
     response_mask: torch.Tensor,            # [B, T]
     tis_weights: torch.Tensor | None = None,  # [B, T]
+    kl_clip: float | None = None,
 ) -> torch.Tensor:
     """KL(p_teacher || p_student), top-K truncated with tail term (Eq. 11, Appendix A.3).
 
@@ -67,7 +76,7 @@ def compute_forward_kl_loss(
 
     per_token_kl = torch.einsum("btk,btk->bt", teacher_probs, teacher_logprobs - student_logprobs)
     per_token_kl = per_token_kl + t_tail * (t_tail.log() - s_tail.log())
-    return _masked_token_mean(per_token_kl, response_mask, tis_weights)
+    return _masked_token_mean(per_token_kl, response_mask, tis_weights, kl_clip)
 
 
 def compute_jsd_loss(
@@ -75,6 +84,7 @@ def compute_jsd_loss(
     teacher_logprobs: torch.Tensor,         # [B, T, K]
     response_mask: torch.Tensor,            # [B, T]
     tis_weights: torch.Tensor | None = None,  # [B, T]
+    kl_clip: float | None = None,
     jsd_alpha: float = 0.5,
 ) -> torch.Tensor:
     """JSD(student || teacher) with tail term (Eq. 11, Appendix A.3).
@@ -105,7 +115,7 @@ def compute_jsd_loss(
     kl_t = kl_t + t_tail * (t_tail.log() - log_M_tail)
 
     per_token_jsd = jsd_alpha * kl_s + (1.0 - jsd_alpha) * kl_t
-    return _masked_token_mean(per_token_jsd, response_mask, tis_weights)
+    return _masked_token_mean(per_token_jsd, response_mask, tis_weights, kl_clip)
 
 
 ALGORITHMS = {

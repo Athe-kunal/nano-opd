@@ -226,7 +226,7 @@ items_with_rubrics.sort(key=lambda x: _approx_len(x[0]))
 
 start_kls, middle_kls, end_kls = [], [], []
 
-for batch_start in tqdm(range(0, len(items_with_rubrics), BATCH_SIZE), desc="KL forward passes"):
+for batch_start in tqdm(range(0, min(len(items_with_rubrics), 300 * BATCH_SIZE), BATCH_SIZE), desc="KL forward passes"):
     batch = items_with_rubrics[batch_start : batch_start + BATCH_SIZE]
 
     no_rubric_ids,   no_rs   = [], []
@@ -252,7 +252,6 @@ for batch_start in tqdm(range(0, len(items_with_rubrics), BATCH_SIZE), desc="KL 
     for b, (item, _) in enumerate(batch):
         kl_per_tok = kl_per_tok_batch[b]
 
-        n_paras = len([p_ for p_ in item.rejected.split("\n\n") if p_.strip()])
         for tok_start, tok_end, label in _sentence_token_ranges(item.rejected):
             sent_toks = kl_per_tok[tok_start:tok_end]
             if not sent_toks:
@@ -260,19 +259,36 @@ for batch_start in tqdm(range(0, len(items_with_rubrics), BATCH_SIZE), desc="KL 
             mean_sent_kl = sum(sent_toks) / len(sent_toks)
             if label == "start":
                 start_kls.append(mean_sent_kl)
-                if n_paras == 1:
-                    end_kls.append(mean_sent_kl)
             elif label == "middle":
                 middle_kls.append(mean_sent_kl)
             else:
                 end_kls.append(mean_sent_kl)
 
 # ── results ───────────────────────────────────────────────────────────────────
-mean_start  = sum(start_kls)  / len(start_kls)  if start_kls  else 0.0
-mean_middle = sum(middle_kls) / len(middle_kls) if middle_kls else 0.0
-mean_end    = sum(end_kls)    / len(end_kls)    if end_kls    else 0.0
+import numpy as np
+from scipy import stats
+
+def summarize(name: str, vals: list[float]):
+    if len(vals) < 2:
+        print(f"  {name}: insufficient data (n={len(vals)})")
+        return
+    a = np.array(vals, dtype=np.float64)
+    mean = a.mean()
+    std  = a.std(ddof=1)
+    se   = std / np.sqrt(len(a))
+    # 95% CI via t-distribution (exact for any n, converges to z for large n)
+    lo, hi = stats.t.interval(0.95, df=len(a) - 1, loc=mean, scale=se)
+    print(f"  {name:6s}: mean={mean:.5f}  std={std:.5f}  95% CI=[{lo:.5f}, {hi:.5f}]  (n={len(a)})")
 
 print(f"\nMean per-token KL(rejected+rubric || rejected)")
-print(f"  Start:  {mean_start:.5f}  (n={len(start_kls)} sentences)")
-print(f"  Middle: {mean_middle:.5f}  (n={len(middle_kls)} sentences)")
-print(f"  End:    {mean_end:.5f}  (n={len(end_kls)} sentences)")
+summarize("Start",  start_kls)
+summarize("Middle", middle_kls)
+summarize("End",    end_kls)
+
+# Pairwise Mann-Whitney U tests (non-parametric: KL values are skewed/non-normal)
+print("\nMann-Whitney U tests (one-sided: row > col)")
+pairs = [("Start", start_kls), ("Middle", middle_kls), ("End", end_kls)]
+for (n1, v1), (n2, v2) in [(pairs[i], pairs[j]) for i in range(len(pairs)) for j in range(i+1, len(pairs))]:
+    stat, p = stats.mannwhitneyu(v1, v2, alternative="greater")
+    sig = "***" if p < 0.001 else "**" if p < 0.01 else "*" if p < 0.05 else "n.s."
+    print(f"  {n1} > {n2}: p={p:.2e}  {sig}")

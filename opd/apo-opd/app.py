@@ -76,7 +76,7 @@ def load_model(model_id: str):
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
         torch_dtype=torch.float32,
-        device_map="cuda",
+        device_map="cuda:3",
     )
     model.eval()
     return model, tokenizer

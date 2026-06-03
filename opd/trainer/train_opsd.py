@@ -1,11 +1,9 @@
 
 import os
-import json
 import math
 import time
 import argparse
-import random as _random
-from typing import Literal, Iterator
+from typing import Literal
 
 import torch
 import torch.nn.functional as F
@@ -21,6 +19,8 @@ from opd.fsdp.algorithms import (
 )
 from opd.trainer.distillation_utils import broadcast_minibatch
 from opd.trainer.setup_utils import init_distributed, build_student, build_teacher, init_vllm_transfer
+from opd.envs.opsd_dataset import OPSDMathEnv
+from opd.envs.dataset import distributed_opd_loader
 from opd.metrics import (
     compute_overlap_ratio,
     compute_overlap_token_advantage,
@@ -31,57 +31,6 @@ from opd.generator.rollout import (
     sync_weights_to_vllm_inplace,
     prepare_batch,
 )
-
-# ---------------------------------------------------------------------------
-# Dataset utilities
-# ---------------------------------------------------------------------------
-
-def load_opsd_dataset(path: str) -> list[dict]:
-    """Load a JSONL file of {"problem": ..., "solution": ...} records."""
-    examples = []
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                examples.append(json.loads(line))
-    assert examples, f"No examples found in {path}"
-    for ex in examples:
-        assert "problem" in ex and "solution" in ex, (
-            "Each JSONL record must have 'problem' and 'solution' fields."
-        )
-    return examples
-
-
-def distributed_opsd_loader(
-    dataset: list[dict],
-    prompts_per_step: int,
-    world_size: int,
-    rank: int,
-    seed: int = 0,
-) -> Iterator[list[dict]]:
-    """Yield per-rank slices of the OPSD dataset, shuffled each epoch."""
-    n = len(dataset)
-    assert prompts_per_step % world_size == 0
-    per_rank = prompts_per_step // world_size
-
-    epoch, cursor = 0, 0
-
-    def _shuffle(epoch_idx):
-        rng = _random.Random(seed * 1_000_003 + epoch_idx)
-        order = list(range(n))
-        rng.shuffle(order)
-        return order
-
-    order = _shuffle(epoch)
-    while True:
-        if cursor + prompts_per_step > n:
-            epoch += 1
-            cursor = 0
-            order = _shuffle(epoch)
-        step_idx = order[cursor : cursor + prompts_per_step]
-        rank_idx = step_idx[rank * per_rank : (rank + 1) * per_rank]
-        yield [dataset[i] for i in rank_idx]
-        cursor += prompts_per_step
 
 
 # ---------------------------------------------------------------------------
@@ -237,9 +186,9 @@ if __name__ == "__main__":
     parser.add_argument("--train-world-size", type=int, required=True,
                         help="Number of student (FSDP) ranks. The teacher occupies "
                              "rank train_world_size in the torchrun world.")
-    # Dataset — must be a JSONL file with {problem, solution} records
-    parser.add_argument("--dataset-path", type=str, required=True,
-                        help="Path to JSONL file. Each line: {\"problem\": ..., \"solution\": ...}")
+    # Dataset — siyanzhao/Openthoughts_math_30k_opsd (hardcoded)
+    parser.add_argument("--dataset-split", type=str, default="train",
+                        help="HuggingFace split to load from siyanzhao/Openthoughts_math_30k_opsd.")
     # Algorithm
     parser.add_argument("--algorithm", type=str, default="forward_kl",
                         choices=list(ALGORITHMS.keys()),
@@ -385,8 +334,8 @@ if __name__ == "__main__":
     # -------------------------------------------------------------------------
     # Dataset (student ranks only)
     if is_student:
-        dataset     = load_opsd_dataset(args.dataset_path)
-        loader      = distributed_opsd_loader(
+        dataset     = OPSDMathEnv.load(split=args.dataset_split)
+        loader      = distributed_opd_loader(
             dataset, args.prompts_per_step, train_world_size, ddp_rank, seed=args.seed
         )
         loader_iter = iter(loader)
@@ -398,12 +347,12 @@ if __name__ == "__main__":
 
         # -- Rollout generation (student ranks only) --
         if is_student:
-            examples = next(loader_iter)   # list of {problem, solution}
+            examples, _ = next(loader_iter)   # list[OPSDMathEnv], state_dict
 
             # Student prompt: problem only — p_S(· | x)
             prompts = [
                 student.tokenizer.apply_chat_template(
-                    [{"role": "user", "content": ex["problem"]}],
+                    [{"role": "user", "content": ex.problem}],
                     tokenize=False,
                     add_generation_prompt=True,
                 )
@@ -424,8 +373,8 @@ if __name__ == "__main__":
             # context than the student (problem only), following Figure 2.
             for i, ex in enumerate(examples):
                 r            = rollouts[i]    # one rollout per prompt (num_samples=1)
-                student_msgs = [{"role": "user", "content": ex["problem"]}]
-                teacher_msgs = _build_teacher_messages(student_msgs, ex["solution"])
+                student_msgs = [{"role": "user", "content": ex.problem}]
+                teacher_msgs = _build_teacher_messages(student_msgs, ex.solution)
                 r["teacher_prompt"] = student.tokenizer.apply_chat_template(
                     teacher_msgs, tokenize=False, add_generation_prompt=True
                 )

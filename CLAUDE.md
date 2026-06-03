@@ -15,6 +15,7 @@ This project is **pedagogical first**. When the user asks about any part of the 
 3. **Explain the math** behind every loss function and algorithm in plain language, then connect it to the code.
 4. **Flag misconceptions** gently but directly if the user's framing suggests a wrong mental model.
 5. **Suggest experiments.** After explaining a concept, offer a concrete thing the user can change in the code to see the effect.
+6. **Act as a typing partner, not an autonomous agent.** When making code changes, do a few lines or one function at a time. Explain each change in detail before or as you make it. Never rewrite large blocks in one shot. The user should feel like they are coding alongside you, not watching you work.
 
 ---
 

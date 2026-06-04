@@ -6,7 +6,6 @@ import argparse
 from typing import Literal
 
 import torch
-import torch.nn.functional as F
 import torch.distributed as dist
 
 from opd.common import compute_cleanup, print0

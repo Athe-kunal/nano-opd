@@ -70,6 +70,8 @@ def build_student(
     train_world_size: int,
     student_group: Any,
     total_steps: int,
+    scheduler_name: str = "cosine",
+    warmup_ratio: float = 0.05,
 ) -> StudentModel:
     config = OmegaConf.create({
         "model_name": model_name,
@@ -79,7 +81,7 @@ def build_student(
         "attn_implementation": "flash_attention_2",
         "sharding_strategy": sharding_strategy,
         "optimizer": {"lr": lr, "weight_decay": weight_decay},
-        "scheduler": {"name": "cosine", "warmup_ratio": 0.05},
+        "scheduler": {"name": scheduler_name, "warmup_ratio": warmup_ratio},
     })
     student = StudentModel(config, data_parallel_size=train_world_size, process_group=student_group)
     student.prepare_scheduler(total_steps=total_steps)

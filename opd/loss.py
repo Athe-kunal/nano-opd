@@ -104,7 +104,7 @@ def compute_jsd_loss(
     t_tail = _tail_probs(teacher_probs)
 
     M = jsd_alpha * student_probs + (1.0 - jsd_alpha) * teacher_probs    # [B, T, K]
-    M_tail = jsd_alpha * s_tail + (1.0 - jsd_alpha) * t_tail             # [B, T]
+    M_tail = jsd_alpha * s_tail + (1.0 - jsd_alpha) * t_tail            # [B, T]
     log_M = M.clamp(min=1e-8).log()
     log_M_tail = M_tail.log()
 

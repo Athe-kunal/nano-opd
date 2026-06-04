@@ -112,7 +112,7 @@ def generate_rollouts_remote(base_url, prompts, num_samples, max_new_tokens,
     return resp["rollouts"]
 
 
-def prepare_batch(rollouts, tokenizer, max_seq_len, device):
+def prepare_batch(rollouts, tokenizer, max_prompt_len, max_response_len, device):
     """Pack a list of rollouts into padded training tensors."""
     input_ids_list = []
     response_mask_list = []
@@ -120,15 +120,13 @@ def prepare_batch(rollouts, tokenizer, max_seq_len, device):
     for rollout in rollouts:
         prompt_ids = rollout["prompt_ids"]
         response_ids = rollout["response_ids"]
-        if len(prompt_ids) >= max_seq_len:
+        if len(prompt_ids) > max_prompt_len:
             raise ValueError(
-                f"Prompt length ({len(prompt_ids)}) >= max_seq_len ({max_seq_len}); "
-                "no space left for response tokens. Increase --max-seq-len."
+                f"Prompt length ({len(prompt_ids)}) > max_prompt_len ({max_prompt_len}). "
+                "Increase --max-prompt-len."
             )
+        response_ids = response_ids[:max_response_len]
         full_ids = prompt_ids + response_ids
-        if len(full_ids) > max_seq_len:
-            full_ids = full_ids[:max_seq_len]
-            response_ids = full_ids[len(prompt_ids):]
         mask = [0] * len(prompt_ids) + [1] * len(response_ids)
         input_ids_list.append(full_ids)
         response_mask_list.append(mask)

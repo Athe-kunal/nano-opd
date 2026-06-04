@@ -8,7 +8,6 @@ from typing import Literal
 import torch
 import torch.nn.functional as F
 import torch.distributed as dist
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from opd.common import compute_cleanup, print0
 from opd.loss import ALGORITHMS
@@ -226,9 +225,17 @@ if __name__ == "__main__":
     parser.add_argument("--train-batch-size", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=1,
                         help="Optimizer steps per rollout batch before collecting new rollouts.")
-    parser.add_argument("--max-seq-len", type=int, default=2048)
+    parser.add_argument("--max-prompt-len", type=int, default=512,
+                        help="Hard cap on prompt tokens. Raises if exceeded.")
+    parser.add_argument("--max-response-len", type=int, default=1536,
+                        help="Cap on response tokens. Truncates silently if exceeded.")
     parser.add_argument("--sharding-strategy", type=str, default="FULL_SHARD")
     parser.add_argument("--gradient-checkpointing", action="store_true")
+    parser.add_argument("--scheduler", type=str, default="cosine",
+                        choices=["cosine", "linear", "constant"],
+                        help="LR scheduler. 'constant' disables warmup/decay entirely.")
+    parser.add_argument("--warmup-ratio", type=float, default=0.05,
+                        help="Fraction of total steps used for LR warmup.")
     # Runtime
     parser.add_argument("--device-type", type=str, default="")
     parser.add_argument("--run-name", type=str, default="dummy")
@@ -300,6 +307,8 @@ if __name__ == "__main__":
             train_world_size=train_world_size,
             student_group=student_group,
             total_steps=args.num_steps * args.epochs,
+            scheduler_name=args.scheduler,
+            warmup_ratio=args.warmup_ratio,
         )
 
     if is_teacher:
@@ -388,7 +397,9 @@ if __name__ == "__main__":
 
             batch = prepare_batch(
                 rollouts, tokenizer=student.tokenizer,
-                max_seq_len=args.max_seq_len, device=device,
+                max_prompt_len=args.max_prompt_len,
+                max_response_len=args.max_response_len,
+                device=device,
             )
             teacher_batch = prepare_teacher_batch(
                 rollouts, tokenizer=student.tokenizer, device=device,
@@ -551,8 +562,10 @@ if __name__ == "__main__":
 
                 # -- Loss and backward (student ranks only) --
                 if is_student:
-                    s_log_resp = F.log_softmax(s_resp.float(), dim=-1)
-                    s_logprobs = s_log_resp.gather(-1, topk_idx)   # [B, R, K]
+                    s_resp_f = s_resp.float()
+                    s_lse    = torch.logsumexp(s_resp_f, dim=-1, keepdim=True)  # [B, R, 1]
+                    s_logprobs       = s_resp_f.gather(-1, topk_idx) - s_lse          # [B, R, K]
+                    s_lp_at_student  = s_resp_f.gather(-1, student_topk_idx) - s_lse  # [B, R, K]
 
                     # Exclude positions where the teacher sequence was truncated
                     # (reference solution may push teacher prompt past max context).
@@ -591,12 +604,11 @@ if __name__ == "__main__":
                     n_batches  += 1
 
                     with torch.no_grad():
-                        s_lp_metrics = s_log_resp.gather(-1, student_topk_idx)
                         overlap_ratio     += compute_overlap_ratio(student_topk_idx, teacher_topk_idx).item()
                         overlap_advantage += compute_overlap_token_advantage(
-                            student_topk_idx, teacher_topk_idx, s_lp_metrics, t_lp_at_student
+                            student_topk_idx, teacher_topk_idx, s_lp_at_student, t_lp_at_student
                         ).item()
-                        entropy_gap_val   += compute_entropy_gap(s_lp_metrics, t_own_logprobs).item()
+                        entropy_gap_val   += compute_entropy_gap(s_lp_at_student, t_own_logprobs).item()
 
             if is_student:
                 student._optimizer_step()

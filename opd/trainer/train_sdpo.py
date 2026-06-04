@@ -247,6 +247,9 @@ if __name__ == "__main__":
                         help="Cap on response tokens. Truncates silently if exceeded.")
     parser.add_argument("--sharding-strategy", type=str, default="FULL_SHARD")
     parser.add_argument("--gradient-checkpointing", action="store_true")
+    parser.add_argument("--scheduler", type=str, default="cosine",
+                        choices=["cosine", "linear", "constant"])
+    parser.add_argument("--warmup-ratio", type=float, default=0.05)
     # Teacher sync — controls how the self-teacher tracks the student
     parser.add_argument("--sync-method", type=str, default="ema",
                         choices=list(SYNC_METHODS.keys()),
@@ -337,6 +340,8 @@ if __name__ == "__main__":
             train_world_size=train_world_size,
             student_group=student_group,
             total_steps=args.num_steps * args.epochs,
+            scheduler_name=args.scheduler,
+            warmup_ratio=args.warmup_ratio,
         )
 
     if is_teacher:
@@ -656,19 +661,19 @@ if __name__ == "__main__":
             if is_student:
                 student._optimizer_step()
 
-            # -- Sync updated student weights to the teacher rank --
-            # This is the core SDPO mechanism: after the student takes a gradient
-            # step, the teacher's weights are updated to follow the student via the
-            # chosen sync strategy (EMA, trust-region, hard-sync, or on-policy).
-            sync_student_to_teacher(
-                student_fsdp_model=student.model if is_student else None,
-                teacher=teacher if is_teacher else None,
-                syncer=syncer,
-                global_step=step,
-                is_student=is_student,
-                is_teacher=is_teacher,
-                all_group=all_group,
-            )
+        # -- Sync updated student weights to the teacher rank (once per step) --
+        # The teacher should track the fully-updated student after all epochs are
+        # done, not after each intermediate epoch — syncing inside the epoch loop
+        # would make the EMA teacher chase intermediate weights too aggressively.
+        sync_student_to_teacher(
+            student_fsdp_model=student.model if is_student else None,
+            teacher=teacher if is_teacher else None,
+            syncer=syncer,
+            global_step=step,
+            is_student=is_student,
+            is_teacher=is_teacher,
+            all_group=all_group,
+        )
 
         # -- Sync updated student weights into vLLM (student ranks only) --
         if is_student:

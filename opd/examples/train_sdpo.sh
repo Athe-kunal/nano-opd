@@ -62,6 +62,8 @@ EVAL_EVERY="${EVAL_EVERY:-20}"
 EVAL_K="${EVAL_K:-4}"
 EVAL_MAX_TOKENS="${EVAL_MAX_TOKENS:-4096}"
 SCIKNOWEVAL_TEST_SIZE="${SCIKNOWEVAL_TEST_SIZE:-0.01}"  # fraction held out for eval (sciknoweval only)
+SCHEDULER="${SCHEDULER:-cosine}"
+WARMUP_RATIO="${WARMUP_RATIO:-0.05}"
 SEED="${SEED:-0}"
 
 # FSDP sharding strategy — choose one of:
@@ -229,6 +231,8 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS,$TEACHER_GPUS" \
     --ema-alpha "$EMA_ALPHA" \
     --trust-region-beta "$TRUST_REGION_BETA" \
     --hard-sync-every-n "$HARD_SYNC_EVERY_N" \
+    --scheduler "$SCHEDULER" \
+    --warmup-ratio "$WARMUP_RATIO" \
     --sharding-strategy "$SHARDING_STRATEGY" \
     --save-dir "$SAVE_DIR" \
     --save-every "$SAVE_EVERY" \

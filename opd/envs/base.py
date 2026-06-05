@@ -12,7 +12,11 @@ class OPDEnvBase(BaseTextEnv):
       - init:           build opening conversation from prompt (dataset-specific)
       - compute_reward: per-step correctness signal for the RL reward
       - get_feedback:   SDPO feedback string injected into step metadata
-      - evaluate:       dataset-level benchmark eval (e.g. AIME pass@k), logs to wandb
+
+    Subclasses may override:
+      - evaluate:       mid-training eval via the live rollout worker (online envs only).
+                        Math datasets use eval_math.py post-training instead — they
+                        inherit the default no-op here.
     """
 
     def __init__(self, kind: str, dataset: str) -> None:
@@ -52,16 +56,16 @@ class OPDEnvBase(BaseTextEnv):
         ...
 
     @classmethod
-    @abc.abstractmethod
     def evaluate(
         cls,
-        rollout_worker_url: str,
-        step: int,
-        **kwargs: Any,
+        _rollout_worker_url: str,
+        _step: int,
+        **_kwargs: Any,
     ) -> dict[str, Any]:
         """
-        Run dataset-level evaluation (e.g. AIME pass@k, LCB pass@1) using the
-        already weight-synced rollout worker. Log results to wandb and return a
-        metrics dict keyed like {"eval/pass@8": 0.42}.
+        Mid-training eval using the live rollout worker. Override in envs that
+        support online evaluation (e.g. livecodebench, sciknoweval). Math envs
+        (dapo_math, opsd_math) leave this as a no-op and use eval_math.py
+        post-training via the shell scripts instead.
         """
-        ...
+        return {}

@@ -54,22 +54,6 @@ class OPSDMathEnv(OPDEnvBase):
         return self.solution
 
     @classmethod
-    def evaluate(
-        cls,
-        rollout_worker_url: str,
-        step: int,
-        tokenizer: Any | None = None,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        from opd.eval.eval_aime_2025 import run_eval
-        return run_eval(
-            rollout_worker_url=rollout_worker_url,
-            tokenizer=tokenizer,
-            step=step,
-            **kwargs,
-        )
-
-    @classmethod
     def load(
         cls,
         split: str = "train",

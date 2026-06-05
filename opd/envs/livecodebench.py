@@ -15,8 +15,15 @@ from skyrl_gym.envs.base_text_env import ConversationType
 
 from opd.common import print0
 from opd.envs.base import OPDEnvBase
-from opd.eval.eval_aime_2025 import pass_at_k
 from opd.generator.rollout import generate_rollouts_remote
+
+def pass_at_k(n: int, c: int, k: int) -> float:
+    """Unbiased pass@k estimator."""
+    if n - c < k:
+        return 1.0
+    from math import comb
+    return 1.0 - comb(n - c, k) / comb(n, k)
+
 
 LCB_TEST_CUTOFF = datetime(2025, 2, 1)
 LCB_TRAIN_CUTOFF = datetime(2025, 2, 1)

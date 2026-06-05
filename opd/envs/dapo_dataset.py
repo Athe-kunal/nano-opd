@@ -115,22 +115,6 @@ class DapoMathEnv(OPDEnvBase):
         return ""
 
     @classmethod
-    def evaluate(
-        cls,
-        rollout_worker_url: str,
-        step: int,
-        tokenizer: Any | None = None,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        from opd.eval.eval_aime_2025 import run_eval
-        return run_eval(
-            rollout_worker_url=rollout_worker_url,
-            tokenizer=tokenizer,
-            step=step,
-            **kwargs,
-        )
-
-    @classmethod
     def from_records(cls, records: list[dict[str, Any]]) -> list[DapoMathEnv]:
         return [cls(prompt=r["prompt"], answer=r["answer"]) for r in records]
 

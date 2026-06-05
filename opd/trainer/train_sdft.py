@@ -301,7 +301,10 @@ if __name__ == "__main__":
                         help="Distillation loss. SDFT paper uses reverse_kl (Eq. 1).")
     parser.add_argument("--distill-top-k", type=int, default=100,
                         help="Top-K vocab for KL distillation. Larger K is more faithful "
-                             "but uses more memory and bandwidth.")
+                             "but uses more memory and bandwidth. NOTE: the SDFT paper's "
+                             "analytic per-token KL estimator (Appendix A.1) sums over the FULL "
+                             "vocabulary V; top-K is a nano-opd memory/bandwidth approximation, "
+                             "not part of the paper. Raise K toward V to reduce the truncation bias.")
     parser.add_argument("--student-chunk-size", type=int, default=-1)
     parser.add_argument("--teacher-chunk-size", type=int, default=-1)
     parser.add_argument("--tis-clip", type=float, default=0.0,
@@ -310,8 +313,10 @@ if __name__ == "__main__":
     # Loss masking — suppress 'Based on the text...' preamble artifacts
     parser.add_argument("--num-loss-tokens-to-skip", type=int, default=5,
                         help="Mask the first N response tokens from the distillation loss. "
-                             "SDFT paper (Section 5) shows this suppresses preamble artifacts "
-                             "the student learns to mimic from the demonstration-conditioned teacher.")
+                             "SDFT paper (Section 5, 'Learned Artifacts') masks 'the first few "
+                             "tokens' to suppress preamble artifacts (e.g. 'Based on the text...') "
+                             "the student mimics from the demonstration-conditioned teacher; the "
+                             "paper does not give an exact count, so N=5 is a nano-opd default.")
     # Generation
     parser.add_argument("--max-new-tokens", type=int, default=1024)
     parser.add_argument("--temperature", type=float, default=1.0)
@@ -329,8 +334,13 @@ if __name__ == "__main__":
                              "produces exactly one on-policy rollout.")
     parser.add_argument("--train-batch-size", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=1,
-                        help="Optimizer steps per rollout batch before collecting new rollouts. "
-                             "SDFT paper uses 2 epochs for Skill Learning, 4 for Knowledge Acquisition.")
+                        help="Optimizer steps taken on the SAME rollout batch before collecting "
+                             "new rollouts (PPO-style inner reuse). WARNING: this is NOT the same "
+                             "as the SDFT paper's 'epochs' (Tables 3/4: 2 for Skill Learning, 4 for "
+                             "Knowledge Acquisition), which are full passes over the dataset that "
+                             "RE-ROLL fresh on-policy trajectories each pass. epochs>1 here reuses "
+                             "stale rollouts and is mildly off-policy (--tis-clip partially corrects "
+                             "it). To replicate the paper's epochs, raise --num-steps instead.")
     parser.add_argument("--max-seq-len", type=int, default=2048)
     parser.add_argument("--sharding-strategy", type=str, default="FULL_SHARD")
     parser.add_argument("--gradient-checkpointing", action="store_true")

@@ -40,12 +40,20 @@ from opd.generator.rollout import (
 # solution the teacher is asked to solve the problem in its own way — this
 # rationalization is done implicitly through a single forward pass (no
 # generation), so the teacher never actually produces new tokens here.
+_STUDENT_SUFFIX = "\n\nPlease reason step by step, and put your final answer within \\boxed{}."  # not passed through .format()
+
 _TEACHER_TEMPLATE = (
-    "{problem}\n"
-    "Here is a reference solution:\n"
+    "{problem}\n\n"
+    "Here is a reference solution to this problem:\n"
+    "=== Reference Solution Begin ===\n"
     "{solution}\n"
-    "After understanding the reference solution, please try to solve this "
-    "problem using your own approach below:"
+    "=== Reference Solution End ===\n\n"
+    "After reading the reference solution above, make sure you truly understand "
+    "the reasoning behind each step — do not copy or paraphrase it. Now, using your "
+    "own words and independent reasoning, derive the same final answer to the problem above. "
+    "Think step by step, explore different approaches, and don't be afraid to backtrack "
+    "or reconsider if something doesn't work out:\n\n"
+    "Please reason step by step, and put your final answer within \\boxed{{}}."
 )
 
 
@@ -360,7 +368,7 @@ if __name__ == "__main__":
             # Student prompt: problem only — p_S(· | x)
             prompts = [
                 student.tokenizer.apply_chat_template(
-                    [{"role": "user", "content": ex.problem}],
+                    [{"role": "user", "content": ex.problem + _STUDENT_SUFFIX}],
                     tokenize=False,
                     add_generation_prompt=True,
                 )
@@ -381,8 +389,10 @@ if __name__ == "__main__":
             # context than the student (problem only), following Figure 2.
             for i, ex in enumerate(examples):
                 r            = rollouts[i]    # one rollout per prompt (num_samples=1)
-                student_msgs = [{"role": "user", "content": ex.problem}]
-                teacher_msgs = _build_teacher_messages(student_msgs, ex.solution)
+                student_msgs = [{"role": "user", "content": ex.problem + _STUDENT_SUFFIX}]
+                teacher_msgs = _build_teacher_messages(
+                    [{"role": "user", "content": ex.problem}], ex.solution
+                )
                 r["teacher_prompt"] = student.tokenizer.apply_chat_template(
                     teacher_msgs, tokenize=False, add_generation_prompt=True
                 )

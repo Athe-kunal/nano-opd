@@ -23,7 +23,7 @@ REPO_ROOT="$(cd "$OPD_DIR/.." && pwd)"
 BASE_DIR="${opd_BASE_DIR:-$REPO_ROOT/.opd}"
 
 # In SDFT the teacher IS the student (EMA copy) — only one model checkpoint needed.
-STUDENT_MODEL="${STUDENT_MODEL:-Qwen/Qwen2.5-7B-Instruct}"
+STUDENT_MODEL="${STUDENT_MODEL:-Qwen/Qwen2.5-1.5B-Instruct}"
 
 # Dataset. Built-in options pulled from the Self-Distillation GitHub repo:
 #   science   – science Q&A with worked demonstrations (paper's Science Q&A task)
@@ -51,10 +51,10 @@ WEIGHT_TRANSFER_BACKEND="${WEIGHT_TRANSFER_BACKEND:-nccl}"
 
 USE_WANDB="${USE_WANDB:-1}"
 
-NUM_STEPS="${NUM_STEPS:-200}"
-SAVE_EVERY="${SAVE_EVERY:-0}"
+NUM_STEPS="${NUM_STEPS:-100}"
+SAVE_EVERY="${SAVE_EVERY:-100}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-4}"
-GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-1}"
+GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-4}"
 
 # NOTE: --epochs here is PPO-style reuse of the SAME rollout batch, NOT the
 # paper's dataset-pass epochs (which re-roll fresh on-policy trajectories).
@@ -69,8 +69,8 @@ MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
 # SDFT: exactly one on-policy rollout per (question, demonstration) pair — there
 # is no num-samples multiplier (paper Appendix A.1 uses a single trajectory).
 PROMPTS_PER_STEP="${PROMPTS_PER_STEP:-8}"
-MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"
-MAX_PROMPT_LEN="${MAX_PROMPT_LEN:-512}"
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1536}"
+MAX_PROMPT_LEN="${MAX_PROMPT_LEN:-1024}"
 MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-1536}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-0}"   # 0 = MAX_PROMPT_LEN + MAX_RESPONSE_LEN
 TEMPERATURE="${TEMPERATURE:-1.0}"

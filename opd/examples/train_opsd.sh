@@ -8,7 +8,7 @@ REPO_ROOT="$(cd "$OPD_DIR/.." && pwd)"
 BASE_DIR="${opd_BASE_DIR:-$REPO_ROOT/.opd}"
 
 # In OPSD the teacher is the FROZEN initial policy — same checkpoint as student.
-STUDENT_MODEL="${STUDENT_MODEL:-Qwen/Qwen2.5-1.5B-Instruct}"
+STUDENT_MODEL="${STUDENT_MODEL:-Qwen/Qwen3-1.7B}"
 
 # GPU assignment (comma-separated physical GPU IDs)
 #   TRAIN_GPUS    – student FSDP training ranks (0..N-1)
@@ -46,7 +46,7 @@ DISTILL_TOP_K="${DISTILL_TOP_K:-100}"
 STUDENT_CHUNK_SIZE="${STUDENT_CHUNK_SIZE:--1}"
 TEACHER_CHUNK_SIZE="${TEACHER_CHUNK_SIZE:--1}"
 TIS_CLIP="${TIS_CLIP:-0.0}"
-KL_CLIP="${KL_CLIP:-0.0}"
+KL_CLIP="${KL_CLIP:-0.05}"
 
 SCHEDULER="${SCHEDULER:-cosine}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.05}"

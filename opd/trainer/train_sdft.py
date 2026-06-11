@@ -411,6 +411,14 @@ if __name__ == "__main__":
     )
     parser.add_argument("--train-batch-size", type=int, default=4)
     parser.add_argument(
+        "--grad-accum-steps",
+        type=int,
+        default=1,
+        help="Gradient accumulation steps. Each minibatch is split into this many "
+        "micro batches; gradients accumulate before a single optimizer step. "
+        "Effective batch size = train-batch-size * grad-accum-steps.",
+    )
+    parser.add_argument(
         "--epochs",
         type=int,
         default=1,
@@ -914,7 +922,7 @@ if __name__ == "__main__":
                             effective_mask,
                             tis_weights=tis_weights,
                         )
-                        / n_mb
+                        / args.grad_accum_steps
                     )
                     student._scale_loss(loss).backward()
                     total_loss += loss.item()
@@ -935,7 +943,12 @@ if __name__ == "__main__":
                             s_lp_metrics, t_own_logprobs
                         ).item()
 
-            if is_student:
+                # -- Optimizer step every grad_accum_steps minibatches --
+                if is_student and (mb_idx + 1) % args.grad_accum_steps == 0:
+                    student._optimizer_step()
+
+            # -- Final optimizer step if minibatches don't divide evenly --
+            if is_student and n_mb % args.grad_accum_steps != 0:
                 student._optimizer_step()
 
             # -- EMA sync: after each optimizer step, teacher tracks student --

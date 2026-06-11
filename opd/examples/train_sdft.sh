@@ -54,6 +54,7 @@ USE_WANDB="${USE_WANDB:-1}"
 NUM_STEPS="${NUM_STEPS:-200}"
 SAVE_EVERY="${SAVE_EVERY:-0}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-4}"
+GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-1}"
 
 # NOTE: --epochs here is PPO-style reuse of the SAME rollout batch, NOT the
 # paper's dataset-pass epochs (which re-roll fresh on-policy trajectories).
@@ -265,6 +266,7 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS,$TEACHER_GPUS" \
     --num-steps "$NUM_STEPS" \
     --prompts-per-step "$PROMPTS_PER_STEP" \
     --train-batch-size "$TRAIN_BATCH_SIZE" \
+    --grad-accum-steps "$GRAD_ACCUM_STEPS" \
     --epochs "$EPOCHS" \
     --max-new-tokens "$MAX_NEW_TOKENS" \
     --max-prompt-len "$MAX_PROMPT_LEN" \

@@ -25,9 +25,15 @@ BASE_DIR="${opd_BASE_DIR:-$REPO_ROOT/.opd}"
 # In SDFT the teacher IS the student (EMA copy) — only one model checkpoint needed.
 STUDENT_MODEL="${STUDENT_MODEL:-Qwen/Qwen2.5-7B-Instruct}"
 
-# JSONL dataset, one record per line: {"question": ..., "demonstration": ...}
-# The demonstration is the worked example spliced into the teacher's context.
-DATASET_PATH="${DATASET_PATH:-$REPO_ROOT/opd/examples/configs/sdft_demo.jsonl}"
+# Dataset. Built-in options pulled from the Self-Distillation GitHub repo:
+#   science   – science Q&A with worked demonstrations (paper's Science Q&A task)
+#   tooluse   – tool-use tasks with golden Action/Action_Input sequences
+# Set DATASET_PATH to a JSONL on disk to override (one {"question","demonstration"} per line).
+DATASET="${DATASET:-science}"
+DATASET_LIMIT="${DATASET_LIMIT:-0}"          # 0 = use all rows
+# Custom data (optional): point DATASET_PATH at your own {question, demonstration}
+# JSONL to override the built-in dataset.
+DATASET_PATH="${DATASET_PATH:-}"
 
 # GPU assignment (comma-separated physical GPU IDs)
 #   TRAIN_GPUS    – student FSDP training ranks (0..N-1)
@@ -63,12 +69,14 @@ MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
 # is no num-samples multiplier (paper Appendix A.1 uses a single trajectory).
 PROMPTS_PER_STEP="${PROMPTS_PER_STEP:-8}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"
-MAX_SEQ_LEN="${MAX_SEQ_LEN:-2048}"
+MAX_PROMPT_LEN="${MAX_PROMPT_LEN:-512}"
+MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-1536}"
+MAX_SEQ_LEN="${MAX_SEQ_LEN:-0}"   # 0 = MAX_PROMPT_LEN + MAX_RESPONSE_LEN
 TEMPERATURE="${TEMPERATURE:-1.0}"
 TOP_K="${TOP_K:-50}"
 
 # reverse_kl is the SDFT default (paper Eq. 1: KL(π_student ‖ π_teacher)).
-ALGORITHM="${ALGORITHM:-reverse_kl}"
+ALGORITHM="${ALGORITHM:-forward_kl}"
 DISTILL_TOP_K="${DISTILL_TOP_K:-100}"
 STUDENT_CHUNK_SIZE="${STUDENT_CHUNK_SIZE:--1}"
 TEACHER_CHUNK_SIZE="${TEACHER_CHUNK_SIZE:--1}"
@@ -111,8 +119,8 @@ export ROLLOUT_PORT
 export USE_WANDB
 
 # ---------------------------------------------------------------------------
-# Sanity: dataset must exist (SDFT needs a {question, demonstration} JSONL).
-if [[ ! -f "$DATASET_PATH" ]]; then
+# Sanity: if DATASET_PATH is set it must exist; otherwise a built-in dataset is used.
+if [[ -n "$DATASET_PATH" && ! -f "$DATASET_PATH" ]]; then
   echo "DATASET_PATH does not exist: $DATASET_PATH" >&2
   echo "Provide a JSONL file, one record per line:" >&2
   echo '  {"question": "...", "demonstration": "...worked example..."}' >&2
@@ -243,7 +251,9 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS,$TEACHER_GPUS" \
     "$OPD_DIR/trainer/train_sdft.py" \
     --student-model "$STUDENT_MODEL" \
     --train-world-size "$TRAIN_NPROC" \
+    --dataset "$DATASET" \
     --dataset-path "$DATASET_PATH" \
+    --dataset-limit "$DATASET_LIMIT" \
     --algorithm "$ALGORITHM" \
     --distill-top-k "$DISTILL_TOP_K" \
     --student-chunk-size "$STUDENT_CHUNK_SIZE" \
@@ -257,6 +267,8 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS,$TEACHER_GPUS" \
     --train-batch-size "$TRAIN_BATCH_SIZE" \
     --epochs "$EPOCHS" \
     --max-new-tokens "$MAX_NEW_TOKENS" \
+    --max-prompt-len "$MAX_PROMPT_LEN" \
+    --max-response-len "$MAX_RESPONSE_LEN" \
     --max-seq-len "$MAX_SEQ_LEN" \
     --temperature "$TEMPERATURE" \
     --top-k "$TOP_K" \

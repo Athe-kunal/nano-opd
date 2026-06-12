@@ -6,7 +6,6 @@ import argparse
 from typing import Literal
 
 import torch
-import torch.nn.functional as F
 import torch.distributed as dist
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
@@ -72,7 +71,7 @@ def _build_teacher_messages(init_messages, env_output, successful_rollout):
 
     teacher_messages = list(init_messages[:-1])  # preserve system message if any
     teacher_messages.append({"role": "user", "content": "\n".join(parts)})
-    return teacher_messages
+    return teacher_messages, has_extra
 
 
 def prepare_teacher_batch(rollouts, tokenizer, device):
@@ -242,9 +241,15 @@ if __name__ == "__main__":
     parser.add_argument("--prompts-per-step", type=int, default=8)
     parser.add_argument("--train-batch-size", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--max-seq-len", type=int, default=2048)
+    parser.add_argument("--max-prompt-len", type=int, default=512,
+                        help="Hard cap on prompt tokens. Raises if exceeded.")
+    parser.add_argument("--max-response-len", type=int, default=1536,
+                        help="Cap on response tokens. Truncates silently if exceeded.")
     parser.add_argument("--sharding-strategy", type=str, default="FULL_SHARD")
     parser.add_argument("--gradient-checkpointing", action="store_true")
+    parser.add_argument("--scheduler", type=str, default="cosine",
+                        choices=["cosine", "linear", "constant"])
+    parser.add_argument("--warmup-ratio", type=float, default=0.05)
     # Teacher sync — controls how the self-teacher tracks the student
     parser.add_argument("--sync-method", type=str, default="ema",
                         choices=list(SYNC_METHODS.keys()),
@@ -335,6 +340,8 @@ if __name__ == "__main__":
             train_world_size=train_world_size,
             student_group=student_group,
             total_steps=args.num_steps * args.epochs,
+            scheduler_name=args.scheduler,
+            warmup_ratio=args.warmup_ratio,
         )
 
     if is_teacher:
@@ -429,14 +436,17 @@ if __name__ == "__main__":
                     # Paper Table 2: successful attempts pass their own response as the correct
                     # solution; failed attempts pass a different successful rollout (if any).
                     success_hint = r["response"] if rewards[j] > 0 else successful_text
-                    teacher_msgs = _build_teacher_messages(init_msgs, env_output, success_hint)
+                    teacher_msgs, has_distillation = _build_teacher_messages(init_msgs, env_output, success_hint)
+                    r["has_distillation"] = has_distillation
                     r["teacher_prompt"] = student.tokenizer.apply_chat_template(
                         teacher_msgs, tokenize=False, add_generation_prompt=True
                     )
 
             batch = prepare_batch(
                 rollouts, tokenizer=student.tokenizer,
-                max_seq_len=args.max_seq_len, device=device,
+                max_prompt_len=args.max_prompt_len,
+                max_response_len=args.max_response_len,
+                device=device,
             )
             teacher_batch = prepare_teacher_batch(
                 rollouts, tokenizer=student.tokenizer, device=device,
@@ -449,6 +459,11 @@ if __name__ == "__main__":
             teacher_input_ids  = teacher_batch["input_ids"]   # [N, T_t]
             teacher_attn_mask  = teacher_batch["attention_mask"]
             teacher_resp_mask  = teacher_batch["response_mask"]
+            # 1 for rollouts where the teacher received augmented context (solution or feedback),
+            # 0 for rollouts where teacher == student context (distillation signal is meaningless).
+            sd_mask = torch.tensor(
+                [r["has_distillation"] for r in rollouts], dtype=torch.float, device=device
+            )  # [N]
             student.model.train()
 
         total_loss        = 0.0
@@ -483,8 +498,9 @@ if __name__ == "__main__":
                     t_mb_ids  = teacher_input_ids[idx]
                     t_mb_attn = teacher_attn_mask[idx]
                     t_mb_mask = teacher_resp_mask[idx]
+                    mb_sd_mask = sd_mask[idx]              # [B]
                 else:
-                    mb_ids = mb_attn = t_mb_ids = t_mb_attn = t_mb_mask = None
+                    mb_ids = mb_attn = t_mb_ids = t_mb_attn = t_mb_mask = mb_sd_mask = None
 
                 # -- Broadcast student inputs to teacher (teacher needs B/T info) --
                 mb_ids, mb_attn = broadcast_minibatch(
@@ -495,6 +511,11 @@ if __name__ == "__main__":
                 t_mb_ids, t_mb_attn, t_mb_mask = broadcast_teacher_inputs(
                     is_student, t_mb_ids, t_mb_attn, t_mb_mask, device, all_group
                 )
+
+                # -- Broadcast self-distillation mask --
+                if not is_student:
+                    mb_sd_mask = torch.zeros(mb_ids.shape[0], dtype=torch.float, device=device)
+                dist.broadcast(mb_sd_mask, src=0, group=all_group)
 
                 # -- Student forward (with grad) --
                 if is_student:
@@ -612,16 +633,20 @@ if __name__ == "__main__":
 
                 # -- Loss and backward (student ranks only) --
                 if is_student:
-                    s_log_resp = F.log_softmax(s_resp.float(), dim=-1)
-                    s_logprobs = s_log_resp.gather(-1, topk_idx)   # [B, R, K] fp32
+                    s_resp_f        = s_resp.float()
+                    s_lse           = torch.logsumexp(s_resp_f, dim=-1, keepdim=True)  # [B, R, 1]
+                    s_logprobs      = s_resp_f.gather(-1, topk_idx) - s_lse            # [B, R, K]
+                    s_lp_at_student = s_resp_f.gather(-1, student_topk_idx) - s_lse   # [B, R, K]
 
                     # Exclude positions where the teacher sequence was truncated (due to
                     # its longer feedback-augmented prompt hitting max_seq_len). Those
                     # padded positions have log_softmax(0) = -log(V) — a spurious uniform
                     # distribution that would corrupt the loss signal.
-                    effective_mask = s_compact_mask * t_compact_mask   # [B, R_max]
+                    # Also exclude samples where the teacher had no augmented context —
+                    # those have teacher == student prompt so the KL signal is meaningless.
+                    effective_mask = s_compact_mask * t_compact_mask * mb_sd_mask.unsqueeze(1)  # [B, R_max]
                     if effective_mask.sum() == 0:
-                        print0(f"[warn mb] effective_mask is all-zero: s_mask={s_compact_mask.sum().item():.0f} t_mask={t_compact_mask.sum().item():.0f}", flush=True)
+                        print0(f"[warn mb] effective_mask is all-zero: s_mask={s_compact_mask.sum().item():.0f} t_mask={t_compact_mask.sum().item():.0f} sd_mask={mb_sd_mask.sum().item():.0f}", flush=True)
 
                     if args.tis_clip > 0.0:
                         sampled_ids    = mb_ids[:, 1:]
@@ -641,29 +666,28 @@ if __name__ == "__main__":
                     n_batches  += 1
 
                     with torch.no_grad():
-                        s_lp_metrics = s_log_resp.gather(-1, student_topk_idx)
                         overlap_ratio     += compute_overlap_ratio(student_topk_idx, teacher_topk_idx).item()
                         overlap_advantage += compute_overlap_token_advantage(
-                            student_topk_idx, teacher_topk_idx, s_lp_metrics, t_lp_at_student
+                            student_topk_idx, teacher_topk_idx, s_lp_at_student, t_lp_at_student
                         ).item()
-                        entropy_gap_val   += compute_entropy_gap(s_lp_metrics, t_own_logprobs).item()
+                        entropy_gap_val   += compute_entropy_gap(s_lp_at_student, t_own_logprobs).item()
 
             if is_student:
                 student._optimizer_step()
 
-            # -- Sync updated student weights to the teacher rank --
-            # This is the core SDPO mechanism: after the student takes a gradient
-            # step, the teacher's weights are updated to follow the student via the
-            # chosen sync strategy (EMA, trust-region, hard-sync, or on-policy).
-            sync_student_to_teacher(
-                student_fsdp_model=student.model if is_student else None,
-                teacher=teacher if is_teacher else None,
-                syncer=syncer,
-                global_step=step,
-                is_student=is_student,
-                is_teacher=is_teacher,
-                all_group=all_group,
-            )
+        # -- Sync updated student weights to the teacher rank (once per step) --
+        # The teacher should track the fully-updated student after all epochs are
+        # done, not after each intermediate epoch — syncing inside the epoch loop
+        # would make the EMA teacher chase intermediate weights too aggressively.
+        sync_student_to_teacher(
+            student_fsdp_model=student.model if is_student else None,
+            teacher=teacher if is_teacher else None,
+            syncer=syncer,
+            global_step=step,
+            is_student=is_student,
+            is_teacher=is_teacher,
+            all_group=all_group,
+        )
 
         # -- Sync updated student weights into vLLM (student ranks only) --
         if is_student:

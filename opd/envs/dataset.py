@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import random as _random
-from typing import Iterator, Literal
+from typing import Iterator, Literal, Sequence, TypeVar
 
 from opd.envs.base import OPDEnvBase
 from opd.envs.dapo_dataset import DapoMathEnv
 from opd.envs.livecodebench import LiveCodeBenchEnv
+from opd.envs.opsd_dataset import OPSDMathEnv
 from opd.envs.sciknoweval import SciKnowEvalEnv
 
-DatasetType = Literal["livecodebench", "sciknoweval", "dapo_math"]
+E = TypeVar("E", bound=OPDEnvBase)
+
+DatasetType = Literal["livecodebench", "sciknoweval", "dapo_math", "opsd_math"]
 
 
-def build_opd_dataset(dataset_type: DatasetType, eval_test_size: float = 0.1, seed: int = 42) -> list[OPDEnvBase]:
+def build_opd_dataset(dataset_type: DatasetType, eval_test_size: float = 0.1, seed: int = 42, dataset_split: str = "train") -> list[OPDEnvBase]:
     envs: list[OPDEnvBase]
     if dataset_type == "livecodebench":
         envs = LiveCodeBenchEnv.load(dataset_split="train")  # type: ignore[assignment]
@@ -19,19 +22,21 @@ def build_opd_dataset(dataset_type: DatasetType, eval_test_size: float = 0.1, se
         envs = SciKnowEvalEnv.load(test_size=eval_test_size, seed=seed)  # type: ignore[assignment]
     elif dataset_type == "dapo_math":
         envs = DapoMathEnv.load()  # type: ignore[assignment]
+    elif dataset_type == "opsd_math":
+        envs = OPSDMathEnv.load(split=dataset_split)  # type: ignore[assignment]
     else:
         raise ValueError(f"Unsupported dataset type: {dataset_type!r}")
     return envs
 
 
 def distributed_opd_loader(
-    dataset: list[OPDEnvBase],
+    dataset: Sequence[E],
     prompts_per_step: int,
     world_size: int,
     rank: int,
     seed: int = 0,
     resume_state: dict | None = None,
-) -> Iterator[tuple[list[OPDEnvBase], dict]]:
+) -> Iterator[tuple[list[E], dict]]:
     """Yield (list[OPDEnvBase], state_dict) per step."""
     n = len(dataset)
     assert prompts_per_step % world_size == 0

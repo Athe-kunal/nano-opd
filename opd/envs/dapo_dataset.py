@@ -112,23 +112,8 @@ class DapoMathEnv(OPDEnvBase):
     def get_feedback(self, action: str) -> str:
         if extract_last_boxed(action) is None:
             return "Format error: response must contain a \\boxed{...} expression with your final answer."
-        return ""
-
-    @classmethod
-    def evaluate(
-        cls,
-        rollout_worker_url: str,
-        step: int,
-        tokenizer: Any | None = None,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        from opd.eval.eval_aime_2025 import run_eval
-        return run_eval(
-            rollout_worker_url=rollout_worker_url,
-            tokenizer=tokenizer,
-            step=step,
-            **kwargs,
-        )
+        pred = extract_last_boxed(action)
+        return f"Your answer \\boxed{{{pred}}} is incorrect. The correct answer is \\boxed{{{self.answer}}}."
 
     @classmethod
     def from_records(cls, records: list[dict[str, Any]]) -> list[DapoMathEnv]:

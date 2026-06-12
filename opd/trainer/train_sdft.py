@@ -1,0 +1,1017 @@
+import os
+import json
+import math
+import time
+import argparse
+import random as _random
+from typing import Literal, Iterator
+
+import torch
+import torch.nn.functional as F
+import torch.distributed as dist
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+from opd.common import compute_cleanup, print0
+from opd.loss import ALGORITHMS
+from opd.fsdp.algorithms import (
+    student_logprob_at_sampled_tokens,
+    teacher_logprobs_at_indices,
+    teacher_topk_logprobs,
+)
+from opd.trainer.distillation_utils import broadcast_minibatch
+from opd.trainer.setup_utils import (
+    init_distributed,
+    build_student,
+    build_teacher,
+    init_vllm_transfer,
+)
+from opd.trainer.sync_teacher import SYNC_METHODS, build_syncer
+from opd.metrics import (
+    compute_overlap_ratio,
+    compute_overlap_token_advantage,
+    compute_entropy_gap,
+)
+from opd.generator.rollout import (
+    generate_rollouts_remote,
+    sync_weights_to_vllm_inplace,
+    prepare_batch,
+)
+from opd.envs.sdft_science import load_sdft_science
+from opd.envs.sdft_tooluse import load_sdft_tooluse
+
+
+def distributed_sdft_loader(
+    dataset: list[dict],
+    prompts_per_step: int,
+    world_size: int,
+    rank: int,
+    seed: int = 0,
+) -> Iterator[list[dict]]:
+    """Yield per-rank slices of the SDFT dataset, shuffled each epoch."""
+    n = len(dataset)
+    assert prompts_per_step % world_size == 0
+    per_rank = prompts_per_step // world_size
+
+    epoch, cursor = 0, 0
+
+    def _shuffle(epoch_idx):
+        rng = _random.Random(seed * 1_000_003 + epoch_idx)
+        order = list(range(n))
+        rng.shuffle(order)
+        return order
+
+    order = _shuffle(epoch)
+    while True:
+        if cursor + prompts_per_step > n:
+            epoch += 1
+            cursor = 0
+            order = _shuffle(epoch)
+        step_idx = order[cursor : cursor + prompts_per_step]
+        rank_idx = step_idx[rank * per_rank : (rank + 1) * per_rank]
+        yield [dataset[i] for i in rank_idx]
+        cursor += prompts_per_step
+
+
+# ---------------------------------------------------------------------------
+# Teacher prompt construction
+# ---------------------------------------------------------------------------
+
+# Template from SDFT paper Section 3. The teacher sees the question AND a
+# worked demonstration; this in-context conditioning shifts the teacher's
+# distribution toward the expert behaviour while keeping it anchored to the
+# pretrained base — closer to the base model than SFT, but task-capable.
+_TEACHER_TEMPLATE = (
+    "{question}\n"
+    "This is an example for a response to the question:\n"
+    "{demonstration}\n"
+    "Now answer with a response of your own, including the thinking process:"
+)
+
+
+def _build_teacher_messages(
+    student_messages: list[dict],
+    demonstration: str,
+) -> list[dict]:
+    """Construct the demonstration-conditioned teacher prompt (SDFT paper, Section 3).
+
+    The student sees: system (optional) + user(question)
+    The teacher sees: system (optional) + user(question + demonstration template)
+
+    We splice the demonstration into the *last* user turn so the chat template
+    renders correctly regardless of whether there is a system message.
+    """
+    user_content = student_messages[-1]["content"]
+    teacher_user = _TEACHER_TEMPLATE.format(
+        question=user_content,
+        demonstration=demonstration,
+    )
+    teacher_messages = list(student_messages[:-1])  # preserve system message if any
+    teacher_messages.append({"role": "user", "content": teacher_user})
+    return teacher_messages
+
+
+# ---------------------------------------------------------------------------
+# Batch preparation helpers
+# (identical to train_sdpo.py — teacher sequences are longer due to the
+# injected demonstration, so they require separate padding)
+# ---------------------------------------------------------------------------
+
+
+def prepare_teacher_batch(rollouts, tokenizer, device):
+    """Build padded teacher sequences from demonstration-augmented prompts.
+
+    Each rollout must carry a ``teacher_prompt`` string (chat template applied
+    to the demonstration-conditioned messages). The same response token IDs as
+    the student are appended after the teacher prompt, so the teacher evaluates
+    the student's exact on-policy response from its richer context.
+
+    No max_seq_len cap: the teacher never generates tokens, so memory is
+    bounded by sequence length alone (no KV cache growth during decoding).
+    """
+    input_ids_list, response_mask_list = [], []
+    for r in rollouts:
+        t_prompt_ids = tokenizer.encode(r["teacher_prompt"], add_special_tokens=False)
+        response_ids = list(r["response_ids"])
+        full_ids = t_prompt_ids + response_ids
+        r_len = len(response_ids)
+        input_ids_list.append(full_ids)
+        response_mask_list.append([0] * len(t_prompt_ids) + [1] * r_len)
+
+    max_len = max(len(ids) for ids in input_ids_list)
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+    padded_ids = [ids + [pad_id] * (max_len - len(ids)) for ids in input_ids_list]
+    padded_masks = [m + [0] * (max_len - len(m)) for m in response_mask_list]
+    attn_masks = [[1] * len(ids) + [0] * (max_len - len(ids)) for ids in input_ids_list]
+
+    return {
+        "input_ids": torch.tensor(padded_ids, dtype=torch.long, device=device),
+        "attention_mask": torch.tensor(attn_masks, dtype=torch.long, device=device),
+        "response_mask": torch.tensor(padded_masks, dtype=torch.float, device=device),
+    }
+
+
+def pack_response_logits(logits, shift_mask):
+    """Extract response-position logits into a compact [B, R_max, V] tensor.
+
+    Student and teacher process sequences of different lengths (teacher prompt
+    is longer due to the injected demonstration). To align both distributions
+    at response token positions, this removes prompt positions and packs the
+    result into a dense tensor.
+
+    Args:
+        logits:     [B, T-1, V] — model output logits (already shifted).
+        shift_mask: [B, T-1]    — float mask, 1 at response positions.
+
+    Returns:
+        resp_logits:  [B, R_max, V]
+        compact_mask: [B, R_max] — 1 where response tokens exist.
+    """
+    B, _, V = logits.shape
+    resp_counts = shift_mask.long().sum(dim=1)
+    R_max = int(resp_counts.max().item())
+    if R_max == 0:
+        return logits.new_zeros(B, 0, V), shift_mask.new_zeros(B, 0)
+
+    out = logits.new_zeros(B, R_max, V)
+    compact_mask = torch.zeros(B, R_max, dtype=torch.float, device=logits.device)
+    for b in range(B):
+        r_b = int(resp_counts[b].item())
+        if r_b > 0:
+            out[b, :r_b] = logits[b][shift_mask[b].bool()]
+            compact_mask[b, :r_b] = 1.0
+    return out, compact_mask
+
+
+def broadcast_teacher_inputs(
+    is_student, t_mb_ids, t_mb_attn, t_mb_mask, device, all_group
+):
+    """Broadcast teacher-specific tensors from student rank 0 to all ranks."""
+    if is_student:
+        shape_t = torch.tensor(
+            [t_mb_ids.shape[0], t_mb_ids.shape[1]], dtype=torch.long, device=device
+        )
+    else:
+        shape_t = torch.zeros(2, dtype=torch.long, device=device)
+    dist.broadcast(shape_t, src=0, group=all_group)
+    B, T_t = int(shape_t[0].item()), int(shape_t[1].item())
+
+    if not is_student:
+        t_mb_ids = torch.zeros(B, T_t, dtype=torch.long, device=device)
+        t_mb_attn = torch.zeros(B, T_t, dtype=torch.long, device=device)
+        t_mb_mask = torch.zeros(B, T_t, dtype=torch.float, device=device)
+
+    dist.broadcast(t_mb_ids, src=0, group=all_group)
+    dist.broadcast(t_mb_attn, src=0, group=all_group)
+    dist.broadcast(t_mb_mask, src=0, group=all_group)
+    return t_mb_ids, t_mb_attn, t_mb_mask
+
+
+@torch.no_grad()
+def sync_student_to_teacher(
+    student_fsdp_model,
+    teacher,
+    syncer,
+    global_step,
+    is_student,
+    is_teacher,
+    all_group,
+):
+    """Broadcast full student parameters to the teacher rank and apply the syncer.
+
+    FSDP shards student parameters; summon_full_params temporarily gathers them
+    so rank 0 can broadcast the full tensors. The teacher rank receives each
+    parameter and updates via the chosen sync method (EMA, trust-region, etc.).
+
+    All ranks must call this function together because dist.broadcast is a
+    collective — the loops on both sides must execute the same number of times
+    in the same order.
+    """
+    if is_student:
+        with FSDP.summon_full_params(student_fsdp_model, writeback=False, recurse=True):
+            for s_param in student_fsdp_model.parameters():
+                dist.broadcast(s_param.data, src=0, group=all_group)
+
+    if is_teacher:
+        received = []
+        for t_param in teacher.model.parameters():
+            buf = torch.empty_like(t_param.data)
+            dist.broadcast(buf, src=0, group=all_group)
+            received.append(buf)
+        student_proxy = (torch.nn.Parameter(r, requires_grad=False) for r in received)
+        syncer.step(student_proxy, teacher.model.parameters(), global_step)
+        print(
+            f"[sync step={global_step}] teacher updated via {syncer.__class__.__name__}",
+            flush=True,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Loss masking helper
+# ---------------------------------------------------------------------------
+
+
+def apply_token_skip_mask(compact_mask: torch.Tensor, num_skip: int) -> torch.Tensor:
+    """Zero out the first `num_skip` response tokens in every sequence.
+
+    SDFT (Section 5, Learned Artifacts) finds that the teacher sometimes
+    outputs preambles like "Based on the text..." which the student learns
+    to mimic even without the demonstration context. Masking the first few
+    response tokens suppresses this artifact.
+
+    Args:
+        compact_mask: [B, R_max] float mask (1 = real response token).
+        num_skip:     number of leading response tokens to exclude from loss.
+
+    Returns:
+        Modified [B, R_max] mask with first `num_skip` positions set to 0.
+    """
+    if num_skip <= 0:
+        return compact_mask
+    skip = torch.zeros_like(compact_mask)
+    if compact_mask.shape[1] > num_skip:
+        skip[:, num_skip:] = 1.0
+    return compact_mask * skip
+
+
+# ---------------------------------------------------------------------------
+# Dataset builder
+# ---------------------------------------------------------------------------
+
+
+def build_sdft_dataset(args) -> list[dict]:
+    """Load the SDFT training dataset from a built-in source or a custom JSONL.
+
+    Returns a list of {"question": str, "demonstration": str} dicts consumed
+    by distributed_sdft_loader. The --dataset-path flag takes precedence over
+    --dataset so users can drop in arbitrary JSONL files without changing code.
+    """
+    if args.dataset_path:
+        with open(args.dataset_path) as f:
+            records = [json.loads(line) for line in f if line.strip()]
+    elif args.dataset == "science":
+        records = load_sdft_science(split="train")
+    elif args.dataset == "tooluse":
+        records = load_sdft_tooluse(split="train")
+    else:
+        raise ValueError(f"Unknown dataset: {args.dataset!r}")
+    if args.dataset_limit > 0:
+        records = records[: args.dataset_limit]
+    return records
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+
+    # -------------------------------------------------------------------------
+    # CLI
+    parser = argparse.ArgumentParser(
+        description="Self-Distillation Fine-Tuning (SDFT) — on-policy distillation "
+        "from a demonstration-conditioned self-teacher."
+    )
+    # Model
+    parser.add_argument(
+        "--student-model",
+        type=str,
+        required=True,
+        help="HuggingFace model ID or path. Used for both student and (EMA) teacher.",
+    )
+    parser.add_argument(
+        "--train-world-size",
+        type=int,
+        required=True,
+        help="Number of student (FSDP) ranks. The teacher occupies "
+        "rank train_world_size in the torchrun world.",
+    )
+    # Dataset — built-in sources pulled from the Self-Distillation GitHub repo,
+    # or a custom JSONL on disk.
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="science",
+        choices=["science", "tooluse"],
+        help="Built-in dataset to pull from the Self-Distillation GitHub repo. "
+        "'science': science Q&A with worked demonstrations. "
+        "'tooluse': tool-use tasks with golden Action/Action_Input sequences.",
+    )
+    parser.add_argument(
+        "--dataset-path",
+        type=str,
+        default="",
+        help="Optional override: path to a custom JSONL, one record "
+        'per line {"question": ..., "demonstration": ...}. '
+        "Takes precedence over --dataset when set.",
+    )
+    parser.add_argument(
+        "--dataset-limit",
+        type=int,
+        default=0,
+        help="Cap the number of training examples (0 = use all).",
+    )
+    # Algorithm
+    parser.add_argument(
+        "--algorithm",
+        type=str,
+        default="reverse_kl",
+        choices=list(ALGORITHMS.keys()),
+        help="Distillation loss. SDFT paper uses reverse_kl (Eq. 1).",
+    )
+    parser.add_argument(
+        "--distill-top-k",
+        type=int,
+        default=100,
+        help="Top-K vocab for KL distillation. Larger K is more faithful "
+        "but uses more memory and bandwidth. NOTE: the SDFT paper's "
+        "analytic per-token KL estimator (Appendix A.1) sums over the FULL "
+        "vocabulary V; top-K is a nano-opd memory/bandwidth approximation, "
+        "not part of the paper. Raise K toward V to reduce the truncation bias.",
+    )
+    parser.add_argument("--student-chunk-size", type=int, default=-1)
+    parser.add_argument("--teacher-chunk-size", type=int, default=-1)
+    parser.add_argument(
+        "--tis-clip",
+        type=float,
+        default=0.0,
+        help="TIS importance-weight clip C (0 disables). Corrects for "
+        "log-prob gap between vLLM inference and training forward pass.",
+    )
+    # Loss masking — suppress 'Based on the text...' preamble artifacts
+    parser.add_argument(
+        "--num-loss-tokens-to-skip",
+        type=int,
+        default=5,
+        help="Mask the first N response tokens from the distillation loss. "
+        "SDFT paper (Section 5, 'Learned Artifacts') masks 'the first few "
+        "tokens' to suppress preamble artifacts (e.g. 'Based on the text...') "
+        "the student mimics from the demonstration-conditioned teacher; the "
+        "paper does not give an exact count, so N=5 is a nano-opd default.",
+    )
+    # Generation
+    parser.add_argument("--max-new-tokens", type=int, default=1024)
+    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--top-k", type=int, default=50)
+    parser.add_argument(
+        "--rollout-worker-url", type=str, default="http://127.0.0.1:8047"
+    )
+    parser.add_argument("--rollout-worker-world-size", type=int, default=1)
+    # Training
+    parser.add_argument("--lr", type=float, default=1e-5)
+    parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument("--num-steps", type=int, default=200)
+    parser.add_argument(
+        "--prompts-per-step",
+        type=int,
+        default=8,
+        help="Number of distinct (question, demonstration) pairs per step. "
+        "Unlike SDPO, there is no num-samples multiplier: each pair "
+        "produces exactly one on-policy rollout.",
+    )
+    parser.add_argument("--train-batch-size", type=int, default=4)
+    parser.add_argument(
+        "--grad-accum-steps",
+        type=int,
+        default=1,
+        help="Gradient accumulation steps. Each minibatch is split into this many "
+        "micro batches; gradients accumulate before a single optimizer step. "
+        "Effective batch size = train-batch-size * grad-accum-steps.",
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=1,
+        help="Optimizer steps taken on the SAME rollout batch before collecting "
+        "new rollouts (PPO-style inner reuse). WARNING: this is NOT the same "
+        "as the SDFT paper's 'epochs' (Tables 3/4: 2 for Skill Learning, 4 for "
+        "Knowledge Acquisition), which are full passes over the dataset that "
+        "RE-ROLL fresh on-policy trajectories each pass. epochs>1 here reuses "
+        "stale rollouts and is mildly off-policy (--tis-clip partially corrects "
+        "it). To replicate the paper's epochs, raise --num-steps instead.",
+    )
+    parser.add_argument("--max-prompt-len", type=int, default=512)
+    parser.add_argument("--max-response-len", type=int, default=1536)
+    parser.add_argument(
+        "--max-seq-len",
+        type=int,
+        default=0,
+        help="Total sequence length cap. If 0, defaults to max-prompt-len + max-response-len.",
+    )
+    parser.add_argument("--sharding-strategy", type=str, default="FULL_SHARD")
+    parser.add_argument("--gradient-checkpointing", action="store_true")
+    # Teacher sync
+    parser.add_argument(
+        "--sync-method",
+        type=str,
+        default="ema",
+        choices=list(SYNC_METHODS.keys()),
+        help="How the EMA teacher tracks the student. SDFT paper uses EMA "
+        "(alpha in {0.01, 0.02, 0.05} per Table 3).",
+    )
+    parser.add_argument(
+        "--ema-alpha",
+        type=float,
+        default=0.02,
+        help="[ema] teacher ← α·student + (1−α)·teacher. "
+        "Small α → stable but lagging teacher. "
+        "SDFT paper sweeps {0.01, 0.02, 0.05}.",
+    )
+    parser.add_argument(
+        "--trust-region-beta",
+        type=float,
+        default=0.05,
+        help="[trust_region] teacher ← β·student + (1−β)·initial_weights.",
+    )
+    parser.add_argument(
+        "--hard-sync-every-n",
+        type=int,
+        default=100,
+        help="[hard_sync] Full copy every N optimizer steps.",
+    )
+    # Runtime
+    parser.add_argument("--device-type", type=str, default="")
+    parser.add_argument("--run-name", type=str, default="dummy")
+    parser.add_argument("--save-dir", type=str, default="sdft_checkpoints")
+    parser.add_argument("--save-every", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=0)
+    args = parser.parse_args()
+
+    use_wandb = os.environ.get("USE_WANDB", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+    )
+    if use_wandb:
+        import wandb
+
+    # -------------------------------------------------------------------------
+    # Distributed init — same rank split as OPD/SDPO:
+    #   ranks 0..train_world_size-1  →  student (FSDP)
+    #   rank  train_world_size       →  teacher (plain nn.Module, EMA of student)
+    ctx = init_distributed(args.device_type, args.train_world_size)
+    ddp_rank = ctx.ddp_rank
+    ddp_world_size = ctx.ddp_world_size
+    device = ctx.device
+    train_world_size = ctx.train_world_size
+    teacher_global_rank = ctx.teacher_global_rank
+    is_student = ctx.is_student
+    is_teacher = ctx.is_teacher
+    master_process = ctx.master_process
+    student_group = ctx.student_group
+    all_group = ctx.all_group
+
+    print0(
+        f"Model: {args.student_model}  (student = teacher, synced via {args.sync_method})"
+    )
+    print0(f"Algorithm: {args.algorithm}  distill-top-k: {args.distill_top_k}")
+    print0(
+        f"Device: {device}  Student ranks: {train_world_size}  Total world: {ddp_world_size}"
+    )
+    print0(f"Loss token skip: {args.num_loss_tokens_to_skip}")
+
+    if master_process and use_wandb:
+        wandb.init(
+            project="nano-opd",
+            name=args.run_name,
+            config={
+                "student_model": args.student_model,
+                "algorithm": args.algorithm,
+                "distill_top_k": args.distill_top_k,
+                "sync_method": args.sync_method,
+                "ema_alpha": args.ema_alpha,
+                "lr": args.lr,
+                "num_steps": args.num_steps,
+                "prompts_per_step": args.prompts_per_step,
+                "train_batch_size": args.train_batch_size,
+                "epochs": args.epochs,
+                "max_new_tokens": args.max_new_tokens,
+                "temperature": args.temperature,
+                "num_loss_tokens_to_skip": args.num_loss_tokens_to_skip,
+            },
+        )
+
+    assert args.prompts_per_step % train_world_size == 0, (
+        f"prompts_per_step ({args.prompts_per_step}) must be divisible by "
+        f"train_world_size ({train_world_size})"
+    )
+
+    # -------------------------------------------------------------------------
+    # Model setup
+    if is_student:
+        student = build_student(
+            args.student_model,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            max_grad_norm=args.max_grad_norm,
+            gradient_checkpointing=args.gradient_checkpointing,
+            sharding_strategy=args.sharding_strategy,
+            train_world_size=train_world_size,
+            student_group=student_group,
+            total_steps=args.num_steps * args.epochs,
+        )
+
+    if is_teacher:
+        # Same checkpoint as the student; weights will be EMA-synced after each step.
+        teacher = build_teacher(args.student_model)
+
+    # -------------------------------------------------------------------------
+    # Teacher syncer
+    syncer_kwargs: dict = {}
+    if args.sync_method == "ema":
+        syncer_kwargs["alpha"] = args.ema_alpha
+    elif args.sync_method == "trust_region":
+        if is_teacher:
+            syncer_kwargs["initial_params"] = [
+                p.data.clone() for p in teacher.model.parameters()
+            ]
+        else:
+            syncer_kwargs["initial_params"] = []
+        syncer_kwargs["beta"] = args.trust_region_beta
+    elif args.sync_method == "hard_sync":
+        syncer_kwargs["sync_every_n_steps"] = args.hard_sync_every_n
+
+    syncer = build_syncer(args.sync_method, **syncer_kwargs)
+
+    # -------------------------------------------------------------------------
+    # Loss function and top-K selection
+    # SDFT uses reverse KL by default (paper Eq. 1): KL(π_student || π_teacher).
+    # For reverse KL, the student selects the top-K indices (the student-weighted
+    # sum means we only need tokens where the student has mass).
+    loss_fn = ALGORITHMS[args.algorithm]
+    select_topk_by: Literal["student", "teacher"] = (
+        "teacher" if args.algorithm == "forward_kl" else "student"
+    )
+    K = args.distill_top_k
+
+    # -------------------------------------------------------------------------
+    # vLLM weight-transfer setup
+    model_update_group = init_vllm_transfer(
+        args.rollout_worker_url,
+        rollout_worker_world_size=args.rollout_worker_world_size,
+        train_world_size=train_world_size,
+        master_process=master_process,
+        all_group=all_group,
+    )
+
+    # -------------------------------------------------------------------------
+    # Dataset (student ranks only)
+    if is_student:
+        dataset = build_sdft_dataset(args)
+        loader = distributed_sdft_loader(
+            dataset, args.prompts_per_step, train_world_size, ddp_rank, seed=args.seed
+        )
+        loader_iter = iter(loader)
+
+    # -------------------------------------------------------------------------
+    # Training loop
+    for step in range(args.num_steps):
+        t0 = time.time()
+
+        # -- Rollout generation (student ranks only) --
+        if is_student:
+            examples = next(loader_iter)  # list of {question, demonstration}
+
+            # Student prompt: question only — π_θ(y|x)
+            prompts = [
+                student.tokenizer.apply_chat_template(
+                    [{"role": "user", "content": ex["question"]}],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+                for ex in examples
+            ]
+
+            rollouts = generate_rollouts_remote(
+                args.rollout_worker_url,
+                prompts=prompts,
+                num_samples=1,  # SDFT: single on-policy trajectory per prompt
+                max_new_tokens=args.max_new_tokens,
+                temperature=args.temperature,
+                top_k=args.top_k,
+            )
+
+            # Attach demonstration-conditioned teacher prompt to each rollout.
+            # The teacher sees: question + worked demonstration → richer context
+            # than the student, which sees only the question.
+            for i, ex in enumerate(examples):
+                r = rollouts[i]  # single rollout per prompt (num_samples=1)
+                student_msgs = [{"role": "user", "content": ex["question"]}]
+                teacher_msgs = _build_teacher_messages(
+                    student_msgs, ex["demonstration"]
+                )
+                r["teacher_prompt"] = student.tokenizer.apply_chat_template(
+                    teacher_msgs, tokenize=False, add_generation_prompt=True
+                )
+
+            if step == 0:
+                print0(
+                    f"[debug step=0] example teacher prompt snippet:\n"
+                    f"{rollouts[0]['teacher_prompt'][:300]}",
+                    flush=True,
+                )
+
+            max_seq_len = args.max_seq_len or (args.max_prompt_len + args.max_response_len)  # noqa: F841
+            batch = prepare_batch(
+                rollouts,
+                tokenizer=student.tokenizer,
+                max_prompt_len=args.max_prompt_len,
+                max_response_len=args.max_response_len,
+                device=device,
+            )
+            teacher_batch = prepare_teacher_batch(
+                rollouts,
+                tokenizer=student.tokenizer,
+                device=device,
+            )
+
+            input_ids = batch["input_ids"]  # [N, T_s]
+            attention_mask = batch["attention_mask"]
+            response_mask = batch["response_mask"]
+            inference_logprobs = batch["inference_logprobs"]
+            teacher_input_ids = teacher_batch["input_ids"]  # [N, T_t]
+            teacher_attn_mask = teacher_batch["attention_mask"]
+            teacher_resp_mask = teacher_batch["response_mask"]
+            student.model.train()
+
+        total_loss = 0.0
+        n_batches = 0
+        overlap_ratio = 0.0
+        overlap_advantage = 0.0
+        entropy_gap_val = 0.0
+
+        # -- Distillation epochs --
+        for _epoch in range(args.epochs):
+
+            if is_student:
+                n_mb = math.ceil(input_ids.shape[0] / args.train_batch_size)
+                perm = torch.randperm(input_ids.shape[0], device=device)
+                n_mb_t = torch.tensor([n_mb], dtype=torch.long, device=device)
+            else:
+                n_mb_t = torch.zeros(1, dtype=torch.long, device=device)
+            dist.broadcast(n_mb_t, src=0, group=all_group)
+            n_mb = int(n_mb_t.item())
+
+            for mb_idx in range(n_mb):
+
+                # -- Slice minibatch (student ranks) --
+                if is_student:
+                    start = mb_idx * args.train_batch_size
+                    idx = perm[start : start + args.train_batch_size]
+                    mb_ids = input_ids[idx]
+                    mb_attn = attention_mask[idx]
+                    mb_mask = response_mask[idx]
+                    mb_inf_lp = inference_logprobs[idx]
+                    t_mb_ids = teacher_input_ids[idx]
+                    t_mb_attn = teacher_attn_mask[idx]
+                    t_mb_mask = teacher_resp_mask[idx]
+                else:
+                    mb_ids = mb_attn = t_mb_ids = t_mb_attn = t_mb_mask = None
+
+                mb_ids, mb_attn = broadcast_minibatch(
+                    is_student, mb_ids, mb_attn, device, all_group
+                )
+                t_mb_ids, t_mb_attn, t_mb_mask = broadcast_teacher_inputs(
+                    is_student, t_mb_ids, t_mb_attn, t_mb_mask, device, all_group
+                )
+
+                # -- Student forward (with grad) --
+                if is_student:
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        student_logits = student.model(
+                            input_ids=mb_ids, attention_mask=mb_attn
+                        ).logits[
+                            :, :-1
+                        ]  # [B, T_s-1, V]
+
+                    s_shift_mask = mb_mask[:, 1:]  # [B, T_s-1]
+                    s_resp, s_compact_mask = pack_response_logits(
+                        student_logits, s_shift_mask
+                    )
+
+                # -- Broadcast R_max so teacher can allocate matching tensors --
+                R_max_t = torch.tensor(
+                    [s_resp.shape[1] if is_student else 0],
+                    dtype=torch.long,
+                    device=device,
+                )
+                dist.broadcast(R_max_t, src=0, group=all_group)
+                R_max = int(R_max_t.item())
+
+                # -- Teacher forward (no grad; demonstration-conditioned context) --
+                # stopgrad prevents gradients from flowing through the teacher
+                # into the student's computation graph (SDFT Eq. 1).
+                if is_teacher:
+                    t_shift_mask = t_mb_mask[:, 1:]
+                    with torch.no_grad():
+                        teacher_logits = teacher.get_logits(t_mb_ids, t_mb_attn)[:, :-1]
+                    t_resp, t_compact_mask = pack_response_logits(
+                        teacher_logits, t_shift_mask
+                    )
+                    if t_resp.shape[1] < R_max:
+                        pad_len = R_max - t_resp.shape[1]
+                        t_resp = torch.cat(
+                            [
+                                t_resp,
+                                t_resp.new_zeros(
+                                    t_resp.shape[0], pad_len, t_resp.shape[-1]
+                                ),
+                            ],
+                            dim=1,
+                        )
+                        t_compact_mask = torch.cat(
+                            [
+                                t_compact_mask,
+                                t_compact_mask.new_zeros(
+                                    t_compact_mask.shape[0], pad_len
+                                ),
+                            ],
+                            dim=1,
+                        )
+                    elif t_resp.shape[1] > R_max:
+                        t_resp = t_resp[:, :R_max]
+                        t_compact_mask = t_compact_mask[:, :R_max]
+
+                # -- Top-K selection and log-prob computation --
+                B = mb_ids.shape[0]
+
+                if select_topk_by == "student":
+                    if is_student:
+                        _, topk_idx = s_resp.topk(K, dim=-1)  # [B, R, K]
+                    else:
+                        topk_idx = torch.empty(
+                            B, R_max, K, dtype=torch.long, device=device
+                        )
+                    dist.broadcast(topk_idx, src=0, group=all_group)
+
+                    if is_teacher:
+                        t_logprobs = teacher_logprobs_at_indices(
+                            t_resp, topk_idx, chunk_size=args.teacher_chunk_size
+                        ).float()
+                        t_topk_idx, t_own_logprobs = teacher_topk_logprobs(
+                            t_resp, K, chunk_size=args.teacher_chunk_size
+                        )
+                        t_own_logprobs = t_own_logprobs.float()
+                        del t_resp
+                    else:
+                        t_logprobs = torch.empty(
+                            B, R_max, K, dtype=torch.float32, device=device
+                        )
+                        t_topk_idx = torch.empty(
+                            B, R_max, K, dtype=torch.long, device=device
+                        )
+                        t_own_logprobs = torch.empty(
+                            B, R_max, K, dtype=torch.float32, device=device
+                        )
+                        t_compact_mask = torch.zeros(
+                            B, R_max, dtype=torch.float32, device=device
+                        )
+
+                    dist.broadcast(t_logprobs, src=teacher_global_rank, group=all_group)
+                    dist.broadcast(t_topk_idx, src=teacher_global_rank, group=all_group)
+                    dist.broadcast(
+                        t_own_logprobs, src=teacher_global_rank, group=all_group
+                    )
+                    dist.broadcast(
+                        t_compact_mask, src=teacher_global_rank, group=all_group
+                    )
+
+                    student_topk_idx = topk_idx
+                    teacher_topk_idx = t_topk_idx
+                    t_lp_at_student = t_logprobs
+
+                else:  # forward_kl: teacher selects top-K
+                    if is_student:
+                        _, student_topk_idx = s_resp.topk(K, dim=-1)
+                    else:
+                        student_topk_idx = torch.empty(
+                            B, R_max, K, dtype=torch.long, device=device
+                        )
+                    dist.broadcast(student_topk_idx, src=0, group=all_group)
+
+                    if is_teacher:
+                        teacher_topk_idx, t_logprobs = teacher_topk_logprobs(
+                            t_resp, K, chunk_size=args.teacher_chunk_size
+                        )
+                        t_logprobs = t_logprobs.float()
+                        t_own_logprobs = t_logprobs
+                        t_lp_at_student = teacher_logprobs_at_indices(
+                            t_resp, student_topk_idx, chunk_size=args.teacher_chunk_size
+                        ).float()
+                        del t_resp
+                    else:
+                        teacher_topk_idx = torch.empty(
+                            B, R_max, K, dtype=torch.long, device=device
+                        )
+                        t_logprobs = torch.empty(
+                            B, R_max, K, dtype=torch.float32, device=device
+                        )
+                        t_own_logprobs = torch.empty(
+                            B, R_max, K, dtype=torch.float32, device=device
+                        )
+                        t_lp_at_student = torch.empty(
+                            B, R_max, K, dtype=torch.float32, device=device
+                        )
+                        t_compact_mask = torch.zeros(
+                            B, R_max, dtype=torch.float32, device=device
+                        )
+
+                    dist.broadcast(
+                        teacher_topk_idx, src=teacher_global_rank, group=all_group
+                    )
+                    dist.broadcast(t_logprobs, src=teacher_global_rank, group=all_group)
+                    dist.broadcast(
+                        t_own_logprobs, src=teacher_global_rank, group=all_group
+                    )
+                    dist.broadcast(
+                        t_lp_at_student, src=teacher_global_rank, group=all_group
+                    )
+                    dist.broadcast(
+                        t_compact_mask, src=teacher_global_rank, group=all_group
+                    )
+
+                    topk_idx = teacher_topk_idx
+
+                # -- Loss and backward (student ranks only) --
+                if is_student:
+                    s_log_resp = F.log_softmax(s_resp.float(), dim=-1)
+                    s_logprobs = s_log_resp.gather(-1, topk_idx)  # [B, R, K]
+
+                    # Base effective mask: intersect student and teacher real positions.
+                    # Teacher positions may be truncated when the demonstration-augmented
+                    # prompt pushes the sequence past the teacher's context window.
+                    effective_mask = s_compact_mask * t_compact_mask  # [B, R_max]
+
+                    # SDFT token-skip mask: zero out the first num_loss_tokens_to_skip
+                    # response tokens to suppress preamble artifacts (Section 5).
+                    effective_mask = apply_token_skip_mask(
+                        effective_mask, args.num_loss_tokens_to_skip
+                    )
+
+                    if effective_mask.sum() == 0:
+                        print0(
+                            f"[warn mb] effective_mask is all-zero: "
+                            f"s_mask={s_compact_mask.sum().item():.0f} "
+                            f"t_mask={t_compact_mask.sum().item():.0f}",
+                            flush=True,
+                        )
+
+                    if args.tis_clip > 0.0:
+                        sampled_ids = mb_ids[:, 1:]
+                        s_lp_sampled = student_logprob_at_sampled_tokens(
+                            student_logits, sampled_ids
+                        )
+                        inf_lp_shifted = mb_inf_lp[:, 1:].to(s_lp_sampled.dtype)
+                        tis_full = (
+                            (s_lp_sampled - inf_lp_shifted)
+                            .exp()
+                            .clamp(max=args.tis_clip)
+                        )
+                        tis_resp, _ = pack_response_logits(
+                            tis_full.unsqueeze(-1).expand_as(student_logits),
+                            s_shift_mask,
+                        )
+                        tis_weights = tis_resp[..., 0]
+                    else:
+                        tis_weights = None
+
+                    loss = (
+                        loss_fn(
+                            s_logprobs,
+                            t_logprobs,
+                            effective_mask,
+                            tis_weights=tis_weights,
+                        )
+                        / args.grad_accum_steps
+                    )
+                    student._scale_loss(loss).backward()
+                    total_loss += loss.item()
+                    n_batches += 1
+
+                    with torch.no_grad():
+                        s_lp_metrics = s_log_resp.gather(-1, student_topk_idx)
+                        overlap_ratio += compute_overlap_ratio(
+                            student_topk_idx, teacher_topk_idx
+                        ).item()
+                        overlap_advantage += compute_overlap_token_advantage(
+                            student_topk_idx,
+                            teacher_topk_idx,
+                            s_lp_metrics,
+                            t_lp_at_student,
+                        ).item()
+                        entropy_gap_val += compute_entropy_gap(
+                            s_lp_metrics, t_own_logprobs
+                        ).item()
+
+                # -- Optimizer step every grad_accum_steps minibatches --
+                if is_student and (mb_idx + 1) % args.grad_accum_steps == 0:
+                    student._optimizer_step()
+
+            # -- Final optimizer step if minibatches don't divide evenly --
+            if is_student and n_mb % args.grad_accum_steps != 0:
+                student._optimizer_step()
+
+            # -- EMA sync: after each optimizer step, teacher tracks student --
+            # This is the core SDFT mechanism: teacher φ ← α·θ + (1−α)·φ
+            # A slowly-updating teacher provides a stable distillation target
+            # while still incorporating the student's improving capabilities.
+            sync_student_to_teacher(
+                student_fsdp_model=student.model if is_student else None,
+                teacher=teacher if is_teacher else None,
+                syncer=syncer,
+                global_step=step,
+                is_student=is_student,
+                is_teacher=is_teacher,
+                all_group=all_group,
+            )
+
+        # -- Push updated student weights into vLLM for next step's rollouts --
+        if is_student:
+            sync_weights_to_vllm_inplace(
+                student.model,
+                args.rollout_worker_url,
+                model_update_group,
+                fsdp=True,
+            )
+
+            dt = time.time() - t0
+            avg_loss = total_loss / max(n_batches, 1)
+            current_lr = (
+                student.scheduler.get_last_lr()[0]
+                if student.scheduler is not None
+                else args.lr
+            )
+            tokens = input_ids.numel()
+            print0(
+                f"step {step + 1:4d}/{args.num_steps} | loss {avg_loss:.4f} "
+                f"| lr {current_lr:.2e} | tokens {tokens} | dt {dt:.1f}s "
+                f"| overlap {overlap_ratio / max(n_batches, 1):.3f} "
+                f"| adv {overlap_advantage / max(n_batches, 1):.4f} "
+                f"| ent_gap {entropy_gap_val / max(n_batches, 1):.4f}"
+            )
+
+            if master_process and use_wandb:
+                wandb.log(
+                    {
+                        "train/loss": avg_loss,
+                        "train/learning_rate": current_lr,
+                        "train/step_time_s": dt,
+                        "train/tokens_per_step": tokens,
+                        "metrics/overlap_ratio": overlap_ratio / max(n_batches, 1),
+                        "metrics/overlap_token_advantage": overlap_advantage
+                        / max(n_batches, 1),
+                        "metrics/entropy_gap": entropy_gap_val / max(n_batches, 1),
+                    },
+                    step=step + 1,
+                )
+
+            if args.save_every > 0 and (step + 1) % args.save_every == 0:
+                save_path = f"{args.save_dir}/step_{step + 1}"
+                student.save_model(save_path)
+                print0(f"Saved checkpoint to {save_path}")
+
+        dist.barrier(group=all_group)
+
+    compute_cleanup()
+    if master_process and use_wandb:
+        wandb.finish()

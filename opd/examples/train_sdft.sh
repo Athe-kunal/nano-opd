@@ -1,14 +1,39 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ---------------------------------------------------------------------------
+# Self-Distillation Fine-Tuning (SDFT) launcher.
+#   Shenfeld, Damani, Hübotter, Agrawal — "Self-Distillation Enables Continual
+#   Learning", arXiv:2601.19897.
+#
+# SDFT distills, on-policy, from a DEMONSTRATION-CONDITIONED self-teacher:
+#   - student sees only the question x        → π_θ(y|x)
+#   - teacher is an EMA copy of the student, conditioned in-context on a worked
+#     demonstration c                          → π(y|x,c)
+#   - loss is the reverse KL  D_KL(π_θ(·|x) ‖ π(·|x,c))   (paper Eq. 1)
+#
+# Like SDPO there is only ONE checkpoint (teacher = EMA of student), so the
+# GPU-split / rollout-worker plumbing mirrors train_sdpo.sh.
+# ---------------------------------------------------------------------------
+
 TAG="${1:-default}"
 
 OPD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO_ROOT="$(cd "$OPD_DIR/.." && pwd)"
 BASE_DIR="${opd_BASE_DIR:-$REPO_ROOT/.opd}"
 
-# In SDPO the teacher IS the student — only one model checkpoint needed.
+# In SDFT the teacher IS the student (EMA copy) — only one model checkpoint needed.
 STUDENT_MODEL="${STUDENT_MODEL:-Qwen/Qwen2.5-1.5B-Instruct}"
+
+# Dataset. Built-in options pulled from the Self-Distillation GitHub repo:
+#   science   – science Q&A with worked demonstrations (paper's Science Q&A task)
+#   tooluse   – tool-use tasks with golden Action/Action_Input sequences
+# Set DATASET_PATH to a JSONL on disk to override (one {"question","demonstration"} per line).
+DATASET="${DATASET:-science}"
+DATASET_LIMIT="${DATASET_LIMIT:-0}"          # 0 = use all rows
+# Custom data (optional): point DATASET_PATH at your own {question, demonstration}
+# JSONL to override the built-in dataset.
+DATASET_PATH="${DATASET_PATH:-}"
 
 # GPU assignment (comma-separated physical GPU IDs)
 #   TRAIN_GPUS    – student FSDP training ranks (0..N-1)
@@ -20,7 +45,7 @@ TRAIN_GPUS="${TRAIN_GPUS:-3}"
 TEACHER_GPUS="${TEACHER_GPUS:-2}"
 
 ROLLOUT_HOST="${ROLLOUT_HOST:-127.0.0.1}"
-ROLLOUT_PORT="${ROLLOUT_PORT:-8048}"
+ROLLOUT_PORT="${ROLLOUT_PORT:-8047}"
 ROLLOUT_GPU_MEM_UTIL="${ROLLOUT_GPU_MEM_UTIL:-0.5}"
 WEIGHT_TRANSFER_BACKEND="${WEIGHT_TRANSFER_BACKEND:-nccl}"
 
@@ -28,70 +53,51 @@ USE_WANDB="${USE_WANDB:-1}"
 
 NUM_STEPS="${NUM_STEPS:-100}"
 SAVE_EVERY="${SAVE_EVERY:-100}"
-TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-2}"
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-4}"
+GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-4}"
+
+# NOTE: --epochs here is PPO-style reuse of the SAME rollout batch, NOT the
+# paper's dataset-pass epochs (which re-roll fresh on-policy trajectories).
+# To replicate the paper's "2 epochs Skill / 4 epochs Knowledge", raise
+# NUM_STEPS instead and keep EPOCHS=1. See the --epochs help in train_sdft.py.
 EPOCHS="${EPOCHS:-1}"
-LR="${LR:-5e-7}"
+
+LR="${LR:-1e-5}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.0}"
 MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
-PROMPTS_PER_STEP="${PROMPTS_PER_STEP:-16}"
-NUM_SAMPLES="${NUM_SAMPLES:-4}"
-MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-8192}"
-MAX_PROMPT_LEN="${MAX_PROMPT_LEN:-1024}"
-MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-15872}"
-TEMPERATURE="${TEMPERATURE:-1.0}"
-DATASET="${DATASET:-sciknoweval}"
 
-# JSD is the SDPO default (symmetric, bounded in [0, log2], more stable than pure KL).
-ALGORITHM="${ALGORITHM:-jsd}"
+# SDFT: exactly one on-policy rollout per (question, demonstration) pair — there
+# is no num-samples multiplier (paper Appendix A.1 uses a single trajectory).
+PROMPTS_PER_STEP="${PROMPTS_PER_STEP:-8}"
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1536}"
+MAX_PROMPT_LEN="${MAX_PROMPT_LEN:-1024}"
+MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-1536}"
+MAX_SEQ_LEN="${MAX_SEQ_LEN:-0}"   # 0 = MAX_PROMPT_LEN + MAX_RESPONSE_LEN
+TEMPERATURE="${TEMPERATURE:-1.0}"
+TOP_K="${TOP_K:-50}"
+
+# reverse_kl is the SDFT default (paper Eq. 1: KL(π_student ‖ π_teacher)).
+ALGORITHM="${ALGORITHM:-forward_kl}"
 DISTILL_TOP_K="${DISTILL_TOP_K:-100}"
 STUDENT_CHUNK_SIZE="${STUDENT_CHUNK_SIZE:--1}"
 TEACHER_CHUNK_SIZE="${TEACHER_CHUNK_SIZE:--1}"
 TIS_CLIP="${TIS_CLIP:-0.0}"
 
-# Teacher sync — controls how the self-teacher tracks the student after each step.
-#   ema          : teacher ← α·student + (1−α)·teacher  (smooth, recommended)
+# Mask the first N response tokens to suppress "Based on the text..." preamble
+# artifacts the student inherits from the demonstration-conditioned teacher
+# (paper Section 5, "Learned Artifacts" — paper says "first few tokens").
+NUM_LOSS_TOKENS_TO_SKIP="${NUM_LOSS_TOKENS_TO_SKIP:-5}"
+
+# Teacher sync — how the EMA self-teacher tracks the student after each step.
+#   ema          : teacher ← α·student + (1−α)·teacher  (paper default)
 #   trust_region : teacher ← β·student + (1−β)·initial_weights  (anchored to init)
 #   hard_sync    : full copy every N steps (DQN-style, less smooth)
-#   on_policy    : teacher = live student (ablation only, can diverge)
 SYNC_METHOD="${SYNC_METHOD:-ema}"
-EMA_ALPHA="${EMA_ALPHA:-0.05}"
+EMA_ALPHA="${EMA_ALPHA:-0.02}"          # paper sweeps {0.01, 0.02, 0.05} (Tables 3/4)
 TRUST_REGION_BETA="${TRUST_REGION_BETA:-0.05}"
-HARD_SYNC_EVERY_N="${HARD_SYNC_EVERY_N:-5}"
+HARD_SYNC_EVERY_N="${HARD_SYNC_EVERY_N:-100}"
 
-EVAL_EVERY="${EVAL_EVERY:-20}"
-EVAL_K="${EVAL_K:-4}"
-EVAL_MAX_TOKENS="${EVAL_MAX_TOKENS:-4096}"
-SCIKNOWEVAL_TEST_SIZE="${SCIKNOWEVAL_TEST_SIZE:-0.01}"  # fraction held out for eval (sciknoweval only)
-SCHEDULER="${SCHEDULER:-cosine}"
-WARMUP_RATIO="${WARMUP_RATIO:-0.05}"
 SEED="${SEED:-0}"
-
-# Post-training math evaluation (eval_math.py)
-# Set SKIP_EVAL=1 to bypass evaluation entirely regardless of dataset.
-# Auto-enable only for math datasets; override with RUN_EVAL=0 or RUN_EVAL=1.
-SKIP_EVAL="${SKIP_EVAL:-0}"
-if [[ "$DATASET" == "dapo_math" || "$DATASET" == "opsd_math" ]]; then
-  RUN_EVAL="${RUN_EVAL:-1}"
-else
-  RUN_EVAL="${RUN_EVAL:-0}"
-fi
-EVAL_DATASETS="${EVAL_DATASETS:-aime24 aime25 hmmt25}"
-EVAL_MAX_NEW_TOKENS="${EVAL_MAX_NEW_TOKENS:-38912}"
-EVAL_ENABLE_THINKING="${EVAL_ENABLE_THINKING:-1}"
-EVAL_TEMPERATURE="${EVAL_TEMPERATURE:-1.0}"
-EVAL_TOP_P="${EVAL_TOP_P:-}"           # blank → auto (0.95 thinking / 0.8 non-thinking)
-EVAL_TOP_K="${EVAL_TOP_K:--1}"
-EVAL_MIN_P="${EVAL_MIN_P:-0.0}"
-EVAL_PRESENCE_PENALTY="${EVAL_PRESENCE_PENALTY:-0.0}"
-EVAL_NUM_SAMPLES="${EVAL_NUM_SAMPLES:-}"  # blank → use all problems in dataset
-EVAL_SMOKE_TEST="${EVAL_SMOKE_TEST:-0}"
-EVAL_GPU_MEM_UTIL="${EVAL_GPU_MEM_UTIL:-0.9}"
-EVAL_TENSOR_PARALLEL_SIZE="${EVAL_TENSOR_PARALLEL_SIZE:-1}"
-EVAL_MAX_MODEL_LEN="${EVAL_MAX_MODEL_LEN:-}"  # blank → auto (40960 thinking / 32768 non-thinking)
-EVAL_VAL_N="${EVAL_VAL_N:-6}"
-EVAL_WANDB_PROJECT="${EVAL_WANDB_PROJECT:-}"
-EVAL_WANDB_RUN_NAME="${EVAL_WANDB_RUN_NAME:-$TAG}"
-EVAL_STEP="${EVAL_STEP:-}"             # blank → omit --step (no x-axis pin in W&B)
 
 # FSDP sharding strategy — choose one of:
 #   FULL_SHARD          params+grads+optimizer sharded; unshard around fwd/bwd
@@ -102,7 +108,7 @@ EVAL_STEP="${EVAL_STEP:-}"             # blank → omit --step (no x-axis pin in
 SHARDING_STRATEGY="${SHARDING_STRATEGY:-NO_SHARD}"
 GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-0}"
 
-RUN_DIR="$BASE_DIR/sdpo/$TAG"
+RUN_DIR="$BASE_DIR/sdft/$TAG"
 SAVE_DIR="$RUN_DIR/checkpoints"
 WORKER_LOG="$RUN_DIR/rollout_worker.log"
 TRAIN_LOG="$RUN_DIR/train.log"
@@ -112,6 +118,16 @@ export opd_BASE_DIR="$BASE_DIR"
 export ROLLOUT_HOST
 export ROLLOUT_PORT
 export USE_WANDB
+
+# ---------------------------------------------------------------------------
+# Sanity: if DATASET_PATH is set it must exist; otherwise a built-in dataset is used.
+if [[ -n "$DATASET_PATH" && ! -f "$DATASET_PATH" ]]; then
+  echo "DATASET_PATH does not exist: $DATASET_PATH" >&2
+  echo "Provide a JSONL file, one record per line:" >&2
+  echo '  {"question": "...", "demonstration": "...worked example..."}' >&2
+  echo "and re-run, e.g.  DATASET_PATH=/path/to/data.jsonl bash $0 $TAG" >&2
+  exit 1
+fi
 
 # ---------------------------------------------------------------------------
 # Parse GPU lists
@@ -183,12 +199,14 @@ mkdir -p "$RUN_DIR" "$SAVE_DIR"
 
 echo "[launcher] run tag         : $TAG"
 echo "[launcher] run dir         : $RUN_DIR"
-echo "[launcher] student model   : $STUDENT_MODEL  (teacher = EMA of student, same checkpoint)"
+echo "[launcher] student model   : $STUDENT_MODEL  (teacher = EMA of student, demonstration-conditioned)"
+echo "[launcher] dataset         : $DATASET_PATH"
 echo "[launcher] train GPUs      : $TRAIN_GPUS  ($TRAIN_NPROC student ranks)"
 echo "[launcher] teacher GPUs    : $TEACHER_GPUS  ($TEACHER_NPROC teacher rank)"
 echo "[launcher] rollout GPUs    : $ROLLOUT_GPUS  (tp=$ROLLOUT_TP)"
-echo "[launcher] algorithm       : $ALGORITHM"
+echo "[launcher] algorithm       : $ALGORITHM  (top-k=$DISTILL_TOP_K)"
 echo "[launcher] sync method     : $SYNC_METHOD  (ema_alpha=$EMA_ALPHA  tr_beta=$TRUST_REGION_BETA  hard_n=$HARD_SYNC_EVERY_N)"
+echo "[launcher] token skip      : $NUM_LOSS_TOKENS_TO_SKIP"
 echo "[launcher] sharding        : $SHARDING_STRATEGY"
 
 # ---------------------------------------------------------------------------
@@ -228,29 +246,34 @@ fi
 # Start student trainer + teacher
 # torchrun world: ranks 0..(TRAIN_NPROC-1) = student FSDP, rank TRAIN_NPROC = teacher.
 # CUDA_VISIBLE_DEVICES maps logical indices to physical GPUs in order.
-echo "[launcher] starting SDPO trainer -> $TRAIN_LOG"
+echo "[launcher] starting SDFT trainer -> $TRAIN_LOG"
 CUDA_VISIBLE_DEVICES="$TRAIN_GPUS,$TEACHER_GPUS" \
   uv run --extra gpu --directory "$REPO_ROOT" torchrun --standalone --nproc_per_node="$TOTAL_NPROC" \
-    "$OPD_DIR/trainer/train_sdpo.py" \
+    "$OPD_DIR/trainer/train_sdft.py" \
     --student-model "$STUDENT_MODEL" \
     --train-world-size "$TRAIN_NPROC" \
     --dataset "$DATASET" \
+    --dataset-path "$DATASET_PATH" \
+    --dataset-limit "$DATASET_LIMIT" \
     --algorithm "$ALGORITHM" \
     --distill-top-k "$DISTILL_TOP_K" \
     --student-chunk-size "$STUDENT_CHUNK_SIZE" \
     --teacher-chunk-size "$TEACHER_CHUNK_SIZE" \
     --tis-clip "$TIS_CLIP" \
+    --num-loss-tokens-to-skip "$NUM_LOSS_TOKENS_TO_SKIP" \
     --rollout-worker-url "http://$ROLLOUT_HOST:$ROLLOUT_PORT" \
     --rollout-worker-world-size "$ROLLOUT_TP" \
     --num-steps "$NUM_STEPS" \
     --prompts-per-step "$PROMPTS_PER_STEP" \
-    --num-samples "$NUM_SAMPLES" \
     --train-batch-size "$TRAIN_BATCH_SIZE" \
+    --grad-accum-steps "$GRAD_ACCUM_STEPS" \
     --epochs "$EPOCHS" \
     --max-new-tokens "$MAX_NEW_TOKENS" \
     --max-prompt-len "$MAX_PROMPT_LEN" \
     --max-response-len "$MAX_RESPONSE_LEN" \
+    --max-seq-len "$MAX_SEQ_LEN" \
     --temperature "$TEMPERATURE" \
+    --top-k "$TOP_K" \
     --lr "$LR" \
     --weight-decay "$WEIGHT_DECAY" \
     --max-grad-norm "$MAX_GRAD_NORM" \
@@ -258,50 +281,10 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS,$TEACHER_GPUS" \
     --ema-alpha "$EMA_ALPHA" \
     --trust-region-beta "$TRUST_REGION_BETA" \
     --hard-sync-every-n "$HARD_SYNC_EVERY_N" \
-    --scheduler "$SCHEDULER" \
-    --warmup-ratio "$WARMUP_RATIO" \
     --sharding-strategy "$SHARDING_STRATEGY" \
     --save-dir "$SAVE_DIR" \
     --save-every "$SAVE_EVERY" \
-    --eval-every "$EVAL_EVERY" \
-    --eval-k "$EVAL_K" \
-    --eval-max-tokens "$EVAL_MAX_TOKENS" \
-    --sciknoweval-test-size "$SCIKNOWEVAL_TEST_SIZE" \
     --seed "$SEED" \
     --run-name "$TAG" \
     "${EXTRA_FLAGS[@]}" \
     2>&1 | tee "$TRAIN_LOG"
-
-# ---------------------------------------------------------------------------
-# Post-training evaluation with eval_math.py
-if [[ "$RUN_EVAL" == "1" && "$SKIP_EVAL" != "1" ]]; then
-  FINAL_CKPT="$SAVE_DIR/final"
-  CKPT_ARG=()
-  [[ -d "$FINAL_CKPT" ]] && CKPT_ARG=(--checkpoint_dir "$FINAL_CKPT")
-
-  EVAL_EXTRA_FLAGS=()
-  [[ "$EVAL_ENABLE_THINKING" == "0" ]] && EVAL_EXTRA_FLAGS+=(--no_thinking)
-  [[ "$EVAL_SMOKE_TEST" == "1" ]]      && EVAL_EXTRA_FLAGS+=(--smoke_test)
-  [[ -n "$EVAL_TOP_P" ]]               && EVAL_EXTRA_FLAGS+=(--top_p "$EVAL_TOP_P")
-  [[ -n "$EVAL_NUM_SAMPLES" ]]         && EVAL_EXTRA_FLAGS+=(--num_samples "$EVAL_NUM_SAMPLES")
-  [[ -n "$EVAL_MAX_MODEL_LEN" ]]       && EVAL_EXTRA_FLAGS+=(--max_model_len "$EVAL_MAX_MODEL_LEN")
-  [[ -n "$EVAL_WANDB_PROJECT" ]]       && EVAL_EXTRA_FLAGS+=(--wandb_project "$EVAL_WANDB_PROJECT" --wandb_run_name "$EVAL_WANDB_RUN_NAME")
-  [[ -n "$EVAL_STEP" ]]                && EVAL_EXTRA_FLAGS+=(--step "$EVAL_STEP")
-
-  echo "[launcher] running post-training eval on: $EVAL_DATASETS"
-  CUDA_VISIBLE_DEVICES="${TRAIN_GPUS},${TEACHER_GPUS}" \
-    uv run --extra gpu --directory "$REPO_ROOT" python "$OPD_DIR/eval/eval_math.py" \
-      --base_model "$STUDENT_MODEL" \
-      "${CKPT_ARG[@]}" \
-      --datasets $EVAL_DATASETS \
-      --max_new_tokens "$EVAL_MAX_NEW_TOKENS" \
-      --temperature "$EVAL_TEMPERATURE" \
-      --top_k "$EVAL_TOP_K" \
-      --min_p "$EVAL_MIN_P" \
-      --presence_penalty "$EVAL_PRESENCE_PENALTY" \
-      --val_n "$EVAL_VAL_N" \
-      --gpu_memory_utilization "$EVAL_GPU_MEM_UTIL" \
-      --tensor_parallel_size "$EVAL_TENSOR_PARALLEL_SIZE" \
-      "${EVAL_EXTRA_FLAGS[@]}" \
-      2>&1 | tee "$RUN_DIR/eval.log"
-fi

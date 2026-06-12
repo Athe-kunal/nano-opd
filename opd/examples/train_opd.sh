@@ -44,6 +44,34 @@ TEACHER_CHUNK_SIZE="${TEACHER_CHUNK_SIZE:--1}"
 EVAL_EVERY="${EVAL_EVERY:-20}"
 EVAL_K="${EVAL_K:-4}"
 EVAL_MAX_TOKENS="${EVAL_MAX_TOKENS:-4096}"
+
+# Post-training math evaluation (eval_math.py)
+# Set SKIP_EVAL=1 to bypass evaluation entirely regardless of dataset.
+# Auto-enable only for math datasets; override with RUN_EVAL=0 or RUN_EVAL=1.
+SKIP_EVAL="${SKIP_EVAL:-0}"
+if [[ "$DATASET" == "dapo_math" || "$DATASET" == "opsd_math" ]]; then
+  RUN_EVAL="${RUN_EVAL:-1}"
+else
+  RUN_EVAL="${RUN_EVAL:-0}"
+fi
+EVAL_DATASETS="${EVAL_DATASETS:-aime24 aime25 hmmt25}"
+EVAL_MAX_NEW_TOKENS="${EVAL_MAX_NEW_TOKENS:-38912}"
+EVAL_ENABLE_THINKING="${EVAL_ENABLE_THINKING:-1}"
+EVAL_TEMPERATURE="${EVAL_TEMPERATURE:-1.0}"
+EVAL_TOP_P="${EVAL_TOP_P:-}"           # blank → auto (0.95 thinking / 0.8 non-thinking)
+EVAL_TOP_K="${EVAL_TOP_K:--1}"
+EVAL_MIN_P="${EVAL_MIN_P:-0.0}"
+EVAL_PRESENCE_PENALTY="${EVAL_PRESENCE_PENALTY:-0.0}"
+EVAL_NUM_SAMPLES="${EVAL_NUM_SAMPLES:-}"  # blank → use all problems in dataset
+EVAL_SMOKE_TEST="${EVAL_SMOKE_TEST:-0}"
+EVAL_GPU_MEM_UTIL="${EVAL_GPU_MEM_UTIL:-0.9}"
+EVAL_TENSOR_PARALLEL_SIZE="${EVAL_TENSOR_PARALLEL_SIZE:-1}"
+EVAL_MAX_MODEL_LEN="${EVAL_MAX_MODEL_LEN:-}"  # blank → auto (40960 thinking / 32768 non-thinking)
+EVAL_VAL_N="${EVAL_VAL_N:-6}"
+EVAL_WANDB_PROJECT="${EVAL_WANDB_PROJECT:-}"
+EVAL_WANDB_RUN_NAME="${EVAL_WANDB_RUN_NAME:-$TAG}"
+EVAL_STEP="${EVAL_STEP:-}"             # blank → omit --step (no x-axis pin in W&B)
+
 # FSDP sharding strategy — choose one of:
 #   FULL_SHARD          params+grads+optimizer sharded; unshard around fwd/bwd
 #   SHARD_GRAD_OP       params sharded; keep unsharded after fwd until bwd done
@@ -206,3 +234,37 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS,$TEACHER_GPUS" \
     --eval-max-tokens "$EVAL_MAX_TOKENS" \
     --run-name "$TAG" \
     2>&1 | tee "$TRAIN_LOG"
+
+# ---------------------------------------------------------------------------
+# Post-training evaluation with eval_math.py
+if [[ "$RUN_EVAL" == "1" && "$SKIP_EVAL" != "1" ]]; then
+  FINAL_CKPT="$SAVE_DIR/final"
+  CKPT_ARG=()
+  [[ -d "$FINAL_CKPT" ]] && CKPT_ARG=(--checkpoint_dir "$FINAL_CKPT")
+
+  EVAL_EXTRA_FLAGS=()
+  [[ "$EVAL_ENABLE_THINKING" == "0" ]] && EVAL_EXTRA_FLAGS+=(--no_thinking)
+  [[ "$EVAL_SMOKE_TEST" == "1" ]]      && EVAL_EXTRA_FLAGS+=(--smoke_test)
+  [[ -n "$EVAL_TOP_P" ]]               && EVAL_EXTRA_FLAGS+=(--top_p "$EVAL_TOP_P")
+  [[ -n "$EVAL_NUM_SAMPLES" ]]         && EVAL_EXTRA_FLAGS+=(--num_samples "$EVAL_NUM_SAMPLES")
+  [[ -n "$EVAL_MAX_MODEL_LEN" ]]       && EVAL_EXTRA_FLAGS+=(--max_model_len "$EVAL_MAX_MODEL_LEN")
+  [[ -n "$EVAL_WANDB_PROJECT" ]]       && EVAL_EXTRA_FLAGS+=(--wandb_project "$EVAL_WANDB_PROJECT" --wandb_run_name "$EVAL_WANDB_RUN_NAME")
+  [[ -n "$EVAL_STEP" ]]                && EVAL_EXTRA_FLAGS+=(--step "$EVAL_STEP")
+
+  echo "[launcher] running post-training eval on: $EVAL_DATASETS"
+  CUDA_VISIBLE_DEVICES="${TRAIN_GPUS},${TEACHER_GPUS}" \
+    uv run --extra gpu --directory "$REPO_ROOT" python "$OPD_DIR/eval/eval_math.py" \
+      --base_model "$STUDENT_MODEL" \
+      "${CKPT_ARG[@]}" \
+      --datasets $EVAL_DATASETS \
+      --max_new_tokens "$EVAL_MAX_NEW_TOKENS" \
+      --temperature "$EVAL_TEMPERATURE" \
+      --top_k "$EVAL_TOP_K" \
+      --min_p "$EVAL_MIN_P" \
+      --presence_penalty "$EVAL_PRESENCE_PENALTY" \
+      --val_n "$EVAL_VAL_N" \
+      --gpu_memory_utilization "$EVAL_GPU_MEM_UTIL" \
+      --tensor_parallel_size "$EVAL_TENSOR_PARALLEL_SIZE" \
+      "${EVAL_EXTRA_FLAGS[@]}" \
+      2>&1 | tee "$RUN_DIR/eval.log"
+fi

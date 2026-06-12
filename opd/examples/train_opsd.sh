@@ -38,6 +38,7 @@ MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1536}"
 MAX_PROMPT_LEN="${MAX_PROMPT_LEN:-512}"
 MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-1536}"
 TEMPERATURE="${TEMPERATURE:-1.0}"
+DATASET_ID="${DATASET_ID:-siyanzhao/Openthoughts_math_30k_opsd}"
 DATASET_SPLIT="${DATASET_SPLIT:-train}"
 
 # Forward KL is the OPSD default (Table 3 of the paper).
@@ -219,6 +220,7 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS,$TEACHER_GPUS" \
     "$OPD_DIR/trainer/train_opsd.py" \
     --student-model "$STUDENT_MODEL" \
     --train-world-size "$TRAIN_NPROC" \
+    --dataset-id "$DATASET_ID" \
     --dataset-split "$DATASET_SPLIT" \
     --algorithm "$ALGORITHM" \
     --distill-top-k "$DISTILL_TOP_K" \

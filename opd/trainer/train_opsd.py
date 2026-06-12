@@ -193,8 +193,11 @@ if __name__ == "__main__":
                         help="Number of student (FSDP) ranks. The teacher occupies "
                              "rank train_world_size in the torchrun world.")
     # Dataset — siyanzhao/Openthoughts_math_30k_opsd (hardcoded)
+    parser.add_argument("--dataset-id", type=str,
+                        default="siyanzhao/Openthoughts_math_30k_opsd",
+                        help="HuggingFace dataset ID for OPSD training.")
     parser.add_argument("--dataset-split", type=str, default="train",
-                        help="HuggingFace split to load from siyanzhao/Openthoughts_math_30k_opsd.")
+                        help="HuggingFace split to load.")
     # Algorithm
     parser.add_argument("--algorithm", type=str, default="forward_kl",
                         choices=list(ALGORITHMS.keys()),
@@ -350,7 +353,7 @@ if __name__ == "__main__":
     # -------------------------------------------------------------------------
     # Dataset (student ranks only)
     if is_student:
-        dataset     = OPSDMathEnv.load(split=args.dataset_split)
+        dataset     = OPSDMathEnv.load(split=args.dataset_split, dataset_id=args.dataset_id)
         loader      = distributed_opd_loader(
             dataset, args.prompts_per_step, train_world_size, ddp_rank, seed=args.seed
         )

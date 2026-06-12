@@ -71,7 +71,7 @@ def _build_teacher_messages(init_messages, env_output, successful_rollout):
 
     teacher_messages = list(init_messages[:-1])  # preserve system message if any
     teacher_messages.append({"role": "user", "content": "\n".join(parts)})
-    return teacher_messages
+    return teacher_messages, has_extra
 
 
 def prepare_teacher_batch(rollouts, tokenizer, device):
@@ -436,7 +436,8 @@ if __name__ == "__main__":
                     # Paper Table 2: successful attempts pass their own response as the correct
                     # solution; failed attempts pass a different successful rollout (if any).
                     success_hint = r["response"] if rewards[j] > 0 else successful_text
-                    teacher_msgs = _build_teacher_messages(init_msgs, env_output, success_hint)
+                    teacher_msgs, has_distillation = _build_teacher_messages(init_msgs, env_output, success_hint)
+                    r["has_distillation"] = has_distillation
                     r["teacher_prompt"] = student.tokenizer.apply_chat_template(
                         teacher_msgs, tokenize=False, add_generation_prompt=True
                     )

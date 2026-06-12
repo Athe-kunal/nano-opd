@@ -112,7 +112,8 @@ class DapoMathEnv(OPDEnvBase):
     def get_feedback(self, action: str) -> str:
         if extract_last_boxed(action) is None:
             return "Format error: response must contain a \\boxed{...} expression with your final answer."
-        return ""
+        pred = extract_last_boxed(action)
+        return f"Your answer \\boxed{{{pred}}} is incorrect. The correct answer is \\boxed{{{self.answer}}}."
 
     @classmethod
     def from_records(cls, records: list[dict[str, Any]]) -> list[DapoMathEnv]:

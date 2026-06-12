@@ -42,11 +42,13 @@ def format_choices(choices: Dict[str, str]) -> str:
 
 
 def _format_row(row: dict) -> dict:
+    choices_text = format_choices(row['choices'])
     return {
         "dataset": "sciknoweval",
         "system": SYSTEM_PROMPT,
-        "prompt": row['question'] + "\n\n" + format_choices(row['choices']) + "\nPlease reason step by step.",
+        "prompt": row['question'] + "\n\n" + choices_text + "\nPlease reason step by step.",
         "answer_key": row['answerKey'],
+        "choices_text": choices_text,
         "description": row['question'],
         "kind": "mcq",
     }
@@ -111,10 +113,11 @@ class SciKnowEvalEnv(OPDEnvBase):
 
     _test_rows: list[dict] = []
 
-    def __init__(self, prompt: str, answer_key: str, system: str = SYSTEM_PROMPT) -> None:
+    def __init__(self, prompt: str, answer_key: str, choices_text: str = "", system: str = SYSTEM_PROMPT) -> None:
         super().__init__(kind="mcq", dataset="sciknoweval")
         self.prompt = prompt
         self.answer_key = answer_key.strip().upper()
+        self.choices_text = choices_text
         self.system = system
 
     def init(self, prompt: ConversationType) -> tuple[ConversationType, dict[str, Any]]:
@@ -131,7 +134,9 @@ class SciKnowEvalEnv(OPDEnvBase):
     def get_feedback(self, action: str) -> str:
         if _extract_answer(action) is None:
             return "Format error: response must contain an <answer>A/B/C/D</answer> tag with your final answer."
-        return ""
+        pred = _extract_answer(action)
+        options = f"\n{self.choices_text}" if self.choices_text else ""
+        return f"The options are:{options}\nYour answer {pred} is incorrect. The correct answer is {self.answer_key}."
 
     @classmethod
     def evaluate(
@@ -163,7 +168,7 @@ class SciKnowEvalEnv(OPDEnvBase):
         seed: int = 42,
     ) -> list[SciKnowEvalEnv]:
         train_rows, _ = load_sciknoweval_split(test_size=test_size, seed=seed, domains=domains, levels=levels, types=types)
-        return [cls(prompt=row["prompt"], answer_key=row["answer_key"]) for row in train_rows]
+        return [cls(prompt=row["prompt"], answer_key=row["answer_key"], choices_text=row.get("choices_text", "")) for row in train_rows]
 
 
 def run_sciknow_eval(

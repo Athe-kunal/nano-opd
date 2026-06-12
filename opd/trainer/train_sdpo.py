@@ -459,6 +459,11 @@ if __name__ == "__main__":
             teacher_input_ids  = teacher_batch["input_ids"]   # [N, T_t]
             teacher_attn_mask  = teacher_batch["attention_mask"]
             teacher_resp_mask  = teacher_batch["response_mask"]
+            # 1 for rollouts where the teacher received augmented context (solution or feedback),
+            # 0 for rollouts where teacher == student context (distillation signal is meaningless).
+            sd_mask = torch.tensor(
+                [r["has_distillation"] for r in rollouts], dtype=torch.float, device=device
+            )  # [N]
             student.model.train()
 
         total_loss        = 0.0
@@ -493,8 +498,9 @@ if __name__ == "__main__":
                     t_mb_ids  = teacher_input_ids[idx]
                     t_mb_attn = teacher_attn_mask[idx]
                     t_mb_mask = teacher_resp_mask[idx]
+                    mb_sd_mask = sd_mask[idx]              # [B]
                 else:
-                    mb_ids = mb_attn = t_mb_ids = t_mb_attn = t_mb_mask = None
+                    mb_ids = mb_attn = t_mb_ids = t_mb_attn = t_mb_mask = mb_sd_mask = None
 
                 # -- Broadcast student inputs to teacher (teacher needs B/T info) --
                 mb_ids, mb_attn = broadcast_minibatch(
@@ -505,6 +511,11 @@ if __name__ == "__main__":
                 t_mb_ids, t_mb_attn, t_mb_mask = broadcast_teacher_inputs(
                     is_student, t_mb_ids, t_mb_attn, t_mb_mask, device, all_group
                 )
+
+                # -- Broadcast self-distillation mask --
+                if not is_student:
+                    mb_sd_mask = torch.zeros(mb_ids.shape[0], dtype=torch.float, device=device)
+                dist.broadcast(mb_sd_mask, src=0, group=all_group)
 
                 # -- Student forward (with grad) --
                 if is_student:
@@ -631,9 +642,11 @@ if __name__ == "__main__":
                     # its longer feedback-augmented prompt hitting max_seq_len). Those
                     # padded positions have log_softmax(0) = -log(V) — a spurious uniform
                     # distribution that would corrupt the loss signal.
-                    effective_mask = s_compact_mask * t_compact_mask   # [B, R_max]
+                    # Also exclude samples where the teacher had no augmented context —
+                    # those have teacher == student prompt so the KL signal is meaningless.
+                    effective_mask = s_compact_mask * t_compact_mask * mb_sd_mask.unsqueeze(1)  # [B, R_max]
                     if effective_mask.sum() == 0:
-                        print0(f"[warn mb] effective_mask is all-zero: s_mask={s_compact_mask.sum().item():.0f} t_mask={t_compact_mask.sum().item():.0f}", flush=True)
+                        print0(f"[warn mb] effective_mask is all-zero: s_mask={s_compact_mask.sum().item():.0f} t_mask={t_compact_mask.sum().item():.0f} sd_mask={mb_sd_mask.sum().item():.0f}", flush=True)
 
                     if args.tis_clip > 0.0:
                         sampled_ids    = mb_ids[:, 1:]

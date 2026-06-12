@@ -240,6 +240,9 @@ if __name__ == "__main__":
     parser.add_argument("--num-steps", type=int, default=200)
     parser.add_argument("--prompts-per-step", type=int, default=8)
     parser.add_argument("--train-batch-size", type=int, default=4)
+    parser.add_argument("--grad-accum-steps", type=int, default=1,
+                        help="Optimizer step every N minibatches. "
+                             "Effective batch size = train_batch_size * grad_accum_steps.")
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--max-prompt-len", type=int, default=512,
                         help="Hard cap on prompt tokens. Raises if exceeded.")
@@ -315,6 +318,7 @@ if __name__ == "__main__":
                 "num_steps": args.num_steps,
                 "prompts_per_step": args.prompts_per_step,
                 "train_batch_size": args.train_batch_size,
+                "grad_accum_steps": args.grad_accum_steps,
                 "epochs": args.epochs,
                 "num_samples": args.num_samples,
                 "max_new_tokens": args.max_new_tokens,
@@ -485,7 +489,12 @@ if __name__ == "__main__":
             dist.broadcast(n_mb_t, src=0, group=all_group)
             n_mb = int(n_mb_t.item())
 
+            G = args.grad_accum_steps
             for mb_idx in range(n_mb):
+                # How many minibatches are in this accumulation window?
+                # The last window may be smaller than G if n_mb % G != 0.
+                window_start = (mb_idx // G) * G
+                window_size  = min(window_start + G, n_mb) - window_start
 
                 # -- Slice minibatch (student ranks) --
                 if is_student:
@@ -660,7 +669,7 @@ if __name__ == "__main__":
                     else:
                         tis_weights = None
 
-                    loss = loss_fn(s_logprobs, t_logprobs, effective_mask, tis_weights=tis_weights) / n_mb
+                    loss = loss_fn(s_logprobs, t_logprobs, effective_mask, tis_weights=tis_weights) / window_size
                     student._scale_loss(loss).backward()
                     total_loss += loss.item()
                     n_batches  += 1
@@ -672,8 +681,9 @@ if __name__ == "__main__":
                         ).item()
                         entropy_gap_val   += compute_entropy_gap(s_lp_at_student, t_own_logprobs).item()
 
-            if is_student:
-                student._optimizer_step()
+                # Step after every G minibatches, and always on the final one.
+                if is_student and ((mb_idx + 1) % G == 0 or mb_idx == n_mb - 1):
+                    student._optimizer_step()
 
         # -- Sync updated student weights to the teacher rank (once per step) --
         # The teacher should track the fully-updated student after all epochs are

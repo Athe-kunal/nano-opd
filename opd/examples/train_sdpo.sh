@@ -29,6 +29,7 @@ USE_WANDB="${USE_WANDB:-1}"
 NUM_STEPS="${NUM_STEPS:-100}"
 SAVE_EVERY="${SAVE_EVERY:-100}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-2}"
+GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-1}"
 EPOCHS="${EPOCHS:-1}"
 LR="${LR:-5e-7}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.0}"
@@ -246,6 +247,7 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS,$TEACHER_GPUS" \
     --prompts-per-step "$PROMPTS_PER_STEP" \
     --num-samples "$NUM_SAMPLES" \
     --train-batch-size "$TRAIN_BATCH_SIZE" \
+    --grad-accum-steps "$GRAD_ACCUM_STEPS" \
     --epochs "$EPOCHS" \
     --max-new-tokens "$MAX_NEW_TOKENS" \
     --max-prompt-len "$MAX_PROMPT_LEN" \

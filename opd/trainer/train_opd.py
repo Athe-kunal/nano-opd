@@ -269,14 +269,18 @@ if __name__ == "__main__":
                 # -- Teacher: compute top-K log-probs and broadcast --
                 # Broadcasts only [B, T-1, K] instead of the full [B, T-1, V] logit
                 # tensor, reducing per-minibatch communication by ~vocab/K (>1000×).
+                if is_teacher:
+                    teacher_logits = teacher.get_logits(mb_ids, mb_attn)[:, :-1]
+                else:
+                    teacher_logits = None
                 topk = exchange_topk(
                     select_topk_by=select_topk_by,
                     is_student=is_student,
                     is_teacher=is_teacher,
                     student_logits=student_logits if is_student else None,
-                    teacher=teacher if is_teacher else None,
-                    mb_ids=mb_ids,
-                    mb_attn=mb_attn,
+                    teacher_logits=teacher_logits,
+                    B=mb_ids.shape[0],
+                    T=mb_ids.shape[1] - 1,
                     K=args.distill_top_k,
                     s_chunk=args.student_chunk_size,
                     t_chunk=args.teacher_chunk_size,

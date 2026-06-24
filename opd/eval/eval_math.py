@@ -124,7 +124,8 @@ def load_vllm_model(
 
     print(f"Model dtype: {llm.llm_engine.model_config.dtype}")
     print(f"Quantization: {llm.llm_engine.model_config.quantization}")
-    print(f"KV cache dtype: {llm.llm_engine.cache_config.cache_dtype}")
+    cache_config = getattr(llm.llm_engine, "cache_config", None) or getattr(getattr(llm.llm_engine, "vllm_config", None), "cache_config", None)
+    print(f"KV cache dtype: {cache_config.cache_dtype if cache_config else 'unknown'}")
     print("vLLM model loaded successfully!")
     return llm, tokenizer
 

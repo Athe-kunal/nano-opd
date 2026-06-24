@@ -234,3 +234,4 @@ notebooks/
 .judge0/
 
 *.jsonl
+eval_results/

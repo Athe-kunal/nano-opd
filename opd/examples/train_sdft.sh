@@ -40,9 +40,9 @@ DATASET_PATH="${DATASET_PATH:-}"
 #   TEACHER_GPUS  – dedicated teacher rank (exactly 1 GPU, rank N in torchrun world)
 #   ROLLOUT_GPUS  – vLLM rollout worker (may share with TEACHER_GPUS)
 #   TRAIN_GPUS must not overlap ROLLOUT_GPUS or TEACHER_GPUS.
-ROLLOUT_GPUS="${ROLLOUT_GPUS:-2}"
-TRAIN_GPUS="${TRAIN_GPUS:-3}"
-TEACHER_GPUS="${TEACHER_GPUS:-2}"
+ROLLOUT_GPUS="${ROLLOUT_GPUS:-0}"
+TRAIN_GPUS="${TRAIN_GPUS:-1}"
+TEACHER_GPUS="${TEACHER_GPUS:-0}"
 
 ROLLOUT_HOST="${ROLLOUT_HOST:-127.0.0.1}"
 ROLLOUT_PORT="${ROLLOUT_PORT:-8047}"
@@ -51,7 +51,7 @@ WEIGHT_TRANSFER_BACKEND="${WEIGHT_TRANSFER_BACKEND:-nccl}"
 
 USE_WANDB="${USE_WANDB:-1}"
 
-NUM_STEPS="${NUM_STEPS:-100}"
+NUM_STEPS="${NUM_STEPS:-50}"
 SAVE_EVERY="${SAVE_EVERY:-100}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-4}"
 GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-4}"
@@ -98,6 +98,11 @@ TRUST_REGION_BETA="${TRUST_REGION_BETA:-0.05}"
 HARD_SYNC_EVERY_N="${HARD_SYNC_EVERY_N:-100}"
 
 SEED="${SEED:-0}"
+
+# Held-out evaluation on the dataset's eval split (science/tooluse only; ignored for custom JSONL).
+# Set EVAL_EVERY=0 to disable.
+EVAL_EVERY="${EVAL_EVERY:-20}"
+EVAL_SIZE="${EVAL_SIZE:-50}"
 
 # FSDP sharding strategy — choose one of:
 #   FULL_SHARD          params+grads+optimizer sharded; unshard around fwd/bwd
@@ -284,6 +289,8 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS,$TEACHER_GPUS" \
     --sharding-strategy "$SHARDING_STRATEGY" \
     --save-dir "$SAVE_DIR" \
     --save-every "$SAVE_EVERY" \
+    --eval-every "$EVAL_EVERY" \
+    --eval-size "$EVAL_SIZE" \
     --seed "$SEED" \
     --run-name "$TAG" \
     "${EXTRA_FLAGS[@]}" \

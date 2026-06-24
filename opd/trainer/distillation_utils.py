@@ -17,11 +17,7 @@ def broadcast_minibatch(
     device: torch.device,
     all_group,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Broadcast input_ids and attention_mask from student rank 0 to all ranks.
-
-    Student rank 0 owns the real tensors; teacher rank allocates zeros of the
-    right shape. Returns (mb_ids, mb_attn) filled on every rank.
-    """
+    """Broadcast input_ids and attention_mask from student rank 0 to all ranks."""
     if is_student:
         assert mb_ids is not None and mb_attn is not None
         shape_t = torch.tensor([mb_ids.shape[0], mb_ids.shape[1]], dtype=torch.long, device=device)
@@ -41,91 +37,114 @@ def broadcast_minibatch(
     return mb_ids, mb_attn
 
 
+def broadcast_teacher_inputs(is_student, t_mb_ids, t_mb_attn, t_mb_mask, device, all_group):
+    """Broadcast teacher-specific tensors from student rank 0 to all ranks.
+
+    Used when teacher and student have different inputs (e.g. SDFT, where the
+    teacher prompt includes a worked demonstration).
+    """
+    if is_student:
+        shape_t = torch.tensor([t_mb_ids.shape[0], t_mb_ids.shape[1]], dtype=torch.long, device=device)
+    else:
+        shape_t = torch.zeros(2, dtype=torch.long, device=device)
+    dist.broadcast(shape_t, src=0, group=all_group)
+    B, T_t = int(shape_t[0].item()), int(shape_t[1].item())
+    if not is_student:
+        t_mb_ids  = torch.zeros(B, T_t, dtype=torch.long,  device=device)
+        t_mb_attn = torch.zeros(B, T_t, dtype=torch.long,  device=device)
+        t_mb_mask = torch.zeros(B, T_t, dtype=torch.float, device=device)
+    dist.broadcast(t_mb_ids,  src=0, group=all_group)
+    dist.broadcast(t_mb_attn, src=0, group=all_group)
+    dist.broadcast(t_mb_mask, src=0, group=all_group)
+    return t_mb_ids, t_mb_attn, t_mb_mask
+
+
 def exchange_topk(
     *,
     select_topk_by: Literal["student", "teacher"],
     is_student: bool,
     is_teacher: bool,
-    student_logits: torch.Tensor | None,  # [B, T-1, V], only valid on student
-    teacher,                               # TeacherModel, only valid on teacher rank
-    mb_ids: torch.Tensor,
-    mb_attn: torch.Tensor,
-    K: int,
-    s_chunk: int,
-    t_chunk: int,
-    teacher_global_rank: int,
-    all_group,
-    device: torch.device,
+    student_logits: torch.Tensor | None,          # [B, T, V], student rank only
+    teacher_logits: torch.Tensor | None,          # [B, T, V], teacher rank only
+    t_compact_mask: torch.Tensor | None = None,   # [B, T], teacher rank only; None → broadcast all-ones
+    B: int = 0,
+    T: int = 0,
+    K: int = 0,
+    s_chunk: int = -1,
+    t_chunk: int = -1,
+    teacher_global_rank: int = 0,
+    all_group=None,
+    device: torch.device | None = None,
 ) -> dict:
-    """Coordinate the top-K log-prob exchange between student and teacher ranks.
+    """Top-K log-prob exchange between student and teacher ranks.
 
-    Returns a dict with keys:
-      topk_idx            - indices used for the distillation loss
-      t_logprobs          - teacher log-probs at topk_idx          [B, T-1, K]
-      student_topk_idx    - student's own top-K indices            [B, T-1, K]
-      teacher_topk_idx    - teacher's own top-K indices            [B, T-1, K]
-      t_logprobs_at_student - teacher log-probs at student top-K   [B, T-1, K]
-      teacher_own_logprobs  - teacher log-probs at teacher top-K   [B, T-1, K]
+    Works for both full-sequence logits [B, T-1, V] (OPD) and packed
+    response-aligned logits [B, R_max, V] (SDFT). The caller is responsible
+    for computing teacher_logits on the teacher rank (and optionally packing
+    it and providing t_compact_mask when student/teacher sequences differ).
+
+    Returns a dict with keys: topk_idx, t_logprobs, t_compact_mask,
+    student_topk_idx, teacher_topk_idx, t_logprobs_at_student, teacher_own_logprobs.
     """
-    B, T_shifted = mb_ids.shape[0], mb_ids.shape[1] - 1
+    if is_teacher and t_compact_mask is None:
+        t_compact_mask = torch.ones(B, T, dtype=torch.float32, device=device)
 
     if select_topk_by == "student":
-        # Student picks top-K; teacher evaluates at those indices.
         if is_student:
-            assert student_logits is not None
             topk_idx = student_topk_indices(student_logits, K, s_chunk)
         else:
-            topk_idx = torch.empty(B, T_shifted, K, dtype=torch.long, device=device)
+            topk_idx = torch.empty(B, T, K, dtype=torch.long, device=device)
         dist.broadcast(topk_idx, src=0, group=all_group)
 
         if is_teacher:
-            t_logits = teacher.get_logits(mb_ids, mb_attn)[:, :-1]
-            t_logprobs = teacher_logprobs_at_indices(t_logits, topk_idx, t_chunk)
-            teacher_topk_idx, teacher_own_logprobs = teacher_topk_logprobs(t_logits, K, t_chunk)
+            t_logprobs           = teacher_logprobs_at_indices(teacher_logits, topk_idx, t_chunk)
+            teacher_topk_idx, teacher_own_logprobs = teacher_topk_logprobs(teacher_logits, K, t_chunk)
         else:
-            t_logprobs           = torch.empty(B, T_shifted, K, dtype=torch.bfloat16, device=device)
-            teacher_topk_idx     = torch.empty(B, T_shifted, K, dtype=torch.long,     device=device)
-            teacher_own_logprobs = torch.empty(B, T_shifted, K, dtype=torch.bfloat16, device=device)
+            t_logprobs           = torch.empty(B, T, K, dtype=torch.bfloat16, device=device)
+            teacher_topk_idx     = torch.empty(B, T, K, dtype=torch.long,     device=device)
+            teacher_own_logprobs = torch.empty(B, T, K, dtype=torch.bfloat16, device=device)
+            t_compact_mask       = torch.empty(B, T,    dtype=torch.float32,  device=device)
 
         dist.broadcast(t_logprobs,           src=teacher_global_rank, group=all_group)
         dist.broadcast(teacher_topk_idx,     src=teacher_global_rank, group=all_group)
         dist.broadcast(teacher_own_logprobs, src=teacher_global_rank, group=all_group)
+        dist.broadcast(t_compact_mask,       src=teacher_global_rank, group=all_group)
 
         student_topk_idx      = topk_idx
-        t_logprobs_at_student = t_logprobs  # teacher was already evaluated at student indices
+        t_logprobs_at_student = t_logprobs
 
     else:  # forward_kl: teacher picks top-K
         if is_student:
-            assert student_logits is not None
             student_topk_idx = student_topk_indices(student_logits, K, s_chunk)
         else:
-            student_topk_idx = torch.empty(B, T_shifted, K, dtype=torch.long, device=device)
+            student_topk_idx = torch.empty(B, T, K, dtype=torch.long, device=device)
         dist.broadcast(student_topk_idx, src=0, group=all_group)
 
         if is_teacher:
-            t_logits = teacher.get_logits(mb_ids, mb_attn)[:, :-1]
-            teacher_topk_idx, t_logprobs = teacher_topk_logprobs(t_logits, K, t_chunk)
+            teacher_topk_idx, t_logprobs = teacher_topk_logprobs(teacher_logits, K, t_chunk)
             teacher_own_logprobs  = t_logprobs
-            t_logprobs_at_student = teacher_logprobs_at_indices(t_logits, student_topk_idx, t_chunk)
+            t_logprobs_at_student = teacher_logprobs_at_indices(teacher_logits, student_topk_idx, t_chunk)
         else:
-            teacher_topk_idx      = torch.empty(B, T_shifted, K, dtype=torch.long,     device=device)
-            t_logprobs            = torch.empty(B, T_shifted, K, dtype=torch.bfloat16, device=device)
-            teacher_own_logprobs  = torch.empty(B, T_shifted, K, dtype=torch.bfloat16, device=device)
-            t_logprobs_at_student = torch.empty(B, T_shifted, K, dtype=torch.bfloat16, device=device)
+            teacher_topk_idx      = torch.empty(B, T, K, dtype=torch.long,     device=device)
+            t_logprobs            = torch.empty(B, T, K, dtype=torch.bfloat16, device=device)
+            teacher_own_logprobs  = torch.empty(B, T, K, dtype=torch.bfloat16, device=device)
+            t_logprobs_at_student = torch.empty(B, T, K, dtype=torch.bfloat16, device=device)
+            t_compact_mask        = torch.empty(B, T,    dtype=torch.float32,  device=device)
 
         dist.broadcast(teacher_topk_idx,      src=teacher_global_rank, group=all_group)
         dist.broadcast(t_logprobs,            src=teacher_global_rank, group=all_group)
         dist.broadcast(teacher_own_logprobs,  src=teacher_global_rank, group=all_group)
         dist.broadcast(t_logprobs_at_student, src=teacher_global_rank, group=all_group)
+        dist.broadcast(t_compact_mask,        src=teacher_global_rank, group=all_group)
 
         topk_idx = teacher_topk_idx
 
     return {
-        "topk_idx":             topk_idx,
-        "t_logprobs":           t_logprobs,
-        "student_topk_idx":     student_topk_idx,
-        "teacher_topk_idx":     teacher_topk_idx,
+        "topk_idx":              topk_idx,
+        "t_logprobs":            t_logprobs,
+        "t_compact_mask":        t_compact_mask,
+        "student_topk_idx":      student_topk_idx,
+        "teacher_topk_idx":      teacher_topk_idx,
         "t_logprobs_at_student": t_logprobs_at_student,
-        "teacher_own_logprobs": teacher_own_logprobs,
+        "teacher_own_logprobs":  teacher_own_logprobs,
     }
-

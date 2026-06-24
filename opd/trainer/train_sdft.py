@@ -32,8 +32,8 @@ from opd.generator.rollout import (
     sync_weights_to_vllm_inplace,
     prepare_batch,
 )
-from opd.envs.sdft_science import load_sdft_science
-from opd.envs.sdft_tooluse import load_sdft_tooluse
+from opd.envs.sdft_science import load_sdft_science, load_sdft_science_eval, grade_science_response
+from opd.envs.sdft_tooluse import load_sdft_tooluse, load_sdft_tooluse_eval, grade_tooluse_response
 
 
 def distributed_sdft_loader(
@@ -295,69 +295,45 @@ def _minibatch_exchange(is_student, is_teacher, mb_ids, mb_attn, mb_mask,
     return tk, s_resp, s_compact_mask, s_shift_mask, student_logits
 
 
-@torch.no_grad()
-def eval_sdft(eval_dataset, args, student, teacher, loss_fn, select_topk_by, K,
-              is_student, is_teacher, all_group, teacher_global_rank, device, step):
-    """Held-out distillation loss on the eval split (no backward, no optimizer step)."""
-    if is_student and not eval_dataset:
-        n_mb_t = torch.zeros(1, dtype=torch.long, device=device)
-        dist.broadcast(n_mb_t, src=0, group=all_group)
-        return 0.0
-    if is_student:
-        rng = _random.Random(step)
-        idxs = list(range(len(eval_dataset)))
-        rng.shuffle(idxs)
-        examples = [eval_dataset[i] for i in idxs[:args.eval_size]]
-        prompts = [student.tokenizer.apply_chat_template(
-            [{"role": "user", "content": ex["question"]}], tokenize=False, add_generation_prompt=True,
-        ) for ex in examples]
-        rollouts = generate_rollouts_remote(
-            args.rollout_worker_url, prompts=prompts, num_samples=1,
-            max_new_tokens=args.max_new_tokens, temperature=args.temperature, top_k=args.top_k,
-        )
-        for r, ex in zip(rollouts, examples):
-            r["teacher_prompt"] = student.tokenizer.apply_chat_template(
-                _build_teacher_messages([{"role": "user", "content": ex["question"]}], ex["demonstration"]),
-                tokenize=False, add_generation_prompt=True,
-            )
-        batch = prepare_batch(rollouts, tokenizer=student.tokenizer,
-                              max_prompt_len=args.max_prompt_len, max_response_len=args.max_response_len, device=device)
-        teacher_batch = prepare_teacher_batch(rollouts, tokenizer=student.tokenizer, device=device)
-        student.model.eval()
-        n_mb_t = torch.tensor([math.ceil(batch["input_ids"].shape[0] / args.train_batch_size)], dtype=torch.long, device=device)
-    else:
-        n_mb_t = batch = teacher_batch = None
-        n_mb_t = torch.zeros(1, dtype=torch.long, device=device)
+def eval_pass_at_k(
+    eval_dataset: list[dict],
+    eval_size: int,
+    args,
+    student,
+    grader,
+    k: int = 4,
+) -> tuple[float, float]:
+    """Pass@k on the held-out eval split. Runs on master rank only (no collectives).
 
-    dist.broadcast(n_mb_t, src=0, group=all_group)
-    n_mb, total_loss, n_batches = int(n_mb_t.item()), 0.0, 0
+    Generates k rollouts per question, grades each with `grader(response, example)`,
+    and returns (pass@k, avg@k) where:
+      pass@k  = fraction of questions with at least 1 correct rollout
+      avg@k   = average fraction of correct rollouts per question
+    """
+    rng = _random.Random(args.seed)
+    idxs = list(range(len(eval_dataset)))
+    rng.shuffle(idxs)
+    examples = [eval_dataset[i] for i in idxs[:eval_size]]
 
-    for mb_idx in range(n_mb):
-        sl = slice(mb_idx * args.train_batch_size, (mb_idx + 1) * args.train_batch_size)
-        if is_student:
-            mb_ids, mb_attn, mb_mask = batch["input_ids"][sl], batch["attention_mask"][sl], batch["response_mask"][sl]
-            t_mb_ids, t_mb_attn, t_mb_mask = teacher_batch["input_ids"][sl], teacher_batch["attention_mask"][sl], teacher_batch["response_mask"][sl]
-        else:
-            mb_ids = mb_attn = mb_mask = t_mb_ids = t_mb_attn = t_mb_mask = None
+    prompts = [student.tokenizer.apply_chat_template(
+        [{"role": "user", "content": ex["question"]}], tokenize=False, add_generation_prompt=True,
+    ) for ex in examples]
 
-        mb_ids, mb_attn = broadcast_minibatch(is_student, mb_ids, mb_attn, device, all_group)
-        t_mb_ids, t_mb_attn, t_mb_mask = broadcast_teacher_inputs(is_student, t_mb_ids, t_mb_attn, t_mb_mask, device, all_group)
+    rollouts = generate_rollouts_remote(
+        args.rollout_worker_url, prompts=prompts, num_samples=k,
+        max_new_tokens=args.max_new_tokens, temperature=args.temperature, top_k=args.top_k,
+    )
 
-        tk, s_resp, s_compact_mask, _, _ = _minibatch_exchange(
-            is_student, is_teacher, mb_ids, mb_attn, mb_mask,
-            t_mb_ids, t_mb_attn, t_mb_mask, student.model if is_student else None, teacher if is_teacher else None,
-            select_topk_by, K, args, all_group, teacher_global_rank, device,
-        )
+    pass_count = 0
+    total_correct = 0
+    for i, ex in enumerate(examples):
+        group = rollouts[i * k : (i + 1) * k]
+        correct = [grader(r["response"], ex) for r in group]
+        pass_count += any(correct)
+        total_correct += sum(correct)
 
-        if is_student:
-            s_logprobs = F.log_softmax(s_resp.float(), dim=-1).gather(-1, tk["topk_idx"])
-            effective_mask = apply_token_skip_mask(s_compact_mask * tk["t_compact_mask"], args.num_loss_tokens_to_skip)
-            total_loss += loss_fn(s_logprobs, tk["t_logprobs"], effective_mask, tis_weights=None).item()
-            n_batches += 1
-
-    if is_student:
-        student.model.train()
-    return total_loss / max(n_batches, 1)
+    n = len(examples)
+    return pass_count / n, total_correct / (n * k)
 
 
 # ---------------------------------------------------------------------------
@@ -366,15 +342,26 @@ def eval_sdft(eval_dataset, args, student, teacher, loss_fn, select_topk_by, K,
 
 
 def build_sdft_eval_dataset(args) -> list[dict]:
-    """Load the held-out eval split.
+    """Load the held-out eval split for pass@k evaluation.
 
-    Only tooluse has an eval split with demonstrations (same format as train).
-    The science eval split is MCQ-only (no demonstrations), so distillation loss
-    can't be computed on it — returns [] for science and custom JSONL datasets.
+    Returns [] for custom JSONL datasets (no eval split available).
     """
-    if args.dataset == "tooluse" and not args.dataset_path:
-        return load_sdft_tooluse(split="eval")
+    if args.dataset_path:
+        return []
+    if args.dataset == "science":
+        return load_sdft_science_eval()
+    if args.dataset == "tooluse":
+        return load_sdft_tooluse_eval()
     return []
+
+
+def build_sdft_grader(args):
+    """Return a grader callable (response, example) -> bool for the dataset."""
+    if args.dataset == "science":
+        return lambda response, ex: grade_science_response(response, ex["answer"])
+    if args.dataset == "tooluse":
+        return lambda response, ex: grade_tooluse_response(response, ex["golden_answer"])
+    return lambda response, ex: False
 
 
 def build_sdft_dataset(args) -> list[dict]:
@@ -573,8 +560,8 @@ if __name__ == "__main__":
     parser.add_argument("--run-name", type=str, default="dummy")
     parser.add_argument("--save-dir", type=str, default="sdft_checkpoints")
     parser.add_argument("--save-every", type=int, default=0)
-    parser.add_argument("--eval-every", type=int, default=0, help="Eval on held-out split every N steps (0 = disabled).")
-    parser.add_argument("--eval-size", type=int, default=50, help="Number of eval examples per eval run.")
+    parser.add_argument("--eval-every", type=int, default=0, help="Pass@k eval on held-out split every N steps (0 = disabled).")
+    parser.add_argument("--eval-k", type=int, default=4, help="Number of rollouts per question for pass@k evaluation.")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
@@ -697,10 +684,13 @@ if __name__ == "__main__":
 
     # -------------------------------------------------------------------------
     # Dataset (student ranks only)
-    eval_dataset: list[dict] = []  # defined on all ranks; only populated on student ranks
+    eval_dataset: list[dict] = []
+    grader = None
     if is_student:
         dataset = build_sdft_dataset(args)
-        eval_dataset = build_sdft_eval_dataset(args) if args.eval_every > 0 else []
+        if args.eval_every > 0:
+            eval_dataset = build_sdft_eval_dataset(args)
+            grader = build_sdft_grader(args)
         loader = distributed_sdft_loader(
             dataset, args.prompts_per_step, train_world_size, ddp_rank, seed=args.seed
         )
@@ -870,16 +860,13 @@ if __name__ == "__main__":
         if is_student:
             sync_weights_to_vllm_inplace(student.model, args.rollout_worker_url, model_update_group, fsdp=True)
 
-        # -- Eval on held-out split (after weight sync so vLLM has latest weights) --
-        if args.eval_every > 0 and (step + 1) % args.eval_every == 0:
-            eval_loss = eval_sdft(
-                eval_dataset, args, student if is_student else None, teacher if is_teacher else None,
-                loss_fn, select_topk_by, K, is_student, is_teacher, all_group, teacher_global_rank, device, step,
-            )
-            if master_process and eval_dataset:
-                print0(f"[eval step={step+1}] eval_loss={eval_loss:.4f}")
-                if use_wandb:
-                    wandb.log({"eval/loss": eval_loss}, step=step + 1)
+        # -- Pass@4 eval (master rank only; others wait at the barrier below) --
+        if args.eval_every > 0 and (step + 1) % args.eval_every == 0 and master_process and eval_dataset:
+            k = args.eval_k
+            pass_at_k, avg_at_k = eval_pass_at_k(eval_dataset, len(eval_dataset), args, student, grader, k=k)
+            print0(f"[eval step={step+1}] pass@{k}={pass_at_k:.3f} avg@{k}={avg_at_k:.3f} (n={len(eval_dataset)})")
+            if use_wandb:
+                wandb.log({f"eval/pass_at_{k}": pass_at_k, f"eval/avg_at_{k}": avg_at_k}, step=step + 1)
 
         if is_student:
             dt = time.time() - t0

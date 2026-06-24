@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from datasets import load_dataset
@@ -38,6 +39,30 @@ def load_sdft_science(split: str = "train") -> list[dict]:
         question = user_messages[-1] if user_messages else messages[-1]["content"]
         records.append({"question": question, "demonstration": row["output_text"]})
     return records
+
+
+def load_sdft_science_eval() -> list[dict]:
+    """Load science MCQ eval split for pass@k evaluation.
+
+    The eval split has a different schema from train: each row has `prompt`
+    (the MCQ question) and `answer` (correct letter A/B/C/D).
+    """
+    url = f"{_BASE_URL}/eval_data/data-00000-of-00001.arrow"
+    ds = load_dataset("arrow", data_files={"eval": url}, split="eval")
+    return [{"question": row["prompt"], "answer": row["answer"]} for row in ds]
+
+
+def grade_science_response(response: str, answer: str) -> bool:
+    """True if response contains the correct MCQ letter.
+
+    Looks for <answer>X</answer> first; falls back to the last standalone
+    A/B/C/D letter in the response.
+    """
+    m = re.search(r"<answer>\s*([A-D])\s*</answer>", response, re.IGNORECASE)
+    if m:
+        return m.group(1).upper() == answer.upper()
+    letters = re.findall(r"\b([A-D])\b", response)
+    return bool(letters) and letters[-1].upper() == answer.upper()
 
 
 class SdftScienceEnv(OPDEnvBase):

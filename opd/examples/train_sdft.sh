@@ -29,7 +29,7 @@ STUDENT_MODEL="${STUDENT_MODEL:-Qwen/Qwen2.5-1.5B-Instruct}"
 #   science   – science Q&A with worked demonstrations (paper's Science Q&A task)
 #   tooluse   – tool-use tasks with golden Action/Action_Input sequences
 # Set DATASET_PATH to a JSONL on disk to override (one {"question","demonstration"} per line).
-DATASET="${DATASET:-science}"
+DATASET="${DATASET:-tooluse}"  # science|tooluse
 DATASET_LIMIT="${DATASET_LIMIT:-0}"          # 0 = use all rows
 # Custom data (optional): point DATASET_PATH at your own {question, demonstration}
 # JSONL to override the built-in dataset.
@@ -51,7 +51,7 @@ WEIGHT_TRANSFER_BACKEND="${WEIGHT_TRANSFER_BACKEND:-nccl}"
 
 USE_WANDB="${USE_WANDB:-1}"
 
-NUM_STEPS="${NUM_STEPS:-50}"
+NUM_STEPS="${NUM_STEPS:-30}"
 SAVE_EVERY="${SAVE_EVERY:-100}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-4}"
 GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-4}"
@@ -70,7 +70,7 @@ MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
 # is no num-samples multiplier (paper Appendix A.1 uses a single trajectory).
 PROMPTS_PER_STEP="${PROMPTS_PER_STEP:-8}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1536}"
-MAX_PROMPT_LEN="${MAX_PROMPT_LEN:-1024}"
+MAX_PROMPT_LEN="${MAX_PROMPT_LEN:-4096}"
 MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-1536}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-0}"   # 0 = MAX_PROMPT_LEN + MAX_RESPONSE_LEN
 TEMPERATURE="${TEMPERATURE:-1.0}"
@@ -101,8 +101,8 @@ SEED="${SEED:-0}"
 
 # Held-out evaluation on the dataset's eval split (science/tooluse only; ignored for custom JSONL).
 # Set EVAL_EVERY=0 to disable.
-EVAL_EVERY="${EVAL_EVERY:-20}"
-EVAL_SIZE="${EVAL_SIZE:-50}"
+EVAL_EVERY="${EVAL_EVERY:-10}"
+EVAL_K="${EVAL_K:-4}"
 
 # FSDP sharding strategy — choose one of:
 #   FULL_SHARD          params+grads+optimizer sharded; unshard around fwd/bwd
@@ -290,7 +290,7 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS,$TEACHER_GPUS" \
     --save-dir "$SAVE_DIR" \
     --save-every "$SAVE_EVERY" \
     --eval-every "$EVAL_EVERY" \
-    --eval-size "$EVAL_SIZE" \
+    --eval-k "$EVAL_K" \
     --seed "$SEED" \
     --run-name "$TAG" \
     "${EXTRA_FLAGS[@]}" \

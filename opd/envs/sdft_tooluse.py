@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from datasets import load_dataset
@@ -55,6 +56,35 @@ def load_sdft_tooluse(split: str = "train") -> list[dict]:
         demonstration = _format_demonstration(row.get("golden_answer") or [])
         records.append({"question": question, "demonstration": demonstration})
     return records
+
+
+def load_sdft_tooluse_eval() -> list[dict]:
+    """Load tooluse eval split for pass@k evaluation.
+
+    Unlike load_sdft_tooluse, keeps golden_answer as a raw list[dict] so the
+    grader can compare action names directly.
+    """
+    url = f"{_BASE_URL}/eval_data/data-00000-of-00001.arrow"
+    ds = load_dataset("arrow", data_files={"eval": url}, split="eval")
+    records: list[dict] = []
+    for row in ds:
+        prompt = (row.get("prompt") or "").strip()
+        instruction = (row.get("instruction") or "").strip()
+        question = f"{prompt}\n\n{instruction}".strip() if instruction else prompt
+        records.append({"question": question, "golden_answer": row.get("golden_answer") or []})
+    return records
+
+
+def grade_tooluse_response(response: str, golden_answer: list[dict]) -> bool:
+    """True if the action names in the response match the expected sequence.
+
+    Parses every "Action: <name>" line from the response (case-insensitive)
+    and compares the sequence to the golden_answer action names.
+    Action_Input is not checked — tool selection is the primary signal.
+    """
+    parsed = re.findall(r"(?i)^Action:\s*(.+)", response, re.MULTILINE)
+    expected = [step["Action"].strip() for step in golden_answer]
+    return [p.strip() for p in parsed] == expected
 
 
 class SdftToolUseEnv(OPDEnvBase):

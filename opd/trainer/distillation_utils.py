@@ -10,6 +10,19 @@ from opd.fsdp.algorithms import (
 )
 
 
+def bcast_or_alloc_async(*, tensor, is_owner, shape, dtype, src, device, group):
+    """If not the owning rank, allocate a placeholder; issue the broadcast without waiting for it.
+
+    Returns (tensor, handle). Call handle.wait() before reading the tensor.
+    Lets several independent broadcasts overlap on the wire instead of
+    completing one at a time.
+    """
+    if not is_owner:
+        tensor = torch.empty(shape, dtype=dtype, device=device)
+    handle = dist.broadcast(tensor, src=src, group=group, async_op=True)
+    return tensor, handle
+
+
 def broadcast_minibatch(
     is_student: bool,
     mb_ids: torch.Tensor | None,
@@ -18,22 +31,15 @@ def broadcast_minibatch(
     all_group,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Broadcast input_ids and attention_mask from student rank 0 to all ranks."""
-    if is_student:
-        assert mb_ids is not None and mb_attn is not None
-        shape_t = torch.tensor([mb_ids.shape[0], mb_ids.shape[1]], dtype=torch.long, device=device)
-    else:
-        shape_t = torch.zeros(2, dtype=torch.long, device=device)
-
-    dist.broadcast(shape_t, src=0, group=all_group)
+    shape_t = torch.tensor([mb_ids.shape[0], mb_ids.shape[1]], dtype=torch.long, device=device) if is_student else None
+    shape_t, h = bcast_or_alloc_async(tensor=shape_t, is_owner=is_student, shape=(2,), dtype=torch.long, src=0, device=device, group=all_group)
+    h.wait()
     B, T = int(shape_t[0].item()), int(shape_t[1].item())
 
-    if not is_student:
-        mb_ids  = torch.zeros(B, T, dtype=torch.long, device=device)
-        mb_attn = torch.zeros(B, T, dtype=torch.long, device=device)
-
-    assert mb_ids is not None and mb_attn is not None
-    dist.broadcast(mb_ids,  src=0, group=all_group)
-    dist.broadcast(mb_attn, src=0, group=all_group)
+    mb_ids,  h1 = bcast_or_alloc_async(tensor=mb_ids,  is_owner=is_student, shape=(B, T), dtype=torch.long, src=0, device=device, group=all_group)
+    mb_attn, h2 = bcast_or_alloc_async(tensor=mb_attn, is_owner=is_student, shape=(B, T), dtype=torch.long, src=0, device=device, group=all_group)
+    h1.wait()
+    h2.wait()
     return mb_ids, mb_attn
 
 
@@ -43,19 +49,16 @@ def broadcast_teacher_inputs(is_student, t_mb_ids, t_mb_attn, t_mb_mask, device,
     Used when teacher and student have different inputs (e.g. SDFT, where the
     teacher prompt includes a worked demonstration).
     """
-    if is_student:
-        shape_t = torch.tensor([t_mb_ids.shape[0], t_mb_ids.shape[1]], dtype=torch.long, device=device)
-    else:
-        shape_t = torch.zeros(2, dtype=torch.long, device=device)
-    dist.broadcast(shape_t, src=0, group=all_group)
+    shape_t = torch.tensor([t_mb_ids.shape[0], t_mb_ids.shape[1]], dtype=torch.long, device=device) if is_student else None
+    shape_t, h = bcast_or_alloc_async(tensor=shape_t, is_owner=is_student, shape=(2,), dtype=torch.long, src=0, device=device, group=all_group)
+    h.wait()
     B, T_t = int(shape_t[0].item()), int(shape_t[1].item())
-    if not is_student:
-        t_mb_ids  = torch.zeros(B, T_t, dtype=torch.long,  device=device)
-        t_mb_attn = torch.zeros(B, T_t, dtype=torch.long,  device=device)
-        t_mb_mask = torch.zeros(B, T_t, dtype=torch.float, device=device)
-    dist.broadcast(t_mb_ids,  src=0, group=all_group)
-    dist.broadcast(t_mb_attn, src=0, group=all_group)
-    dist.broadcast(t_mb_mask, src=0, group=all_group)
+
+    t_mb_ids,  h1 = bcast_or_alloc_async(tensor=t_mb_ids,  is_owner=is_student, shape=(B, T_t), dtype=torch.long,  src=0, device=device, group=all_group)
+    t_mb_attn, h2 = bcast_or_alloc_async(tensor=t_mb_attn, is_owner=is_student, shape=(B, T_t), dtype=torch.long,  src=0, device=device, group=all_group)
+    t_mb_mask, h3 = bcast_or_alloc_async(tensor=t_mb_mask, is_owner=is_student, shape=(B, T_t), dtype=torch.float, src=0, device=device, group=all_group)
+    for h in (h1, h2, h3):
+        h.wait()
     return t_mb_ids, t_mb_attn, t_mb_mask
 
 
@@ -89,53 +92,46 @@ def exchange_topk(
     if is_teacher and t_compact_mask is None:
         t_compact_mask = torch.ones(B, T, dtype=torch.float32, device=device)
 
-    if select_topk_by == "student":
-        if is_student:
-            topk_idx = student_topk_indices(student_logits, K, s_chunk)
-        else:
-            topk_idx = torch.empty(B, T, K, dtype=torch.long, device=device)
-        dist.broadcast(topk_idx, src=0, group=all_group)
+    if select_topk_by == "student": #reverse KL
+        topk_idx = student_topk_indices(student_logits, K, s_chunk) if is_student else None
+        topk_idx, h = bcast_or_alloc_async(tensor=topk_idx, is_owner=is_student, shape=(B, T, K), dtype=torch.long, src=0, device=device, group=all_group)
+        h.wait()
 
         if is_teacher:
-            t_logprobs           = teacher_logprobs_at_indices(teacher_logits, topk_idx, t_chunk)
+            t_logprobs                             = teacher_logprobs_at_indices(teacher_logits, topk_idx, t_chunk)
             teacher_topk_idx, teacher_own_logprobs = teacher_topk_logprobs(teacher_logits, K, t_chunk)
         else:
-            t_logprobs           = torch.empty(B, T, K, dtype=torch.bfloat16, device=device)
-            teacher_topk_idx     = torch.empty(B, T, K, dtype=torch.long,     device=device)
-            teacher_own_logprobs = torch.empty(B, T, K, dtype=torch.bfloat16, device=device)
-            t_compact_mask       = torch.empty(B, T,    dtype=torch.float32,  device=device)
+            t_logprobs = teacher_topk_idx = teacher_own_logprobs = None
 
-        dist.broadcast(t_logprobs,           src=teacher_global_rank, group=all_group)
-        dist.broadcast(teacher_topk_idx,     src=teacher_global_rank, group=all_group)
-        dist.broadcast(teacher_own_logprobs, src=teacher_global_rank, group=all_group)
-        dist.broadcast(t_compact_mask,       src=teacher_global_rank, group=all_group)
+        t_logprobs,           h1 = bcast_or_alloc_async(tensor=t_logprobs,           is_owner=is_teacher, shape=(B, T, K), dtype=torch.bfloat16, src=teacher_global_rank, device=device, group=all_group)
+        teacher_topk_idx,     h2 = bcast_or_alloc_async(tensor=teacher_topk_idx,     is_owner=is_teacher, shape=(B, T, K), dtype=torch.long,     src=teacher_global_rank, device=device, group=all_group)
+        teacher_own_logprobs, h3 = bcast_or_alloc_async(tensor=teacher_own_logprobs, is_owner=is_teacher, shape=(B, T, K), dtype=torch.bfloat16, src=teacher_global_rank, device=device, group=all_group)
+        t_compact_mask,       h4 = bcast_or_alloc_async(tensor=t_compact_mask,       is_owner=is_teacher, shape=(B, T),    dtype=torch.float32,  src=teacher_global_rank, device=device, group=all_group)
+        for h in (h1, h2, h3, h4):
+            h.wait()
 
         student_topk_idx      = topk_idx
         t_logprobs_at_student = t_logprobs
 
     else:  # forward_kl: teacher picks top-K
-        if is_student:
-            student_topk_idx = student_topk_indices(student_logits, K, s_chunk)
-        else:
-            student_topk_idx = torch.empty(B, T, K, dtype=torch.long, device=device)
-        dist.broadcast(student_topk_idx, src=0, group=all_group)
+        student_topk_idx = student_topk_indices(student_logits, K, s_chunk) if is_student else None
+        student_topk_idx, h = bcast_or_alloc_async(tensor=student_topk_idx, is_owner=is_student, shape=(B, T, K), dtype=torch.long, src=0, device=device, group=all_group)
+        h.wait()
 
         if is_teacher:
             teacher_topk_idx, t_logprobs = teacher_topk_logprobs(teacher_logits, K, t_chunk)
             teacher_own_logprobs  = t_logprobs
             t_logprobs_at_student = teacher_logprobs_at_indices(teacher_logits, student_topk_idx, t_chunk)
         else:
-            teacher_topk_idx      = torch.empty(B, T, K, dtype=torch.long,     device=device)
-            t_logprobs            = torch.empty(B, T, K, dtype=torch.bfloat16, device=device)
-            teacher_own_logprobs  = torch.empty(B, T, K, dtype=torch.bfloat16, device=device)
-            t_logprobs_at_student = torch.empty(B, T, K, dtype=torch.bfloat16, device=device)
-            t_compact_mask        = torch.empty(B, T,    dtype=torch.float32,  device=device)
+            teacher_topk_idx = t_logprobs = teacher_own_logprobs = t_logprobs_at_student = None
 
-        dist.broadcast(teacher_topk_idx,      src=teacher_global_rank, group=all_group)
-        dist.broadcast(t_logprobs,            src=teacher_global_rank, group=all_group)
-        dist.broadcast(teacher_own_logprobs,  src=teacher_global_rank, group=all_group)
-        dist.broadcast(t_logprobs_at_student, src=teacher_global_rank, group=all_group)
-        dist.broadcast(t_compact_mask,        src=teacher_global_rank, group=all_group)
+        teacher_topk_idx,      h1 = bcast_or_alloc_async(tensor=teacher_topk_idx,      is_owner=is_teacher, shape=(B, T, K), dtype=torch.long,     src=teacher_global_rank, device=device, group=all_group)
+        t_logprobs,            h2 = bcast_or_alloc_async(tensor=t_logprobs,            is_owner=is_teacher, shape=(B, T, K), dtype=torch.bfloat16, src=teacher_global_rank, device=device, group=all_group)
+        teacher_own_logprobs,  h3 = bcast_or_alloc_async(tensor=teacher_own_logprobs,  is_owner=is_teacher, shape=(B, T, K), dtype=torch.bfloat16, src=teacher_global_rank, device=device, group=all_group)
+        t_logprobs_at_student, h4 = bcast_or_alloc_async(tensor=t_logprobs_at_student, is_owner=is_teacher, shape=(B, T, K), dtype=torch.bfloat16, src=teacher_global_rank, device=device, group=all_group)
+        t_compact_mask,        h5 = bcast_or_alloc_async(tensor=t_compact_mask,        is_owner=is_teacher, shape=(B, T),    dtype=torch.float32,  src=teacher_global_rank, device=device, group=all_group)
+        for h in (h1, h2, h3, h4, h5):
+            h.wait()
 
         topk_idx = teacher_topk_idx
 

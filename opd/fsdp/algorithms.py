@@ -15,6 +15,11 @@ def _effective_chunk(T: int, *chunk_sizes: int) -> int:
     return min(active) if active else T
 
 
+def _logprobs_at(logits_slice: torch.Tensor, idx: torch.Tensor, lse: torch.Tensor) -> torch.Tensor:
+    """Gather log-probs at idx from a [B, C, V] logits slice, given its logsumexp [B, C]."""
+    return logits_slice.gather(-1, idx) - rearrange(lse, "b c -> b c 1")
+
+
 # ---------------------------------------------------------------------------
 # Per-rank helpers used by the distributed training loop
 # ---------------------------------------------------------------------------
@@ -48,7 +53,7 @@ def teacher_logprobs_at_indices(
         for t0, t1 in _chunk_range(T, chunk):
             sl = teacher_logits[:, t0:t1]
             lse = torch.logsumexp(sl, dim=-1)
-            parts.append(sl.gather(-1, topk_idx[:, t0:t1]) - rearrange(lse, "b c -> b c 1"))
+            parts.append(_logprobs_at(sl, topk_idx[:, t0:t1], lse))
     del teacher_logits
     return torch.cat(parts, dim=1)
 
@@ -68,7 +73,7 @@ def teacher_topk_logprobs(
             lse = torch.logsumexp(sl, dim=-1)
             _, idx = sl.topk(K, dim=-1)
             idx_parts.append(idx)
-            lp_parts.append(sl.gather(-1, idx) - rearrange(lse, "b c -> b c 1"))
+            lp_parts.append(_logprobs_at(sl, idx, lse))
     del teacher_logits
     return torch.cat(idx_parts, dim=1), torch.cat(lp_parts, dim=1)
 
@@ -102,7 +107,7 @@ def student_logprobs_at_indices(
     for t0, t1 in _chunk_range(T, chunk):
         sl = student_logits[:, t0:t1]
         lse = torch.logsumexp(sl, dim=-1)
-        parts.append(sl.gather(-1, topk_idx[:, t0:t1]) - rearrange(lse, "b c -> b c 1"))
+        parts.append(_logprobs_at(sl, topk_idx[:, t0:t1], lse))
     return torch.cat(parts, dim=1)
 
 
@@ -127,9 +132,9 @@ def _topk_logprobs_slice(
         with torch.no_grad():
             _, topk_idx = t.topk(top_k, dim=-1)
 
-    s_lp = s.gather(-1, topk_idx) - rearrange(s_lse, "b c -> b c 1")
+    s_lp = _logprobs_at(s, topk_idx, s_lse)
     with torch.no_grad():
-        t_lp = t.gather(-1, topk_idx) - rearrange(t_lse, "b c -> b c 1")
+        t_lp = _logprobs_at(t, topk_idx, t_lse)
 
     return s_lp, t_lp, topk_idx
 

@@ -73,7 +73,8 @@ if __name__ == "__main__":
                         help="Sequences per gradient accumulation step. Optimizer updates after all "
                              "prompts_per_step * num_samples sequences are processed.")
     parser.add_argument("--epochs", type=int, default=1, help="Optimizer steps per rollout batch")
-    parser.add_argument("--max-seq-len", type=int, default=2048)
+    parser.add_argument("--max-prompt-len", type=int, default=512)
+    parser.add_argument("--max-response-len", type=int, default=1536)
     parser.add_argument("--sharding-strategy", type=str, default="FULL_SHARD")
     parser.add_argument("--gradient-checkpointing", action="store_true")
     # Runtime
@@ -130,7 +131,8 @@ if __name__ == "__main__":
                 "epochs": args.epochs,
                 "num_samples": args.num_samples,
                 "max_new_tokens": args.max_new_tokens,
-                "max_seq_len": args.max_seq_len,
+                "max_prompt_len": args.max_prompt_len,
+                "max_response_len": args.max_response_len,
                 "temperature": args.temperature,
                 "sharding_strategy": args.sharding_strategy,
             },
@@ -213,7 +215,8 @@ if __name__ == "__main__":
             batch = prepare_batch(
                 rollouts,
                 tokenizer=student.tokenizer,
-                max_seq_len=args.max_seq_len,
+                max_prompt_len=args.max_prompt_len,
+                max_response_len=args.max_response_len,
                 device=device,
             )
             input_ids         = batch["input_ids"]          # [N, T]

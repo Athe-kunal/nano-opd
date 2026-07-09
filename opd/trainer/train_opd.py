@@ -8,19 +8,21 @@ from typing import Literal
 import torch
 import torch.distributed as dist
 
-from opd.common import compute_cleanup, print0
 from opd.loss import ALGORITHMS
 from opd.fsdp.algorithms import (
     student_logprobs_at_indices,
     student_logprob_at_sampled_tokens,
 )
-from opd.trainer.distillation_utils import broadcast_minibatch, exchange_topk
-from opd.trainer.setup_utils import init_distributed, build_student, build_teacher, init_vllm_transfer
-from opd.metrics import (
-    compute_overlap_ratio,
-    compute_overlap_token_advantage,
-    compute_entropy_gap,
+from opd.trainer.distillation_utils import broadcast_minibatch, exchange_topk, exchange_sampled_teacher_logprob
+from opd.trainer.setup_utils import (
+    compute_cleanup,
+    print0,
+    init_distributed,
+    build_student,
+    build_teacher,
+    init_vllm_transfer,
 )
+from opd.metrics import compute_topk_health_metrics
 from opd.generator.rollout import (
     generate_rollouts_remote,
     sync_weights_to_vllm_inplace,
@@ -165,9 +167,9 @@ if __name__ == "__main__":
     # Loss function and top-K selection
     loss_fn = ALGORITHMS[args.algorithm]
     # reverse_kl and jsd weight by the student distribution → student selects top-K
-    # forward_kl weights by the teacher distribution → teacher selects top-K
+    # forward_kl and mopd_loss weight by the teacher distribution → teacher selects top-K
     select_topk_by: Literal["student", "teacher"] = (
-        "teacher" if args.algorithm == "forward_kl" else "student"
+        "teacher" if args.algorithm in ("forward_kl", "mopd_loss") else "student"
     )
 
     # -----------------------------------------------------------------------------
@@ -276,6 +278,76 @@ if __name__ == "__main__":
                     teacher_logits = teacher.get_logits(mb_ids, mb_attn)[:, :-1]
                 else:
                     teacher_logits = None
+                if args.algorithm == "mopd_pg_loss":
+                    # -- PG form (Eq. 3-4): no top-K exchange needed for the loss
+                    # itself, just the sampled token's log-prob under each policy.
+                    # mb_ids is already on every rank (broadcast above), so
+                    # sampled_ids needs no extra communication — only the
+                    # teacher's [B, T-1] logprob at those ids crosses the wire.
+                    sampled_ids = mb_ids[:, 1:]                             # [B, T-1]
+                    t_logprob = exchange_sampled_teacher_logprob(
+                        is_teacher=is_teacher,
+                        teacher_logits=teacher_logits,
+                        token_ids=sampled_ids,
+                        B=mb_ids.shape[0],
+                        T=mb_ids.shape[1] - 1,
+                        t_chunk=args.teacher_chunk_size,
+                        teacher_global_rank=teacher_global_rank,
+                        all_group=all_group,
+                        device=device,
+                    )
+
+                    # -- Diagnostics-only top-K exchange --
+                    # The overlap/advantage/entropy-gap metrics are loss-agnostic
+                    # (they just compare the two policies' top-K distributions),
+                    # so they're just as meaningful for the PG form as for the KL
+                    # variants. But computing them needs student/teacher top-K,
+                    # which the PG form otherwise skips to avoid this exact
+                    # broadcast cost — so this is deliberately paid only here,
+                    # separately from the (cheaper) loss computation above.
+                    topk = exchange_topk(
+                        select_topk_by=select_topk_by,
+                        is_student=is_student,
+                        is_teacher=is_teacher,
+                        student_logits=student_logits if is_student else None,
+                        teacher_logits=teacher_logits,
+                        B=mb_ids.shape[0],
+                        T=mb_ids.shape[1] - 1,
+                        K=args.distill_top_k,
+                        s_chunk=args.student_chunk_size,
+                        t_chunk=args.teacher_chunk_size,
+                        teacher_global_rank=teacher_global_rank,
+                        all_group=all_group,
+                        device=device,
+                    )
+
+                    if is_student:
+                        s_logprob = student_logprobs_at_indices(
+                            student_logits, sampled_ids.unsqueeze(-1), args.student_chunk_size
+                        ).squeeze(-1)                                      # [B, T-1], grad-carrying
+                        shift_mask = mb_mask[:, 1:]                        # [B, T-1]
+
+                        if args.tis_clip > 0.0:
+                            s_lp_sampled = student_logprob_at_sampled_tokens(student_logits, sampled_ids)
+                            inf_lp_shifted = mb_inf_lp[:, 1:].to(s_lp_sampled.dtype)
+                            tis_weights = (s_lp_sampled - inf_lp_shifted).exp().clamp(max=args.tis_clip)
+                        else:
+                            tis_weights = None
+
+                        loss = loss_fn(s_logprob, t_logprob, shift_mask, tis_weights=tis_weights) / n_mb
+                        student._scale_loss(loss).backward()
+                        total_loss += loss.item()
+                        n_batches  += 1
+
+                        with torch.no_grad():
+                            ratio, adv, ent_gap = compute_topk_health_metrics(
+                                student_logits, topk, args.student_chunk_size
+                            )
+                            overlap_ratio     += ratio
+                            overlap_advantage += adv
+                            entropy_gap_val   += ent_gap
+                    continue
+
                 topk = exchange_topk(
                     select_topk_by=select_topk_by,
                     is_student=is_student,
@@ -291,16 +363,9 @@ if __name__ == "__main__":
                     all_group=all_group,
                     device=device,
                 )
-                topk_idx             = topk["topk_idx"]
-                t_logprobs           = topk["t_logprobs"]
-                student_topk_idx     = topk["student_topk_idx"]
-                teacher_topk_idx     = topk["teacher_topk_idx"]
-                t_logprobs_at_student = topk["t_logprobs_at_student"]
-                teacher_own_logprobs  = topk["teacher_own_logprobs"]
-
                 # -- Student: compute TIS weights then loss and backward --
                 if is_student:
-                    s_logprobs = student_logprobs_at_indices(student_logits, topk_idx, args.student_chunk_size)
+                    s_logprobs = student_logprobs_at_indices(student_logits, topk.topk_idx, args.student_chunk_size)
                     shift_mask = mb_mask[:, 1:]                             # [B, T-1]
 
                     # TIS weight: corrects for numerical gap between vLLM inference
@@ -314,19 +379,19 @@ if __name__ == "__main__":
                     else:
                         tis_weights = None
 
-                    loss = loss_fn(s_logprobs, t_logprobs, shift_mask, tis_weights=tis_weights) / n_mb
+                    loss = loss_fn(s_logprobs, topk.t_logprobs, shift_mask, tis_weights=tis_weights) / n_mb
                     student._scale_loss(loss).backward()
                     total_loss += loss.item()
                     n_batches  += 1
 
                     # Compute distillation health metrics (no grad)
                     with torch.no_grad():
-                        s_lp_for_metrics = student_logprobs_at_indices(student_logits, student_topk_idx, args.student_chunk_size)
-                        overlap_ratio     += compute_overlap_ratio(student_topk_idx, teacher_topk_idx).item()
-                        overlap_advantage += compute_overlap_token_advantage(
-                            student_topk_idx, teacher_topk_idx, s_lp_for_metrics, t_logprobs_at_student
-                        ).item()
-                        entropy_gap_val   += compute_entropy_gap(s_lp_for_metrics, teacher_own_logprobs).item()
+                        ratio, adv, ent_gap = compute_topk_health_metrics(
+                            student_logits, topk, args.student_chunk_size
+                        )
+                        overlap_ratio     += ratio
+                        overlap_advantage += adv
+                        entropy_gap_val   += ent_gap
 
             if is_student:
                 student._optimizer_step()

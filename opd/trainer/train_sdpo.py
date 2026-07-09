@@ -7,17 +7,27 @@ from typing import Literal
 
 import torch
 import torch.distributed as dist
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+import torch.nn.functional as F
 
-from opd.common import compute_cleanup, print0
 from opd.loss import ALGORITHMS
-from opd.fsdp.algorithms import (
-    student_logprob_at_sampled_tokens,
-    teacher_logprobs_at_indices,
-    teacher_topk_logprobs,
+from opd.fsdp.algorithms import student_logprob_at_sampled_tokens
+from opd.trainer.distillation_utils import (
+    broadcast_minibatch,
+    broadcast_teacher_inputs,
+    minibatch_exchange,
+    mopd_pg_loss_and_backward,
+    pack_response_logits,
+    prepare_teacher_batch,
+    sync_student_to_teacher,
 )
-from opd.trainer.distillation_utils import broadcast_minibatch
-from opd.trainer.setup_utils import init_distributed, build_student, build_teacher, init_vllm_transfer
+from opd.trainer.setup_utils import (
+    compute_cleanup,
+    print0,
+    init_distributed,
+    build_student,
+    build_teacher,
+    init_vllm_transfer,
+)
 from opd.trainer.sync_teacher import SYNC_METHODS, build_syncer
 from opd.metrics import (
     compute_overlap_ratio,
@@ -72,138 +82,6 @@ def _build_teacher_messages(init_messages, env_output, successful_rollout):
     teacher_messages = list(init_messages[:-1])  # preserve system message if any
     teacher_messages.append({"role": "user", "content": "\n".join(parts)})
     return teacher_messages, has_extra
-
-
-def prepare_teacher_batch(rollouts, tokenizer, device):
-    """Build padded teacher sequences from feedback-augmented prompts.
-
-    Each rollout must have a ``teacher_prompt`` string (chat template applied
-    to feedback-augmented messages). The same response token IDs as the student
-    are appended after the teacher prompt, so the teacher re-evaluates the
-    student's exact response from a better-informed context.
-
-    No max_seq_len cap is applied here: the teacher never generates tokens, so
-    memory is bounded by the sequence length alone (no KV cache growth during
-    decoding). The student batch enforces max_seq_len separately.
-    """
-    input_ids_list, response_mask_list = [], []
-
-    for r in rollouts:
-        t_prompt_ids = tokenizer.encode(r["teacher_prompt"], add_special_tokens=False)
-        response_ids = list(r["response_ids"])
-
-        full_ids = t_prompt_ids + response_ids
-        r_len = len(response_ids)
-        input_ids_list.append(full_ids)
-        response_mask_list.append([0] * len(t_prompt_ids) + [1] * r_len)
-
-    max_len = max(len(ids) for ids in input_ids_list)
-    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
-    padded_ids   = [ids + [pad_id] * (max_len - len(ids)) for ids in input_ids_list]
-    padded_masks = [m   + [0]      * (max_len - len(m))   for m   in response_mask_list]
-    attn_masks   = [[1] * len(ids) + [0] * (max_len - len(ids)) for ids in input_ids_list]
-
-    return {
-        "input_ids":      torch.tensor(padded_ids,   dtype=torch.long,  device=device),
-        "attention_mask": torch.tensor(attn_masks,   dtype=torch.long,  device=device),
-        "response_mask":  torch.tensor(padded_masks, dtype=torch.float, device=device),
-    }
-
-
-def pack_response_logits(logits, shift_mask):
-    """Extract response-position logits into a compact [B, R_max, V] tensor.
-
-    Student and teacher process sequences of different lengths (teacher prompt
-    includes feedback, so it is longer). To compute the KL loss we must align
-    both distributions at the same response token positions. This removes
-    prompt positions and packs the result into a dense tensor.
-
-    Args:
-        logits:     [B, T-1, V] — model output logits.
-        shift_mask: [B, T-1]    — float mask, 1 at response positions.
-
-    Returns:
-        resp_logits:  [B, R_max, V]
-        compact_mask: [B, R_max] — 1 where response tokens exist.
-    """
-    B, _, V = logits.shape
-    resp_counts = shift_mask.long().sum(dim=1)     # [B]
-    R_max = int(resp_counts.max().item())
-    if R_max == 0:
-        return logits.new_zeros(B, 0, V), shift_mask.new_zeros(B, 0)
-
-    out          = logits.new_zeros(B, R_max, V)
-    compact_mask = torch.zeros(B, R_max, dtype=torch.float, device=logits.device)
-    for b in range(B):
-        r_b = int(resp_counts[b].item())
-        if r_b > 0:
-            out[b, :r_b]          = logits[b][shift_mask[b].bool()]
-            compact_mask[b, :r_b] = 1.0
-    return out, compact_mask
-
-
-def broadcast_teacher_inputs(is_student, t_mb_ids, t_mb_attn, t_mb_mask, device, all_group):
-    """Broadcast teacher-specific input tensors from student rank 0 to all ranks.
-
-    Like broadcast_minibatch but handles the three tensors needed for the
-    teacher's feedback-augmented sequences (which have a different T from the
-    student's sequences).
-    """
-    if is_student:
-        shape_t = torch.tensor(
-            [t_mb_ids.shape[0], t_mb_ids.shape[1]], dtype=torch.long, device=device
-        )
-    else:
-        shape_t = torch.zeros(2, dtype=torch.long, device=device)
-    dist.broadcast(shape_t, src=0, group=all_group)
-    B, T_t = int(shape_t[0].item()), int(shape_t[1].item())
-
-    if not is_student:
-        t_mb_ids   = torch.zeros(B, T_t, dtype=torch.long,  device=device)
-        t_mb_attn  = torch.zeros(B, T_t, dtype=torch.long,  device=device)
-        t_mb_mask  = torch.zeros(B, T_t, dtype=torch.float, device=device)
-
-    dist.broadcast(t_mb_ids,  src=0, group=all_group)
-    dist.broadcast(t_mb_attn, src=0, group=all_group)
-    dist.broadcast(t_mb_mask, src=0, group=all_group)
-    return t_mb_ids, t_mb_attn, t_mb_mask
-
-
-@torch.no_grad()
-def sync_student_to_teacher(
-    student_fsdp_model, teacher, syncer, global_step,
-    is_student, is_teacher, all_group,
-):
-    """Broadcast full student parameters to the teacher rank and apply the syncer.
-
-    FSDP shards student parameters across student ranks; summon_full_params
-    temporarily gathers them so rank 0 can broadcast the full tensors. The
-    teacher rank receives each parameter and updates its weights via the chosen
-    sync method (EMA, trust-region, hard-sync, or on-policy).
-
-    All ranks must call this function together because dist.broadcast is a
-    collective — the loops on both sides must execute the same number of times
-    in the same order (guaranteed because student and teacher share the same
-    architecture).
-    """
-    if is_student:
-        with FSDP.summon_full_params(student_fsdp_model, writeback=False, recurse=True):
-            for s_param in student_fsdp_model.parameters():
-                # Rank 0 sends; other student ranks and teacher rank receive.
-                # writeback=False ensures the receive on non-zero student ranks
-                # does not corrupt the FSDP shards.
-                dist.broadcast(s_param.data, src=0, group=all_group)
-
-    if is_teacher:
-        received = []
-        for t_param in teacher.model.parameters():
-            buf = torch.empty_like(t_param.data)
-            dist.broadcast(buf, src=0, group=all_group)
-            received.append(buf)
-        student_proxy = (torch.nn.Parameter(r, requires_grad=False) for r in received)
-        syncer.step(student_proxy, teacher.model.parameters(), global_step)
-        # print directly — this runs only on the teacher rank, not rank 0
-        print(f"[sync step={global_step}] teacher updated via {syncer.__class__.__name__}", flush=True)
 
 
 if __name__ == "__main__":
@@ -377,7 +255,7 @@ if __name__ == "__main__":
     # Loss function and top-K selection
     loss_fn = ALGORITHMS[args.algorithm]
     select_topk_by: Literal["student", "teacher"] = (
-        "teacher" if args.algorithm == "forward_kl" else "student"
+        "teacher" if args.algorithm in ("forward_kl", "mopd_loss") else "student"
     )
     K = args.distill_top_k
 
@@ -526,126 +404,41 @@ if __name__ == "__main__":
                     mb_sd_mask = torch.zeros(mb_ids.shape[0], dtype=torch.float, device=device)
                 dist.broadcast(mb_sd_mask, src=0, group=all_group)
 
-                # -- Student forward (with grad) --
-                if is_student:
-                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                        student_logits = student.model(
-                            input_ids=mb_ids, attention_mask=mb_attn
-                        ).logits[:, :-1]                    # [B, T_s-1, V]
-
-                    s_shift_mask = mb_mask[:, 1:]           # [B, T_s-1]
-                    s_resp, s_compact_mask = pack_response_logits(student_logits, s_shift_mask)
-
-                # -- Broadcast R_max so teacher can allocate matching tensors --
-                R_max_t = torch.tensor(
-                    [s_resp.shape[1] if is_student else 0], dtype=torch.long, device=device
+                # -- Student + teacher forward, then top-K (or PG) exchange --
+                # The self-teacher uses the same weights as the student but sees a
+                # richer context: the question + feedback + original response.
+                # stopgrad (no_grad, inside minibatch_exchange) prevents gradients
+                # from flowing through the teacher back into the student's
+                # computation graph (SDPO Eq. 1).
+                is_pg = args.algorithm == "mopd_pg_loss"
+                tk, s_resp, s_compact_mask, s_shift_mask, student_logits = minibatch_exchange(
+                    is_student, is_teacher, mb_ids, mb_attn, mb_mask,
+                    t_mb_ids, t_mb_attn, t_mb_mask,
+                    student.model if is_student else None, teacher if is_teacher else None,
+                    select_topk_by, K, args.student_chunk_size, args.teacher_chunk_size,
+                    teacher_global_rank, all_group, device,
+                    is_pg=is_pg,
                 )
-                dist.broadcast(R_max_t, src=0, group=all_group)
-                R_max = int(R_max_t.item())
 
-                # -- Teacher forward (no grad; feedback-augmented context) --
-                # The self-teacher uses the same weights as the student but sees
-                # a richer context: the question + feedback + original response.
-                # stopgrad (no_grad) prevents gradients from flowing through the
-                # teacher back into the student's computation graph (SDPO Eq. 1).
-                if is_teacher:
-                    t_shift_mask = t_mb_mask[:, 1:]
-                    with torch.no_grad():
-                        teacher_logits = teacher.get_logits(t_mb_ids, t_mb_attn)[:, :-1]
-                    t_resp, t_compact_mask = pack_response_logits(teacher_logits, t_shift_mask)
-                    # Align teacher's compact tensors to student's R_max.
-                    # Positions padded with zeros would receive log_softmax(0) = -log(V)
-                    # (a spurious uniform distribution). The compact mask tracks which
-                    # positions are real vs. padded so the loss can exclude them.
-                    if t_resp.shape[1] < R_max:
-                        pad_len = R_max - t_resp.shape[1]
-                        t_resp = torch.cat(
-                            [t_resp, t_resp.new_zeros(t_resp.shape[0], pad_len, t_resp.shape[-1])], dim=1
-                        )
-                        t_compact_mask = torch.cat(
-                            [t_compact_mask, t_compact_mask.new_zeros(t_compact_mask.shape[0], pad_len)], dim=1
-                        )
-                    elif t_resp.shape[1] > R_max:
-                        t_resp = t_resp[:, :R_max]
-                        t_compact_mask = t_compact_mask[:, :R_max]
-
-                # -- Top-K selection and log-prob computation --
-                # Student selects top-K indices (reverse_kl / jsd); teacher selects
-                # for forward_kl. Only the chosen indices are communicated.
-                B = mb_ids.shape[0]
-
-                if select_topk_by == "student":
+                # -- PG form: no top-K exchange at all, just the sampled-token
+                # log-prob under each policy, packed to response positions. --
+                if is_pg:
                     if is_student:
-                        _, topk_idx = s_resp.topk(K, dim=-1)   # [B, R, K]
-                    else:
-                        topk_idx = torch.empty(B, R_max, K, dtype=torch.long, device=device)
-                    dist.broadcast(topk_idx, src=0, group=all_group)
-
-                    if is_teacher:
-                        # teacher_logprobs_at_indices: chunked logsumexp, stays bfloat16
-                        # internally, returns [B, R_max, K] — never materialises [B, R, V]
-                        # in float32, avoiding the OOM on the shared rollout+teacher GPU.
-                        t_logprobs = teacher_logprobs_at_indices(
-                            t_resp, topk_idx, chunk_size=args.teacher_chunk_size
-                        ).float()
-                        t_topk_idx, t_own_logprobs = teacher_topk_logprobs(
-                            t_resp, K, chunk_size=args.teacher_chunk_size
+                        loss = mopd_pg_loss_and_backward(
+                            student=student, pg=tk, loss_fn=loss_fn,
+                            student_logits=student_logits, sampled_ids=mb_ids[:, 1:], s_shift_mask=s_shift_mask,
+                            inf_lp_shifted=mb_inf_lp[:, 1:] if args.tis_clip > 0.0 else None,
+                            tis_clip=args.tis_clip, divisor=window_size,
+                            extra_mask=mb_sd_mask.unsqueeze(1),
                         )
-                        t_own_logprobs = t_own_logprobs.float()
-                        del t_resp
-                    else:
-                        t_logprobs     = torch.empty(B, R_max, K, dtype=torch.float32, device=device)
-                        t_topk_idx     = torch.empty(B, R_max, K, dtype=torch.long,    device=device)
-                        t_own_logprobs = torch.empty(B, R_max, K, dtype=torch.float32, device=device)
-                        t_compact_mask = torch.zeros(B, R_max,    dtype=torch.float32, device=device)
+                        total_loss += loss.item()
+                        n_batches  += 1
 
-                    dist.broadcast(t_logprobs,     src=teacher_global_rank, group=all_group)
-                    dist.broadcast(t_topk_idx,     src=teacher_global_rank, group=all_group)
-                    dist.broadcast(t_own_logprobs, src=teacher_global_rank, group=all_group)
-                    dist.broadcast(t_compact_mask, src=teacher_global_rank, group=all_group)
-
-                    student_topk_idx = topk_idx
-                    teacher_topk_idx = t_topk_idx
-                    t_lp_at_student  = t_logprobs   # teacher was evaluated at student's indices
-
-                else:  # forward_kl: teacher selects top-K
-                    if is_student:
-                        _, student_topk_idx = s_resp.topk(K, dim=-1)
-                    else:
-                        student_topk_idx = torch.empty(B, R_max, K, dtype=torch.long, device=device)
-                    dist.broadcast(student_topk_idx, src=0, group=all_group)
-
-                    if is_teacher:
-                        teacher_topk_idx, t_logprobs = teacher_topk_logprobs(
-                            t_resp, K, chunk_size=args.teacher_chunk_size
-                        )
-                        t_logprobs     = t_logprobs.float()
-                        t_own_logprobs = t_logprobs
-                        t_lp_at_student = teacher_logprobs_at_indices(
-                            t_resp, student_topk_idx, chunk_size=args.teacher_chunk_size
-                        ).float()
-                        del t_resp
-                    else:
-                        teacher_topk_idx = torch.empty(B, R_max, K, dtype=torch.long,    device=device)
-                        t_logprobs       = torch.empty(B, R_max, K, dtype=torch.float32, device=device)
-                        t_own_logprobs   = torch.empty(B, R_max, K, dtype=torch.float32, device=device)
-                        t_lp_at_student  = torch.empty(B, R_max, K, dtype=torch.float32, device=device)
-                        t_compact_mask   = torch.zeros(B, R_max,    dtype=torch.float32, device=device)
-
-                    dist.broadcast(teacher_topk_idx, src=teacher_global_rank, group=all_group)
-                    dist.broadcast(t_logprobs,       src=teacher_global_rank, group=all_group)
-                    dist.broadcast(t_own_logprobs,   src=teacher_global_rank, group=all_group)
-                    dist.broadcast(t_lp_at_student,  src=teacher_global_rank, group=all_group)
-                    dist.broadcast(t_compact_mask,   src=teacher_global_rank, group=all_group)
-
-                    topk_idx = teacher_topk_idx
-
-                # -- Loss and backward (student ranks only) --
-                if is_student:
-                    s_resp_f        = s_resp.float()
-                    s_lse           = torch.logsumexp(s_resp_f, dim=-1, keepdim=True)  # [B, R, 1]
-                    s_logprobs      = s_resp_f.gather(-1, topk_idx) - s_lse            # [B, R, K]
-                    s_lp_at_student = s_resp_f.gather(-1, student_topk_idx) - s_lse   # [B, R, K]
+                # -- Loss and backward (student ranks only; PG form already did its own above) --
+                elif is_student:
+                    s_log_resp      = F.log_softmax(s_resp.float(), dim=-1)
+                    s_logprobs      = s_log_resp.gather(-1, tk.topk_idx)
+                    s_lp_at_student = s_log_resp.gather(-1, tk.student_topk_idx)
 
                     # Exclude positions where the teacher sequence was truncated (due to
                     # its longer feedback-augmented prompt hitting max_seq_len). Those
@@ -653,9 +446,9 @@ if __name__ == "__main__":
                     # distribution that would corrupt the loss signal.
                     # Also exclude samples where the teacher had no augmented context —
                     # those have teacher == student prompt so the KL signal is meaningless.
-                    effective_mask = s_compact_mask * t_compact_mask * mb_sd_mask.unsqueeze(1)  # [B, R_max]
+                    effective_mask = s_compact_mask * tk.t_compact_mask * mb_sd_mask.unsqueeze(1)  # [B, R_max]
                     if effective_mask.sum() == 0:
-                        print0(f"[warn mb] effective_mask is all-zero: s_mask={s_compact_mask.sum().item():.0f} t_mask={t_compact_mask.sum().item():.0f} sd_mask={mb_sd_mask.sum().item():.0f}", flush=True)
+                        print0(f"[warn mb] effective_mask is all-zero: s_mask={s_compact_mask.sum().item():.0f} t_mask={tk.t_compact_mask.sum().item():.0f} sd_mask={mb_sd_mask.sum().item():.0f}", flush=True)
 
                     if args.tis_clip > 0.0:
                         sampled_ids    = mb_ids[:, 1:]
@@ -669,17 +462,17 @@ if __name__ == "__main__":
                     else:
                         tis_weights = None
 
-                    loss = loss_fn(s_logprobs, t_logprobs, effective_mask, tis_weights=tis_weights) / window_size
+                    loss = loss_fn(s_logprobs, tk.t_logprobs, effective_mask, tis_weights=tis_weights) / window_size
                     student._scale_loss(loss).backward()
                     total_loss += loss.item()
                     n_batches  += 1
 
                     with torch.no_grad():
-                        overlap_ratio     += compute_overlap_ratio(student_topk_idx, teacher_topk_idx).item()
+                        overlap_ratio     += compute_overlap_ratio(tk.student_topk_idx, tk.teacher_topk_idx).item()
                         overlap_advantage += compute_overlap_token_advantage(
-                            student_topk_idx, teacher_topk_idx, s_lp_at_student, t_lp_at_student
+                            tk.student_topk_idx, tk.teacher_topk_idx, s_lp_at_student, tk.t_logprobs_at_student
                         ).item()
-                        entropy_gap_val   += compute_entropy_gap(s_lp_at_student, t_own_logprobs).item()
+                        entropy_gap_val   += compute_entropy_gap(s_lp_at_student, tk.teacher_own_logprobs).item()
 
                 # Step after every G minibatches, and always on the final one.
                 if is_student and ((mb_idx + 1) % G == 0 or mb_idx == n_mb - 1):

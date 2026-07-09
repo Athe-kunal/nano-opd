@@ -4,12 +4,25 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+from loguru import logger
 from omegaconf import OmegaConf
 
-from opd.common import compute_init, print0, autodetect_device_type
 from opd.fsdp.model import StudentModel, TeacherModel
 from opd.generator.rollout import remote_vllm_init_weight_transfer, wait_for_rollout_worker
 from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
+
+
+def print0(s="", **kwargs):
+    """Log only from rank 0, so multi-process training doesn't spam N copies of every line."""
+    ddp_rank = int(os.environ.get("RANK", 0))
+    if ddp_rank == 0:
+        logger.info(s, **kwargs)
+
+
+def compute_cleanup():
+    """Companion to init_distributed: destroy the process group before exit, if one was created."""
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
 
 
 @dataclass
@@ -33,8 +46,47 @@ def init_distributed(device_type_arg: str, train_world_size: int) -> Distributed
     Ranks 0..train_world_size-1 are student (FSDP) ranks.
     Rank train_world_size is the teacher rank.
     """
-    device_type = autodetect_device_type() if device_type_arg == "" else device_type_arg
-    _, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
+    if device_type_arg == "":
+        # Prefer CUDA if available, otherwise MPS, otherwise fall back to CPU.
+        if torch.cuda.is_available():
+            device_type = "cuda"
+        elif torch.backends.mps.is_available():
+            device_type = "mps"
+        else:
+            device_type = "cpu"
+        print0(f"Autodetected device type: {device_type}")
+    else:
+        device_type = device_type_arg
+    assert device_type in ("cuda", "mps", "cpu"), "Invalid device type atm"
+    if device_type == "cuda":
+        assert torch.cuda.is_available(), "Your PyTorch installation is not configured for CUDA but device_type is 'cuda'"
+    if device_type == "mps":
+        assert torch.backends.mps.is_available(), "Your PyTorch installation is not configured for MPS but device_type is 'mps'"
+
+    # Reproducibility. Note most of the code uses explicit rng objects; the
+    # only place a global rng might matter is nn.Module weight init.
+    torch.manual_seed(42)
+    if device_type == "cuda":
+        torch.cuda.manual_seed(42)
+        torch.set_float32_matmul_precision("high")  # tf32 instead of fp32 for matmuls
+
+    is_ddp = all(k in os.environ for k in ("RANK", "LOCAL_RANK", "WORLD_SIZE"))
+    if is_ddp:
+        ddp_rank = int(os.environ["RANK"])
+        ddp_local_rank = int(os.environ["LOCAL_RANK"])
+        ddp_world_size = int(os.environ["WORLD_SIZE"])
+    else:
+        ddp_rank, ddp_local_rank, ddp_world_size = 0, 0, 1
+
+    if is_ddp and device_type == "cuda":
+        device = torch.device("cuda", ddp_local_rank)
+        torch.cuda.set_device(device)  # make "cuda" default to this device
+        dist.init_process_group(backend="nccl", device_id=device)
+        dist.barrier()
+    else:
+        device = torch.device(device_type)  # mps|cpu
+
+    print0(f"Distributed world size: {ddp_world_size}")
 
     teacher_global_rank = train_world_size
     is_student = ddp_rank < train_world_size

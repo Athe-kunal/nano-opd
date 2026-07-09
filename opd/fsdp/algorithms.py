@@ -33,10 +33,11 @@ def student_topk_indices(
     T = student_logits.shape[1]
     chunk = _effective_chunk(T, chunk_size)
     parts = []
-    with torch.no_grad():
-        for t0, t1 in _chunk_range(T, chunk):
-            _, idx = student_logits[:, t0:t1].topk(K, dim=-1)
-            parts.append(idx)
+
+    for t0, t1 in _chunk_range(T, chunk):
+        curr_student_logits = student_logits[:,t0:t1]
+        with torch.no_grad():
+            parts.append(curr_student_logits.topk(K, dim=-1).indices)
     return torch.cat(parts, dim=1)
 
 

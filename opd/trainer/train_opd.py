@@ -320,7 +320,6 @@ if __name__ == "__main__":
                     is_teacher=is_teacher,
                     student_logits=student_logits if is_student else None,
                     teacher_logits=teacher_logits,
-                    input_ids=mb_ids[:, 1:] if is_student else None,
                     B=mb_ids.shape[0],
                     T=mb_ids.shape[1] - 1,
                     K=args.distill_top_k,
@@ -330,12 +329,12 @@ if __name__ == "__main__":
                     all_group=all_group,
                     device=device,
                 )
-                topk_idx             = topk["topk_idx"]
-                t_logprobs           = topk["t_logprobs"]
-                student_topk_idx     = topk["student_topk_idx"]
-                teacher_topk_idx     = topk["teacher_topk_idx"]
-                t_logprobs_at_student = topk["t_logprobs_at_student"]
-                teacher_own_logprobs  = topk["teacher_own_logprobs"]
+                topk_idx             = topk.topk_idx
+                t_logprobs           = topk.t_logprobs
+                student_topk_idx     = topk.student_topk_idx
+                teacher_topk_idx     = topk.teacher_topk_idx
+                t_logprobs_at_student = topk.t_logprobs_at_student
+                teacher_own_logprobs  = topk.teacher_own_logprobs
 
                 # -- Student: compute TIS weights then loss and backward --
                 if is_student:

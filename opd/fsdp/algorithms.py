@@ -26,18 +26,24 @@ def _logprobs_at(logits_slice: torch.Tensor, idx: torch.Tensor, lse: torch.Tenso
 
 def student_topk_indices(
     student_logits: torch.Tensor,   # [B, T, V]
+    input_ids: torch.Tensor,  #[B,T]
     K: int,
     chunk_size: int = -1,
-) -> torch.Tensor:                  # [B, T, K]
+) -> tuple[torch.Tensor,torch.Tensor]:                  # [B, T, K]
     """Select top-K vocab indices from student logits (no grad)."""
     T = student_logits.shape[1]
     chunk = _effective_chunk(T, chunk_size)
     parts = []
-    with torch.no_grad():
-        for t0, t1 in _chunk_range(T, chunk):
-            _, idx = student_logits[:, t0:t1].topk(K, dim=-1)
-            parts.append(idx)
-    return torch.cat(parts, dim=1)
+    gathered_logits = []
+   
+    for t0, t1 in _chunk_range(T, chunk):
+        curr_student_logits = student_logits[:,t0:t1]
+        curr_input_ids = input_ids[:,t0:t1]
+        with torch.no_grad():
+            parts.append(curr_student_logits.topk(K, dim=-1).indices)
+        lp = torch.log_softmax(curr_student_logits.float(), dim=-1)
+        gathered_logits.append(torch.gather(lp,dim=-1,index=curr_input_ids.unsqueeze(-1)).squeeze(-1))
+    return torch.cat(parts, dim=1), torch.cat(gathered_logits,dim=1)
 
 
 def teacher_logprobs_at_indices(

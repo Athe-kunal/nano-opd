@@ -14,7 +14,7 @@ from opd.fsdp.algorithms import (
     student_logprobs_at_indices,
     student_logprob_at_sampled_tokens,
 )
-from opd.trainer.distillation_utils import broadcast_minibatch, exchange_topk
+from opd.trainer.distillation_utils import broadcast_minibatch, exchange_topk, exchange_sampled_teacher_logprob
 from opd.trainer.setup_utils import init_distributed, build_student, build_teacher, init_vllm_transfer
 from opd.metrics import (
     compute_overlap_ratio,
@@ -165,9 +165,9 @@ if __name__ == "__main__":
     # Loss function and top-K selection
     loss_fn = ALGORITHMS[args.algorithm]
     # reverse_kl and jsd weight by the student distribution → student selects top-K
-    # forward_kl weights by the teacher distribution → teacher selects top-K
+    # forward_kl and mopd_loss weight by the teacher distribution → teacher selects top-K
     select_topk_by: Literal["student", "teacher"] = (
-        "teacher" if args.algorithm == "forward_kl" else "student"
+        "teacher" if args.algorithm in ("forward_kl", "mopd_loss") else "student"
     )
 
     # -----------------------------------------------------------------------------
@@ -276,6 +276,44 @@ if __name__ == "__main__":
                     teacher_logits = teacher.get_logits(mb_ids, mb_attn)[:, :-1]
                 else:
                     teacher_logits = None
+                if args.algorithm == "mopd_pg_loss":
+                    # -- PG form (Eq. 3-4): no top-K exchange, just the sampled
+                    # token's log-prob under each policy. mb_ids is already on
+                    # every rank (broadcast above), so sampled_ids needs no
+                    # extra communication — only the teacher's [B, T-1] logprob
+                    # at those ids crosses the wire.
+                    sampled_ids = mb_ids[:, 1:]                             # [B, T-1]
+                    t_logprob = exchange_sampled_teacher_logprob(
+                        is_teacher=is_teacher,
+                        teacher_logits=teacher_logits,
+                        token_ids=sampled_ids,
+                        B=mb_ids.shape[0],
+                        T=mb_ids.shape[1] - 1,
+                        t_chunk=args.teacher_chunk_size,
+                        teacher_global_rank=teacher_global_rank,
+                        all_group=all_group,
+                        device=device,
+                    )
+
+                    if is_student:
+                        s_logprob = student_logprobs_at_indices(
+                            student_logits, sampled_ids.unsqueeze(-1), args.student_chunk_size
+                        ).squeeze(-1)                                      # [B, T-1], grad-carrying
+                        shift_mask = mb_mask[:, 1:]                        # [B, T-1]
+
+                        if args.tis_clip > 0.0:
+                            s_lp_sampled = student_logprob_at_sampled_tokens(student_logits, sampled_ids)
+                            inf_lp_shifted = mb_inf_lp[:, 1:].to(s_lp_sampled.dtype)
+                            tis_weights = (s_lp_sampled - inf_lp_shifted).exp().clamp(max=args.tis_clip)
+                        else:
+                            tis_weights = None
+
+                        loss = loss_fn(s_logprob, t_logprob, shift_mask, tis_weights=tis_weights) / n_mb
+                        student._scale_loss(loss).backward()
+                        total_loss += loss.item()
+                        n_batches  += 1
+                    continue
+
                 topk = exchange_topk(
                     select_topk_by=select_topk_by,
                     is_student=is_student,

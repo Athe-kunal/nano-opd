@@ -15,7 +15,11 @@ from opd.fsdp.algorithms import (
     teacher_logprobs_at_indices,
     teacher_topk_logprobs,
 )
-from opd.trainer.distillation_utils import broadcast_minibatch
+from opd.trainer.distillation_utils import (
+    broadcast_minibatch,
+    exchange_mopd_pg_packed,
+    pack_response_logits,
+)
 from opd.trainer.setup_utils import init_distributed, build_student, build_teacher, init_vllm_transfer
 from opd.envs.opsd_dataset import OPSDMathEnv
 from opd.envs.dataset import distributed_opd_loader
@@ -116,38 +120,6 @@ def prepare_teacher_batch(rollouts, tokenizer, device):
         "attention_mask": torch.tensor(attn_masks,   dtype=torch.long,  device=device),
         "response_mask":  torch.tensor(padded_masks, dtype=torch.float, device=device),
     }
-
-
-def pack_response_logits(logits, shift_mask):
-    """Extract response-position logits into a compact [B, R_max, V] tensor.
-
-    Student and teacher process sequences of different lengths (teacher prompt
-    is longer due to the injected reference solution). To align both
-    distributions at response token positions, this removes prompt positions
-    and packs the result into a dense tensor.
-
-    Args:
-        logits:     [B, T-1, V] — model output logits (already shifted).
-        shift_mask: [B, T-1]    — float mask, 1 at response positions.
-
-    Returns:
-        resp_logits:  [B, R_max, V]
-        compact_mask: [B, R_max] — 1 where response tokens exist.
-    """
-    B, _, V = logits.shape
-    resp_counts = shift_mask.long().sum(dim=1)
-    R_max = int(resp_counts.max().item())
-    if R_max == 0:
-        return logits.new_zeros(B, 0, V), shift_mask.new_zeros(B, 0)
-
-    out          = logits.new_zeros(B, R_max, V)
-    compact_mask = torch.zeros(B, R_max, dtype=torch.float, device=logits.device)
-    for b in range(B):
-        r_b = int(resp_counts[b].item())
-        if r_b > 0:
-            out[b, :r_b]          = logits[b][shift_mask[b].bool()]
-            compact_mask[b, :r_b] = 1.0
-    return out, compact_mask
 
 
 def broadcast_teacher_inputs(is_student, t_mb_ids, t_mb_attn, t_mb_mask, device, all_group):
@@ -336,7 +308,7 @@ if __name__ == "__main__":
     # sum means we need tokens where the teacher has non-negligible probability).
     loss_fn = ALGORITHMS[args.algorithm]
     select_topk_by: Literal["student", "teacher"] = (
-        "teacher" if args.algorithm == "forward_kl" else "student"
+        "teacher" if args.algorithm in ("forward_kl", "mopd_loss") else "student"
     )
     K = args.distill_top_k
 
@@ -468,6 +440,7 @@ if __name__ == "__main__":
                 )
 
                 # -- Student forward (with grad) --
+                is_pg = args.algorithm == "mopd_pg_loss"
                 if is_student:
                     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                         student_logits = student.model(
@@ -475,11 +448,20 @@ if __name__ == "__main__":
                         ).logits[:, :-1]                    # [B, T_s-1, V]
 
                     s_shift_mask = mb_mask[:, 1:]           # [B, T_s-1]
-                    s_resp, s_compact_mask = pack_response_logits(student_logits, s_shift_mask)
+                    if is_pg:
+                        # PG form only needs the sampled token's log-prob, not the
+                        # full top-K distribution — skip packing [B, T_s-1, V] into
+                        # [B, R_max, V], which would materialise a same-sized copy
+                        # of the logits for nothing.
+                        s_resp = s_compact_mask = None
+                        R_max_local = int(s_shift_mask.long().sum(dim=1).max().item())
+                    else:
+                        s_resp, s_compact_mask = pack_response_logits(student_logits, s_shift_mask)
+                        R_max_local = s_resp.shape[1]
 
                 # -- Broadcast R_max so teacher can allocate matching tensors --
                 R_max_t = torch.tensor(
-                    [s_resp.shape[1] if is_student else 0], dtype=torch.long, device=device
+                    [R_max_local if is_student else 0], dtype=torch.long, device=device
                 )
                 dist.broadcast(R_max_t, src=0, group=all_group)
                 R_max = int(R_max_t.item())
@@ -493,18 +475,55 @@ if __name__ == "__main__":
                     t_shift_mask = t_mb_mask[:, 1:]
                     with torch.no_grad():
                         teacher_logits = teacher.get_logits(t_mb_ids, t_mb_attn)[:, :-1]
-                    t_resp, t_compact_mask = pack_response_logits(teacher_logits, t_shift_mask)
-                    if t_resp.shape[1] < R_max:
-                        pad_len = R_max - t_resp.shape[1]
-                        t_resp = torch.cat(
-                            [t_resp, t_resp.new_zeros(t_resp.shape[0], pad_len, t_resp.shape[-1])], dim=1
-                        )
-                        t_compact_mask = torch.cat(
-                            [t_compact_mask, t_compact_mask.new_zeros(t_compact_mask.shape[0], pad_len)], dim=1
-                        )
-                    elif t_resp.shape[1] > R_max:
-                        t_resp         = t_resp[:, :R_max]
-                        t_compact_mask = t_compact_mask[:, :R_max]
+                    if not is_pg:
+                        t_resp, t_compact_mask = pack_response_logits(teacher_logits, t_shift_mask)
+                        if t_resp.shape[1] < R_max:
+                            pad_len = R_max - t_resp.shape[1]
+                            t_resp = torch.cat(
+                                [t_resp, t_resp.new_zeros(t_resp.shape[0], pad_len, t_resp.shape[-1])], dim=1
+                            )
+                            t_compact_mask = torch.cat(
+                                [t_compact_mask, t_compact_mask.new_zeros(t_compact_mask.shape[0], pad_len)], dim=1
+                            )
+                        elif t_resp.shape[1] > R_max:
+                            t_resp         = t_resp[:, :R_max]
+                            t_compact_mask = t_compact_mask[:, :R_max]
+
+                # -- PG form: no top-K exchange at all, just the sampled-token
+                # log-prob under each policy, packed to response positions. --
+                if is_pg:
+                    B = mb_ids.shape[0]
+                    pg = exchange_mopd_pg_packed(
+                        is_student=is_student, is_teacher=is_teacher,
+                        student_logits=student_logits if is_student else None,
+                        teacher_logits=teacher_logits if is_teacher else None,
+                        student_ids=mb_ids if is_student else None,
+                        teacher_ids=t_mb_ids if is_teacher else None,
+                        s_shift_mask=s_shift_mask if is_student else None,
+                        t_shift_mask=t_shift_mask if is_teacher else None,
+                        R_max=R_max, B=B,
+                        t_chunk=args.teacher_chunk_size,
+                        teacher_global_rank=teacher_global_rank, all_group=all_group, device=device,
+                    )
+                    if is_student:
+                        effective_mask = pg["s_compact_mask"] * pg["t_compact_mask"]
+                        if effective_mask.sum() == 0:
+                            print0(f"[warn mb] effective_mask is all-zero: s_mask={pg['s_compact_mask'].sum().item():.0f} t_mask={pg['t_compact_mask'].sum().item():.0f}", flush=True)
+
+                        tis_weights = None
+                        if args.tis_clip > 0.0:
+                            sampled_ids    = mb_ids[:, 1:]
+                            s_lp_sampled   = student_logprob_at_sampled_tokens(student_logits, sampled_ids)
+                            inf_lp_shifted = mb_inf_lp[:, 1:].to(s_lp_sampled.dtype)
+                            tis_full       = (s_lp_sampled - inf_lp_shifted).exp().clamp(max=args.tis_clip)
+                            tis_resp, _    = pack_response_logits(tis_full.unsqueeze(-1), s_shift_mask)
+                            tis_weights    = tis_resp[..., 0]
+
+                        loss = loss_fn(pg["s_logprob"], pg["t_logprob"], effective_mask, tis_weights=tis_weights) / n_mb
+                        student._scale_loss(loss).backward()
+                        total_loss += loss.item()
+                        n_batches  += 1
+                    continue
 
                 # -- Top-K selection and log-prob computation --
                 B = mb_ids.shape[0]

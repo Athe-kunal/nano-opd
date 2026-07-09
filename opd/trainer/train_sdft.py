@@ -14,7 +14,13 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from opd.common import compute_cleanup, print0
 from opd.loss import ALGORITHMS
 from opd.fsdp.algorithms import student_logprob_at_sampled_tokens
-from opd.trainer.distillation_utils import broadcast_minibatch, broadcast_teacher_inputs, exchange_topk
+from opd.trainer.distillation_utils import (
+    broadcast_minibatch,
+    broadcast_teacher_inputs,
+    exchange_mopd_pg_packed,
+    exchange_topk,
+    pack_response_logits,
+)
 from opd.trainer.setup_utils import (
     init_distributed,
     build_student,
@@ -146,36 +152,6 @@ def prepare_teacher_batch(rollouts, tokenizer, device):
     }
 
 
-def pack_response_logits(logits, shift_mask):
-    """Extract response-position logits into a compact [B, R_max, V] tensor.
-
-    Student and teacher process sequences of different lengths (teacher prompt
-    is longer due to the injected demonstration). To align both distributions
-    at response token positions, this removes prompt positions and packs the
-    result into a dense tensor.
-
-    Args:
-        logits:     [B, T-1, V] — model output logits (already shifted).
-        shift_mask: [B, T-1]    — float mask, 1 at response positions.
-
-    Returns:
-        resp_logits:  [B, R_max, V]
-        compact_mask: [B, R_max] — 1 where response tokens exist.
-    """
-    B, _, V = logits.shape
-    resp_counts = shift_mask.long().sum(dim=1)
-    R_max = int(resp_counts.max().item())
-    if R_max == 0:
-        return logits.new_zeros(B, 0, V), shift_mask.new_zeros(B, 0)
-
-    out = logits.new_zeros(B, R_max, V)
-    compact_mask = torch.zeros(B, R_max, dtype=torch.float, device=logits.device)
-    for b in range(B):
-        r_b = int(resp_counts[b].item())
-        if r_b > 0:
-            out[b, :r_b] = logits[b][shift_mask[b].bool()]
-            compact_mask[b, :r_b] = 1.0
-    return out, compact_mask
 
 
 @torch.no_grad()
@@ -263,31 +239,67 @@ def _align_to_rmax(t_resp, t_compact_mask, R_max):
 
 def _minibatch_exchange(is_student, is_teacher, mb_ids, mb_attn, mb_mask,
                         t_mb_ids, t_mb_attn, t_mb_mask, student_model, teacher,
-                        select_topk_by, K, args, all_group, teacher_global_rank, device):
-    """Student + teacher forward, then top-K exchange. Returns (tk, s_resp, s_compact_mask, s_shift_mask, student_logits)."""
+                        select_topk_by, K, args, all_group, teacher_global_rank, device, is_pg=False):
+    """Student + teacher forward, then top-K exchange (or, for MOPD-PG, the
+    lighter sampled-token-only exchange). Returns
+    (tk, s_resp, s_compact_mask, s_shift_mask, student_logits).
+
+    When is_pg=True: s_resp/s_compact_mask are None (never packed — the PG
+    form doesn't need the full top-K distribution) and tk holds
+    {"s_logprob", "t_logprob", "s_compact_mask", "t_compact_mask"} instead of
+    the top-K keys.
+    """
     if is_student:
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             student_logits = student_model(input_ids=mb_ids, attention_mask=mb_attn).logits[:, :-1]
         s_shift_mask = mb_mask[:, 1:]
-        s_resp, s_compact_mask = pack_response_logits(student_logits, s_shift_mask)
+        if is_pg:
+            s_resp = s_compact_mask = s_ids_resp = None
+            R_max_local = int(s_shift_mask.long().sum(dim=1).max().item())
+        else:
+            s_resp, s_compact_mask = pack_response_logits(student_logits, s_shift_mask)
+            # exchange_topk needs input_ids aligned to s_resp's packed [B, R, V]
+            # positions (for the sampled-token TIS gather), not the raw [B, T-1]
+            # sequence — pack the sampled token ids the same way as the logits.
+            s_ids_resp, _ = pack_response_logits(mb_ids[:, 1:].unsqueeze(-1).float(), s_shift_mask)
+            s_ids_resp = s_ids_resp.squeeze(-1).long()
+            R_max_local = s_resp.shape[1]
     else:
-        student_logits = s_shift_mask = s_resp = s_compact_mask = None
+        student_logits = s_shift_mask = s_resp = s_compact_mask = s_ids_resp = None
+        R_max_local = 0
 
-    R_max_t = torch.tensor([s_resp.shape[1] if is_student else 0], dtype=torch.long, device=device)
+    R_max_t = torch.tensor([R_max_local if is_student else 0], dtype=torch.long, device=device)
     dist.broadcast(R_max_t, src=0, group=all_group)
     R_max = int(R_max_t.item())
 
     if is_teacher:
         with torch.no_grad():
             teacher_logits = teacher.get_logits(t_mb_ids, t_mb_attn)[:, :-1]
-        t_resp, t_compact_mask = pack_response_logits(teacher_logits, t_mb_mask[:, 1:])
-        t_resp, t_compact_mask = _align_to_rmax(t_resp, t_compact_mask, R_max)
+        t_shift_mask = t_mb_mask[:, 1:]
+        if not is_pg:
+            t_resp, t_compact_mask = pack_response_logits(teacher_logits, t_shift_mask)
+            t_resp, t_compact_mask = _align_to_rmax(t_resp, t_compact_mask, R_max)
     else:
-        t_resp = t_compact_mask = None
+        teacher_logits = t_shift_mask = t_resp = t_compact_mask = None
+
+    if is_pg:
+        tk = exchange_mopd_pg_packed(
+            is_student=is_student, is_teacher=is_teacher,
+            student_logits=student_logits if is_student else None,
+            teacher_logits=teacher_logits if is_teacher else None,
+            student_ids=mb_ids if is_student else None,
+            teacher_ids=t_mb_ids if is_teacher else None,
+            s_shift_mask=s_shift_mask if is_student else None,
+            t_shift_mask=t_shift_mask if is_teacher else None,
+            R_max=R_max, B=mb_ids.shape[0],
+            t_chunk=args.teacher_chunk_size,
+            teacher_global_rank=teacher_global_rank, all_group=all_group, device=device,
+        )
+        return tk, s_resp, s_compact_mask, s_shift_mask, student_logits
 
     tk = exchange_topk(
         select_topk_by=select_topk_by, is_student=is_student, is_teacher=is_teacher,
-        student_logits=s_resp, teacher_logits=t_resp, t_compact_mask=t_compact_mask,
+        student_logits=s_resp, teacher_logits=t_resp, input_ids=s_ids_resp, t_compact_mask=t_compact_mask,
         B=mb_ids.shape[0], T=R_max, K=K,
         s_chunk=args.student_chunk_size, t_chunk=args.teacher_chunk_size,
         teacher_global_rank=teacher_global_rank, all_group=all_group, device=device,
@@ -668,7 +680,7 @@ if __name__ == "__main__":
     # sum means we only need tokens where the student has mass).
     loss_fn = ALGORITHMS[args.algorithm]
     select_topk_by: Literal["student", "teacher"] = (
-        "teacher" if args.algorithm == "forward_kl" else "student"
+        "teacher" if args.algorithm in ("forward_kl", "mopd_loss") else "student"
     )
     K = args.distill_top_k
 
@@ -799,14 +811,38 @@ if __name__ == "__main__":
                 mb_ids, mb_attn = broadcast_minibatch(is_student, mb_ids, mb_attn, device, all_group)
                 t_mb_ids, t_mb_attn, t_mb_mask = broadcast_teacher_inputs(is_student, t_mb_ids, t_mb_attn, t_mb_mask, device, all_group)
 
+                is_pg = args.algorithm == "mopd_pg_loss"
                 tk, s_resp, s_compact_mask, s_shift_mask, student_logits = _minibatch_exchange(
                     is_student, is_teacher, mb_ids, mb_attn, mb_mask,
                     t_mb_ids, t_mb_attn, t_mb_mask,
                     student.model if is_student else None, teacher if is_teacher else None,
                     select_topk_by, K, args, all_group, teacher_global_rank, device,
+                    is_pg=is_pg,
                 )
 
-                if is_student:
+                if is_student and is_pg:
+                    # PG form: tk holds {"s_logprob","t_logprob",...} — sampled-token
+                    # log-probs only, no top-K distribution to gather from.
+                    effective_mask = apply_token_skip_mask(
+                        tk["s_compact_mask"] * tk["t_compact_mask"], args.num_loss_tokens_to_skip
+                    )
+                    if effective_mask.sum() == 0:
+                        print0(f"[warn mb] effective_mask is all-zero: s_mask={tk['s_compact_mask'].sum().item():.0f} t_mask={tk['t_compact_mask'].sum().item():.0f}", flush=True)
+
+                    if args.tis_clip > 0.0:
+                        s_lp_sampled = student_logprob_at_sampled_tokens(student_logits, mb_ids[:, 1:])
+                        tis_full = (s_lp_sampled - mb_inf_lp[:, 1:].to(s_lp_sampled.dtype)).exp().clamp(max=args.tis_clip)
+                        tis_resp, _ = pack_response_logits(tis_full.unsqueeze(-1), s_shift_mask)
+                        tis_weights = tis_resp[..., 0]
+                    else:
+                        tis_weights = None
+
+                    loss = loss_fn(tk["s_logprob"], tk["t_logprob"], effective_mask, tis_weights=tis_weights) / args.grad_accum_steps
+                    student._scale_loss(loss).backward()
+                    total_loss += loss.item()
+                    n_batches += 1
+
+                elif is_student:
                     s_log_resp = F.log_softmax(s_resp.float(), dim=-1)
                     s_logprobs = s_log_resp.gather(-1, tk["topk_idx"])
                     effective_mask = apply_token_skip_mask(

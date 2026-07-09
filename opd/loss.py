@@ -117,9 +117,66 @@ def compute_jsd_loss(
     per_token_jsd = jsd_alpha * kl_s + (1.0 - jsd_alpha) * kl_t
     return _masked_token_mean(per_token_jsd, response_mask, tis_weights, kl_clip)
 
+def compute_mopd_loss(
+    student_logprobs: torch.Tensor,         # [B, T, K]
+    teacher_logprobs: torch.Tensor,         # [B, T, K]
+    response_mask: torch.Tensor,            # [B, T]
+    tis_weights: torch.Tensor | None = None,  # [B, T]
+    kl_clip: float | None = None,
+) -> torch.Tensor:
+    """Top-K MOPD loss: generalized (unnormalized) reverse KL (Eq. 5).
+
+    Reference: https://arxiv.org/pdf/2606.30406
+    MOPD: Multi-Teacher On-Policy Distillation for Capability Integration in LLM Post-Training
+
+    Teacher selects the top-K indices (see select_topk_by="teacher" wiring).
+    Per-token: Σ_k p_s·(log p_s − log p_t) − p_s + p_t.
+    The −p_s + p_t term makes this a Bregman divergence in p_s (min at p_s=p_t
+    pointwise, for any k independently) so, unlike plain top-K reverse KL, no
+    tail/renormalization correction is needed — the K-token sum alone is
+    already unbiased.
+    """
+    student_logprobs = student_logprobs.float()
+    teacher_logprobs = teacher_logprobs.float()
+    student_probs = student_logprobs.exp()
+    teacher_probs = teacher_logprobs.exp()
+
+    per_token = torch.einsum("btk,btk->bt", student_probs, student_logprobs - teacher_logprobs)
+    per_token = per_token - student_probs.sum(dim=-1) + teacher_probs.sum(dim=-1)
+    return _masked_token_mean(per_token, response_mask, tis_weights, kl_clip)
+
+
+def compute_mopd_pg_loss(
+    student_logprob: torch.Tensor,          # [B, T], grad-carrying log π_θ(y_t)
+    teacher_logprob: torch.Tensor,          # [B, T], no-grad log π_φd(y_t)
+    response_mask: torch.Tensor,            # [B, T]
+    tis_weights: torch.Tensor | None = None,  # [B, T]
+    adv_clip: float | None = 5.0,
+) -> torch.Tensor:
+    """Policy-gradient MOPD loss on the sampled token only (Eq. 3-4).
+
+    No top-K exchange needed at all — only the sampled token's log-prob under
+    each policy. The teacher–student log-diff is a stop-gradient advantage;
+    it reweights −log π_θ(y_t) (standard NLL) instead of appearing inside a
+    divergence. Two-sided clip (A_max=5 in the paper) bounds how much a single
+    token can dominate the gradient, same motivation as kl_clip elsewhere.
+    """
+    student_logprob = student_logprob.float()
+    teacher_logprob = teacher_logprob.float().detach()
+
+    advantage = (teacher_logprob - student_logprob.detach())
+    if adv_clip is not None:
+        advantage = advantage.clamp(min=-adv_clip, max=adv_clip)
+
+    per_token = -advantage * student_logprob
+    return _masked_token_mean(per_token, response_mask, tis_weights, kl_clip=None)
+
+
 
 ALGORITHMS = {
     "reverse_kl": compute_reverse_kl_loss,
     "forward_kl": compute_forward_kl_loss,
     "jsd": compute_jsd_loss,
+    "mopd_loss": compute_mopd_loss,
+    "mopd_pg_loss": compute_mopd_pg_loss,
 }

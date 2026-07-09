@@ -19,6 +19,7 @@ from opd.fsdp.algorithms import (
 from opd.trainer.distillation_utils import (
     broadcast_minibatch,
     exchange_mopd_pg_packed,
+    mopd_pg_loss_and_backward,
     pack_response_logits,
 )
 from opd.trainer.setup_utils import init_distributed, build_student, build_teacher, init_vllm_transfer
@@ -570,22 +571,13 @@ if __name__ == "__main__":
                         teacher_global_rank=teacher_global_rank, all_group=all_group, device=device,
                     )
                     if is_student:
-                        effective_mask = pg["s_compact_mask"] * pg["t_compact_mask"] * mb_sd_mask.unsqueeze(1)
-                        if effective_mask.sum() == 0:
-                            print0(f"[warn mb] effective_mask is all-zero: s_mask={pg['s_compact_mask'].sum().item():.0f} t_mask={pg['t_compact_mask'].sum().item():.0f} sd_mask={mb_sd_mask.sum().item():.0f}", flush=True)
-
-                        if args.tis_clip > 0.0:
-                            sampled_ids    = mb_ids[:, 1:]
-                            s_lp_sampled   = student_logprob_at_sampled_tokens(student_logits, sampled_ids)
-                            inf_lp_shifted = mb_inf_lp[:, 1:].to(s_lp_sampled.dtype)
-                            tis_full       = (s_lp_sampled - inf_lp_shifted).exp().clamp(max=args.tis_clip)
-                            tis_resp, _    = pack_response_logits(tis_full.unsqueeze(-1), s_shift_mask)
-                            tis_weights    = tis_resp[..., 0]
-                        else:
-                            tis_weights = None
-
-                        loss = loss_fn(pg["s_logprob"], pg["t_logprob"], effective_mask, tis_weights=tis_weights) / window_size
-                        student._scale_loss(loss).backward()
+                        loss = mopd_pg_loss_and_backward(
+                            student=student, pg=pg, loss_fn=loss_fn,
+                            student_logits=student_logits, sampled_ids=mb_ids[:, 1:], s_shift_mask=s_shift_mask,
+                            inf_lp_shifted=mb_inf_lp[:, 1:] if args.tis_clip > 0.0 else None,
+                            tis_clip=args.tis_clip, divisor=window_size,
+                            extra_mask=mb_sd_mask.unsqueeze(1),
+                        )
                         total_loss += loss.item()
                         n_batches  += 1
 

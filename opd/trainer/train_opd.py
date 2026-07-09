@@ -320,6 +320,7 @@ if __name__ == "__main__":
                     is_teacher=is_teacher,
                     student_logits=student_logits if is_student else None,
                     teacher_logits=teacher_logits,
+                    input_ids=mb_ids[:, 1:] if is_student else None,
                     B=mb_ids.shape[0],
                     T=mb_ids.shape[1] - 1,
                     K=args.distill_top_k,

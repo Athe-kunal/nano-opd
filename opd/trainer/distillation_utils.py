@@ -3,7 +3,9 @@ from typing import Literal
 import torch
 import torch.distributed as dist
 
+from opd.common import print0
 from opd.fsdp.algorithms import (
+    student_logprob_at_sampled_tokens,
     student_logprobs_at_indices,
     student_topk_indices,
     teacher_logprobs_at_indices,
@@ -202,6 +204,52 @@ def exchange_mopd_pg_packed(
     }
 
 
+def mopd_pg_loss_and_backward(
+    *,
+    student,                                # has ._scale_loss(...).backward()
+    pg: dict,                               # from exchange_mopd_pg_packed
+    loss_fn,                                # compute_mopd_pg_loss
+    student_logits: torch.Tensor,           # [B, T_s-1, V], for TIS gather
+    sampled_ids: torch.Tensor,              # [B, T_s-1]
+    s_shift_mask: torch.Tensor,             # [B, T_s-1]
+    inf_lp_shifted: torch.Tensor | None,    # [B, T_s-1], vLLM inference log-probs; None disables TIS
+    tis_clip: float,
+    divisor: float,
+    extra_mask: torch.Tensor | None = None,  # e.g. SDPO's mb_sd_mask.unsqueeze(1)
+    mask_fn=None,                            # e.g. SDFT's apply_token_skip_mask
+    warn: bool = True,
+) -> torch.Tensor:
+    """Shared MOPD-PG loss step for the three packed-response training scripts
+    (SDPO / OPSD / SDFT) — computing the effective mask, TIS weights, calling
+    the loss, and backpropagating was identical across all three call sites.
+
+    Returns the (already backward()-ed) loss tensor for accounting.
+    """
+    effective_mask = pg["s_compact_mask"] * pg["t_compact_mask"]
+    if extra_mask is not None:
+        effective_mask = effective_mask * extra_mask
+    if mask_fn is not None:
+        effective_mask = mask_fn(effective_mask)
+
+    if warn and effective_mask.sum() == 0:
+        print0(
+            f"[warn mb] effective_mask is all-zero: "
+            f"s_mask={pg['s_compact_mask'].sum().item():.0f} t_mask={pg['t_compact_mask'].sum().item():.0f}",
+        )
+
+    if tis_clip > 0.0:
+        s_lp_sampled = student_logprob_at_sampled_tokens(student_logits, sampled_ids)
+        tis_full = (s_lp_sampled - inf_lp_shifted.to(s_lp_sampled.dtype)).exp().clamp(max=tis_clip)
+        tis_resp, _ = pack_response_logits(tis_full.unsqueeze(-1), s_shift_mask)
+        tis_weights = tis_resp[..., 0]
+    else:
+        tis_weights = None
+
+    loss = loss_fn(pg["s_logprob"], pg["t_logprob"], effective_mask, tis_weights=tis_weights) / divisor
+    student._scale_loss(loss).backward()
+    return loss
+
+
 def exchange_topk(
     *,
     select_topk_by: Literal["student", "teacher"],
@@ -234,7 +282,9 @@ def exchange_topk(
         t_compact_mask = torch.ones(B, T, dtype=torch.float32, device=device)
 
     if select_topk_by == "student": #reverse KL
-        topk_idx, student_gathered_logits = student_topk_indices(student_logits, input_ids, K, s_chunk) if is_student else None
+        topk_idx, student_gathered_logits = (
+            student_topk_indices(student_logits, input_ids, K, s_chunk) if is_student else (None, None)
+        )
         topk_idx, h = bcast_or_alloc_async(tensor=topk_idx, is_owner=is_student, shape=(B, T, K), dtype=torch.long, src=0, device=device, group=all_group)
         h.wait()
 
@@ -255,7 +305,9 @@ def exchange_topk(
         t_logprobs_at_student = t_logprobs
 
     else:  # forward_kl: teacher picks top-K
-        student_topk_idx, student_gathered_logits = student_topk_indices(student_logits, input_ids, K, s_chunk) if is_student else None
+        student_topk_idx, student_gathered_logits = (
+            student_topk_indices(student_logits, input_ids, K, s_chunk) if is_student else (None, None)
+        )
         student_topk_idx, h = bcast_or_alloc_async(tensor=student_topk_idx, is_owner=is_student, shape=(B, T, K), dtype=torch.long, src=0, device=device, group=all_group)
         h.wait()
 

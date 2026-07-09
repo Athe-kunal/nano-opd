@@ -19,6 +19,7 @@ from opd.trainer.distillation_utils import (
     broadcast_teacher_inputs,
     exchange_mopd_pg_packed,
     exchange_topk,
+    mopd_pg_loss_and_backward,
     pack_response_logits,
 )
 from opd.trainer.setup_utils import (
@@ -823,22 +824,13 @@ if __name__ == "__main__":
                 if is_student and is_pg:
                     # PG form: tk holds {"s_logprob","t_logprob",...} — sampled-token
                     # log-probs only, no top-K distribution to gather from.
-                    effective_mask = apply_token_skip_mask(
-                        tk["s_compact_mask"] * tk["t_compact_mask"], args.num_loss_tokens_to_skip
+                    loss = mopd_pg_loss_and_backward(
+                        student=student, pg=tk, loss_fn=loss_fn,
+                        student_logits=student_logits, sampled_ids=mb_ids[:, 1:], s_shift_mask=s_shift_mask,
+                        inf_lp_shifted=mb_inf_lp[:, 1:] if args.tis_clip > 0.0 else None,
+                        tis_clip=args.tis_clip, divisor=args.grad_accum_steps,
+                        mask_fn=lambda m: apply_token_skip_mask(m, args.num_loss_tokens_to_skip),
                     )
-                    if effective_mask.sum() == 0:
-                        print0(f"[warn mb] effective_mask is all-zero: s_mask={tk['s_compact_mask'].sum().item():.0f} t_mask={tk['t_compact_mask'].sum().item():.0f}", flush=True)
-
-                    if args.tis_clip > 0.0:
-                        s_lp_sampled = student_logprob_at_sampled_tokens(student_logits, mb_ids[:, 1:])
-                        tis_full = (s_lp_sampled - mb_inf_lp[:, 1:].to(s_lp_sampled.dtype)).exp().clamp(max=args.tis_clip)
-                        tis_resp, _ = pack_response_logits(tis_full.unsqueeze(-1), s_shift_mask)
-                        tis_weights = tis_resp[..., 0]
-                    else:
-                        tis_weights = None
-
-                    loss = loss_fn(tk["s_logprob"], tk["t_logprob"], effective_mask, tis_weights=tis_weights) / args.grad_accum_steps
-                    student._scale_loss(loss).backward()
                     total_loss += loss.item()
                     n_batches += 1
 

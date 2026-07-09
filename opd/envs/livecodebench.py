@@ -13,7 +13,7 @@ import wandb
 from datasets import Dataset, concatenate_datasets, load_dataset
 from skyrl_gym.envs.base_text_env import ConversationType
 
-from opd.common import print0
+from opd.trainer.setup_utils import print0
 from opd.envs.base import OPDEnvBase
 from opd.generator.rollout import generate_rollouts_remote
 

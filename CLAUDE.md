@@ -2,7 +2,7 @@
 
 ## What this library is
 
-**nano-opd** is a **pedagogical and hackable** library for on-policy distillation (OPD) of language models. Every design choice is meant to be readable, modifiable, and understandable. There is no magic framework hiding the training loop — the loop is right there in `train_opd.py` and `train_sdpo.py`, readable top-to-bottom.
+**nano-opd** is a **pedagogical and hackable** library for on-policy distillation (OPD) of language models. Every design choice is meant to be readable, modifiable, and understandable. There is no magic framework hiding the training loop — the loop is right there in `train_opd.py`, `train_sdpo.py`, `train_opsd.py`, and `train_sdft.py`, readable top-to-bottom.
 
 If you are here to learn how on-policy distillation works, you are in the right place. If you are here to swap in a new loss function, a different teacher schedule, or a new dataset, you can do that in a few lines.
 
@@ -22,7 +22,7 @@ This project is **pedagogical first**. When the user asks about any part of the 
 ## Architecture overview
 
 ```
-trainer (FSDP, train_opd.py / train_sdpo.py)
+trainer (FSDP, train_opd.py / train_sdpo.py / train_opsd.py / train_sdft.py)
     │
     ├── student model (FSDP-wrapped, updated by optimizer)
     ├── teacher model (frozen or EMA-updated)
@@ -35,7 +35,7 @@ The trainer and rollout worker are **separate processes** communicating over HTT
 
 ---
 
-## The two training scripts
+## The four training scripts
 
 ### `train_opd.py` — On-Policy Distillation with a separate teacher
 
@@ -48,6 +48,18 @@ The student and a frozen external teacher run in the **same torchrun job** but o
 There is **no separate teacher model**. The teacher is an EMA copy of the student, living as a plain `nn.Module` on every rank. Every rank runs both student and teacher forward passes locally — no cross-rank broadcast of teacher outputs needed.
 
 **Why is this interesting?** The teacher is always chasing the student, so the distillation target is never too far ahead. This is analogous to how target networks work in deep RL (DQN-style).
+
+### `train_opsd.py` — On-Policy Self-Distillation (OPSD)
+
+Also a self-teacher setup (same checkpoint for student and teacher, same rank split as SDPO), but the teacher is **not** an EMA of the student — it is the **frozen initial policy**, conditioned on the problem **plus the ground-truth reference solution**. The student only ever sees the problem. The teacher is never updated during training.
+
+**Why is this interesting?** Because the teacher is frozen, it acts as a fixed regularizer anchoring the student to the pretrained distribution — there's no EMA drift to tune. The paper (Table 3) finds **forward KL** — `KL(p_teacher || p_student)` — consistently outperforms reverse KL and JSD here, so it's the default algorithm. OPSD also introduces `--kl-clip`: per-token pointwise KL clipping, which stops stylistic tokens (which can have much higher KL than content tokens) from dominating the gradient signal — the paper shows this prevents performance collapse on small models.
+
+### `train_sdft.py` — Self-Distillation Fine-Tuning (SDFT)
+
+Another self-teacher setup: the teacher is an EMA copy of the student (like SDPO), but instead of environment feedback, the teacher is conditioned on the question plus a **worked demonstration** pulled from a dataset (science Q&A or tool-use). The default loss is **reverse KL** (paper Eq. 1).
+
+**Why is this interesting?** The demonstration-conditioned teacher tends to produce preamble artifacts (e.g. "Based on the text...") that the student would otherwise learn to mimic even without ever seeing the demonstration itself. SDFT introduces `--num-loss-tokens-to-skip` to mask the first few response tokens from the loss and suppress this ("Learned Artifacts", paper Section 5).
 
 ---
 
@@ -175,19 +187,24 @@ The shift by 1 (`[:, 1:]` on mask, `[:, :-1]` on logits) aligns token t's logits
 | File | Purpose |
 |------|---------|
 | `opd/loss.py` | Reverse KL, forward KL, JSD loss functions |
-| `opd/train_opd.py` | OPD training loop (external frozen teacher) |
-| `opd/train_sdpo.py` | SDPO training loop (EMA self-teacher) |
-| `opd/rollout.py` | vLLM HTTP client, batch preparation, weight sync |
-| `opd/rollout_worker.py` | The vLLM HTTP server that runs in a separate process |
+| `opd/trainer/train_opd.py` | OPD training loop (external frozen teacher) |
+| `opd/trainer/train_sdpo.py` | SDPO training loop (EMA self-teacher, feedback conditioned) |
+| `opd/trainer/train_opsd.py` | OPSD training loop (frozen initial-policy teacher, reference-solution conditioned) |
+| `opd/trainer/train_sdft.py` | SDFT training loop (EMA self-teacher, demonstration conditioned) |
+| `opd/trainer/setup_utils.py` | Distributed init, device/seed setup, model construction, vLLM weight-transfer setup — shared by all four training scripts |
+| `opd/trainer/distillation_utils.py` | Shared minibatch-exchange helpers (top-K exchange, PG exchange, response packing, broadcast utilities) used by OPD/SDPO/OPSD/SDFT |
+| `opd/trainer/sync_teacher.py` | Self-teacher sync strategies (EMA, trust-region, hard-sync, on-policy) used by SDPO and SDFT |
+| `opd/generator/rollout.py` | vLLM HTTP client, batch preparation, weight sync |
+| `opd/generator/rollout_worker.py` | The vLLM HTTP server that runs in a separate process |
 | `opd/fsdp/algorithms.py` | Top-K log-prob selection (chunked, distributed) |
 | `opd/fsdp/model.py` | Student (FSDP-wrapped) and Teacher model classes |
-| `opd/data/dataset.py` | Dataset loading and distributed data loader |
-| `opd/data/dapo.py` | DAPO math dataset exporter |
-| `opd/eval_aime.py` | AIME evaluation (pass@k) |
+| `opd/envs/dataset.py` | Dataset loading and distributed data loader |
+| `opd/envs/dapo_dataset.py` | DAPO math dataset exporter |
+| `opd/eval/eval_math.py` | AIME 2024/2025 and HMMT 2025 evaluation (pass@k) |
 
 ## Good entry points for hacking
 
-- **New loss function**: add a function to `loss.py`, register it in `ALGORITHMS`, add a choice to the `--algorithm` argparse argument in both training scripts.
-- **New dataset**: add a file in `opd/data/`, make it produce `Example` objects (see `dataset.py`), wire it into `build_opd_dataset()`.
-- **Different EMA schedule**: the `update_teacher_ema` function in `train_sdpo.py` is self-contained — swap in a warmup, a cyclical schedule, or a per-layer alpha.
+- **New loss function**: add a function to `loss.py`, register it in `ALGORITHMS`, add a choice to the `--algorithm` argparse argument in the training scripts.
+- **New dataset**: add a file in `opd/envs/`, make it produce environment objects (see `dataset.py`), wire it into `build_opd_dataset()`.
+- **Different EMA schedule**: `EMASyncer` in `opd/trainer/sync_teacher.py` is self-contained — swap in a warmup, a cyclical schedule, or a per-layer alpha. Used by both `train_sdpo.py` and `train_sdft.py` via `build_syncer("ema", ...)`.
 - **Different top-K selection**: `fsdp/algorithms.py` contains the top-K helpers in isolation — easy to swap for top-p, nucleus sampling-style selection, or importance-weighted sampling.

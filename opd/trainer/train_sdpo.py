@@ -9,7 +9,6 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from opd.common import compute_cleanup, print0
 from opd.loss import ALGORITHMS
 from opd.fsdp.algorithms import student_logprob_at_sampled_tokens
 from opd.trainer.distillation_utils import (
@@ -21,7 +20,14 @@ from opd.trainer.distillation_utils import (
     prepare_teacher_batch,
     sync_student_to_teacher,
 )
-from opd.trainer.setup_utils import init_distributed, build_student, build_teacher, init_vllm_transfer
+from opd.trainer.setup_utils import (
+    compute_cleanup,
+    print0,
+    init_distributed,
+    build_student,
+    build_teacher,
+    init_vllm_transfer,
+)
 from opd.trainer.sync_teacher import SYNC_METHODS, build_syncer
 from opd.metrics import (
     compute_overlap_ratio,

@@ -5,7 +5,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
-from opd.common import print0
+from opd.trainer.setup_utils import print0
 from opd.fsdp.algorithms import (
     student_logprob_at_sampled_tokens,
     student_logprobs_at_indices,

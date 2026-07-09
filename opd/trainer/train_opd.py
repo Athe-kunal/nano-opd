@@ -8,14 +8,20 @@ from typing import Literal
 import torch
 import torch.distributed as dist
 
-from opd.common import compute_cleanup, print0
 from opd.loss import ALGORITHMS
 from opd.fsdp.algorithms import (
     student_logprobs_at_indices,
     student_logprob_at_sampled_tokens,
 )
 from opd.trainer.distillation_utils import broadcast_minibatch, exchange_topk, exchange_sampled_teacher_logprob
-from opd.trainer.setup_utils import init_distributed, build_student, build_teacher, init_vllm_transfer
+from opd.trainer.setup_utils import (
+    compute_cleanup,
+    print0,
+    init_distributed,
+    build_student,
+    build_teacher,
+    init_vllm_transfer,
+)
 from opd.metrics import (
     compute_overlap_ratio,
     compute_overlap_token_advantage,

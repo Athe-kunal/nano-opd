@@ -19,23 +19,44 @@ def print0(s="", **kwargs):
         logger.info(s, **kwargs)
 
 
-def autodetect_device_type() -> str:
-    """Prefer CUDA if available, otherwise MPS, otherwise fall back to CPU."""
-    if torch.cuda.is_available():
-        device_type = "cuda"
-    elif torch.backends.mps.is_available():
-        device_type = "mps"
-    else:
-        device_type = "cpu"
-    print0(f"Autodetected device type: {device_type}")
-    return device_type
+def compute_cleanup():
+    """Companion to init_distributed: destroy the process group before exit, if one was created."""
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
 
 
-def compute_init(device_type: str = "cuda") -> tuple[int, int, int, torch.device]:
-    """Seed, precision, and (optional) torch.distributed process-group init.
+@dataclass
+class DistributedContext:
+    ddp_rank: int
+    ddp_local_rank: int
+    ddp_world_size: int
+    device: torch.device
+    train_world_size: int
+    teacher_global_rank: int
+    is_student: bool
+    is_teacher: bool
+    master_process: bool
+    student_group: Any   # dist.ProcessGroup
+    all_group: Any       # dist.ProcessGroup
 
-    Returns (ddp_rank, ddp_local_rank, ddp_world_size, device).
+
+def init_distributed(device_type_arg: str, train_world_size: int) -> DistributedContext:
+    """Init torch.distributed and partition ranks into student and teacher sets.
+
+    Ranks 0..train_world_size-1 are student (FSDP) ranks.
+    Rank train_world_size is the teacher rank.
     """
+    if device_type_arg == "":
+        # Prefer CUDA if available, otherwise MPS, otherwise fall back to CPU.
+        if torch.cuda.is_available():
+            device_type = "cuda"
+        elif torch.backends.mps.is_available():
+            device_type = "mps"
+        else:
+            device_type = "cpu"
+        print0(f"Autodetected device type: {device_type}")
+    else:
+        device_type = device_type_arg
     assert device_type in ("cuda", "mps", "cpu"), "Invalid device type atm"
     if device_type == "cuda":
         assert torch.cuda.is_available(), "Your PyTorch installation is not configured for CUDA but device_type is 'cuda'"
@@ -66,38 +87,6 @@ def compute_init(device_type: str = "cuda") -> tuple[int, int, int, torch.device
         device = torch.device(device_type)  # mps|cpu
 
     print0(f"Distributed world size: {ddp_world_size}")
-    return ddp_rank, ddp_local_rank, ddp_world_size, device
-
-
-def compute_cleanup():
-    """Companion to compute_init: destroy the process group before exit, if one was created."""
-    if dist.is_available() and dist.is_initialized():
-        dist.destroy_process_group()
-
-
-@dataclass
-class DistributedContext:
-    ddp_rank: int
-    ddp_local_rank: int
-    ddp_world_size: int
-    device: torch.device
-    train_world_size: int
-    teacher_global_rank: int
-    is_student: bool
-    is_teacher: bool
-    master_process: bool
-    student_group: Any   # dist.ProcessGroup
-    all_group: Any       # dist.ProcessGroup
-
-
-def init_distributed(device_type_arg: str, train_world_size: int) -> DistributedContext:
-    """Init torch.distributed and partition ranks into student and teacher sets.
-
-    Ranks 0..train_world_size-1 are student (FSDP) ranks.
-    Rank train_world_size is the teacher rank.
-    """
-    device_type = autodetect_device_type() if device_type_arg == "" else device_type_arg
-    ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 
     teacher_global_rank = train_world_size
     is_student = ddp_rank < train_world_size

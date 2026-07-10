@@ -2,50 +2,39 @@
 
 import argparse
 import json
-import os
 import random
 import time
 from typing import Literal
 
 import torch
 import torch.nn.functional as F
-import torch.distributed as dist
 
 from opd.loss import ALGORITHMS
 from opd.fsdp.algorithms import student_logprob_at_sampled_tokens
 from opd.trainer.distillation_utils import (
-    broadcast_minibatch,
-    broadcast_teacher_inputs,
     minibatch_exchange,
     mopd_pg_loss_and_backward,
     pack_response_logits,
-    prepare_teacher_batch,
-    sync_student_to_teacher,
 )
+from opd.trainer.logging_utils import finish_wandb, init_wandb, log_eval_metrics, should_use_wandb
 from opd.trainer.setup_utils import (
     assert_prompts_divisible,
-    broadcast_n_minibatches,
     build_student,
     build_teacher,
     compute_cleanup,
     init_distributed,
     init_vllm_transfer,
-    log_step_metrics,
-    maybe_save_checkpoint,
     print0,
     topk_selector_for,
 )
+from opd.trainer.trainer_utils import MinibatchTensors, StepAccumulator, Trainer
 from opd.trainer.sync_teacher import SYNC_METHODS, build_syncer
 from opd.metrics import (
     compute_overlap_ratio,
     compute_overlap_token_advantage,
     compute_entropy_gap,
 )
-from opd.generator.rollout import (
-    generate_rollouts_remote,
-    sync_weights_to_vllm_inplace,
-    prepare_batch,
-)
+from opd.generator.rollout import generate_rollouts_remote
 from opd.envs.dataset import distributed_opd_loader
 from opd.envs.sdft_science import load_sdft_science, load_sdft_science_eval, grade_science_response
 from opd.envs.sdft_tooluse import load_sdft_tooluse, load_sdft_tooluse_eval, grade_tooluse_response
@@ -387,13 +376,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
-    use_wandb = os.environ.get("USE_WANDB", "1").strip().lower() not in (
-        "0",
-        "false",
-        "no",
-    )
-    if use_wandb:
-        import wandb
+    use_wandb = should_use_wandb()
 
     # -------------------------------------------------------------------------
     # Distributed init — same rank split as OPD/SDPO:
@@ -404,7 +387,6 @@ if __name__ == "__main__":
     ddp_world_size = ctx.ddp_world_size
     device = ctx.device
     train_world_size = ctx.train_world_size
-    teacher_global_rank = ctx.teacher_global_rank
     is_student = ctx.is_student
     is_teacher = ctx.is_teacher
     master_process = ctx.master_process
@@ -420,26 +402,24 @@ if __name__ == "__main__":
     )
     print0(f"Loss token skip: {args.num_loss_tokens_to_skip}")
 
-    if master_process and use_wandb:
-        wandb.init(
-            project="nano-opd",
-            name=args.run_name,
-            config={
-                "student_model": args.student_model,
-                "algorithm": args.algorithm,
-                "distill_top_k": args.distill_top_k,
-                "sync_method": args.sync_method,
-                "ema_alpha": args.ema_alpha,
-                "lr": args.lr,
-                "num_steps": args.num_steps,
-                "prompts_per_step": args.prompts_per_step,
-                "train_batch_size": args.train_batch_size,
-                "epochs": args.epochs,
-                "max_new_tokens": args.max_new_tokens,
-                "temperature": args.temperature,
-                "num_loss_tokens_to_skip": args.num_loss_tokens_to_skip,
-            },
-        )
+    init_wandb(
+        args.run_name, master_process, use_wandb,
+        config={
+            "student_model": args.student_model,
+            "algorithm": args.algorithm,
+            "distill_top_k": args.distill_top_k,
+            "sync_method": args.sync_method,
+            "ema_alpha": args.ema_alpha,
+            "lr": args.lr,
+            "num_steps": args.num_steps,
+            "prompts_per_step": args.prompts_per_step,
+            "train_batch_size": args.train_batch_size,
+            "epochs": args.epochs,
+            "max_new_tokens": args.max_new_tokens,
+            "temperature": args.temperature,
+            "num_loss_tokens_to_skip": args.num_loss_tokens_to_skip,
+        },
+    )
 
     assert_prompts_divisible(args.prompts_per_step, train_world_size)
 
@@ -487,7 +467,7 @@ if __name__ == "__main__":
     # sum means we only need tokens where the student has mass).
     loss_fn = ALGORITHMS[args.algorithm]
     select_topk_by: Literal["student", "teacher"] = topk_selector_for(args.algorithm)
-    K = args.distill_top_k
+    top_k = args.distill_top_k
 
     # -------------------------------------------------------------------------
     # vLLM weight-transfer setup
@@ -497,6 +477,12 @@ if __name__ == "__main__":
         train_world_size=train_world_size,
         master_process=master_process,
         all_group=all_group,
+    )
+
+    trainer = Trainer(
+        args, ctx,
+        student if is_student else None, teacher if is_teacher else None,
+        model_update_group, use_wandb,
     )
 
     # -------------------------------------------------------------------------
@@ -514,11 +500,76 @@ if __name__ == "__main__":
         loader_iter = iter(loader)
 
     # -------------------------------------------------------------------------
+    # Per-minibatch exchange + loss + backward.
+    def do_minibatch(mb: MinibatchTensors, acc: StepAccumulator) -> None:
+        # How many minibatches are in this accumulation window? The last
+        # window may be smaller than G if n_mb % G != 0 — same adaptive-window
+        # divisor SDPO uses, so a short final window isn't under-weighted.
+        G = args.grad_accum_steps
+        window_start = (mb.mb_idx // G) * G
+        window_size = min(window_start + G, mb.n_mb) - window_start
+
+        is_pg = args.algorithm == "mopd_pg_loss"
+        result = minibatch_exchange(
+            ctx, mb.mb_ids, mb.mb_attn, mb.mb_mask,
+            mb.t_mb_ids, mb.t_mb_attn, mb.t_mb_mask,
+            student if is_student else None, teacher if is_teacher else None,
+            select_topk_by, top_k, args.student_chunk_size, args.teacher_chunk_size,
+            is_pg=is_pg,
+        )
+
+        if is_student and result.is_pg:
+            # PG form: result.pg holds sampled-token log-probs only, no
+            # top-K distribution to gather from.
+            loss = mopd_pg_loss_and_backward(
+                student=student, pg=result.pg, loss_fn=loss_fn,
+                student_logits=result.student_logits, sampled_ids=mb.mb_ids[:, 1:], s_shift_mask=result.s_shift_mask,
+                inf_lp_shifted=mb.mb_inf_lp[:, 1:] if args.tis_clip > 0.0 else None,
+                tis_clip=args.tis_clip, divisor=window_size,
+                mask_fn=lambda m: apply_token_skip_mask(m, args.num_loss_tokens_to_skip),
+            )
+            acc.add_loss(loss)
+
+        elif is_student:
+            tk = result.topk
+            student_logits = result.student_logits
+            s_log_resp = F.log_softmax(result.s_resp.float(), dim=-1)
+            s_logprobs = s_log_resp.gather(-1, tk.topk_idx)
+            effective_mask = apply_token_skip_mask(
+                result.s_compact_mask * tk.t_compact_mask, args.num_loss_tokens_to_skip
+            )
+
+            if effective_mask.sum() == 0:
+                print0(f"[warn mb] effective_mask is all-zero: s_mask={result.s_compact_mask.sum().item():.0f} t_mask={tk.t_compact_mask.sum().item():.0f}", flush=True)
+
+            if args.tis_clip > 0.0:
+                s_lp_sampled = student_logprob_at_sampled_tokens(student_logits, mb.mb_ids[:, 1:])
+                tis_full = (s_lp_sampled - mb.mb_inf_lp[:, 1:].to(s_lp_sampled.dtype)).exp().clamp(max=args.tis_clip)
+                tis_resp, _ = pack_response_logits(tis_full.unsqueeze(-1).expand_as(student_logits), result.s_shift_mask)
+                tis_weights = tis_resp[..., 0]
+            else:
+                tis_weights = None
+
+            loss = loss_fn(s_logprobs, tk.t_logprobs, effective_mask, tis_weights=tis_weights) / window_size
+            student._scale_loss(loss).backward()
+            acc.add_loss(loss)
+
+            with torch.no_grad():
+                s_lp_metrics = s_log_resp.gather(-1, tk.student_topk_idx)
+                ratio = compute_overlap_ratio(tk.student_topk_idx, tk.teacher_topk_idx).item()
+                advantage = compute_overlap_token_advantage(
+                    tk.student_topk_idx, tk.teacher_topk_idx, s_lp_metrics, tk.t_logprobs_at_student
+                ).item()
+                entropy_gap = compute_entropy_gap(s_lp_metrics, tk.teacher_own_logprobs).item()
+                acc.add_health_metrics(ratio, advantage, entropy_gap)
+
+    # -------------------------------------------------------------------------
     # Training loop
     for step in range(args.num_steps):
         t0 = time.time()
 
         # -- Rollout generation (student ranks only) --
+        rollouts = None
         if is_student:
             examples, _ = next(loader_iter)  # list of {question, demonstration}, state dict
 
@@ -561,166 +612,31 @@ if __name__ == "__main__":
                     flush=True,
                 )
 
-            batch = prepare_batch(
-                rollouts,
-                tokenizer=student.tokenizer,
-                max_prompt_len=args.max_prompt_len,
-                max_response_len=args.max_response_len,
-                device=device,
-            )
-            teacher_batch = prepare_teacher_batch(
-                rollouts,
-                tokenizer=student.tokenizer,
-                device=device,
-            )
+        batch, teacher_batch = trainer.prepare_batches(rollouts, has_teacher_batch=True)
 
-            input_ids = batch["input_ids"]  # [N, T_s]
-            attention_mask = batch["attention_mask"]
-            response_mask = batch["response_mask"]
-            inference_logprobs = batch["inference_logprobs"]
-            teacher_input_ids = teacher_batch["input_ids"]  # [N, T_t]
-            teacher_attn_mask = teacher_batch["attention_mask"]
-            teacher_resp_mask = teacher_batch["response_mask"]
-            student.model.train()
+        # -- EMA sync: after each epoch's optimizer step(s), teacher tracks
+        # student. This is the core SDFT mechanism: teacher φ ← α·θ + (1−α)·φ
+        # A slowly-updating teacher provides a stable distillation target
+        # while still incorporating the student's improving capabilities.
+        trainer.step(
+            step, t0, batch, teacher_batch, do_minibatch,
+            has_teacher_batch=True,
+            accum_steps=args.grad_accum_steps,
+            syncer=syncer,
+            teacher_sync_scope="epoch",
+        )
 
-        total_loss = 0.0
-        n_batches = 0
-        overlap_ratio = 0.0
-        overlap_advantage = 0.0
-        entropy_gap_val = 0.0
-
-        # -- Distillation epochs --
-        for _epoch in range(args.epochs):
-
-            n_mb, perm = broadcast_n_minibatches(
-                is_student,
-                input_ids.shape[0] if is_student else 0,
-                args.train_batch_size,
-                device,
-                all_group,
-            )
-
-            for mb_idx in range(n_mb):
-
-                if is_student:
-                    start = mb_idx * args.train_batch_size
-                    idx = perm[start : start + args.train_batch_size]
-                    mb_ids, mb_attn, mb_mask = input_ids[idx], attention_mask[idx], response_mask[idx]
-                    mb_inf_lp = inference_logprobs[idx]
-                    t_mb_ids, t_mb_attn, t_mb_mask = teacher_input_ids[idx], teacher_attn_mask[idx], teacher_resp_mask[idx]
-                else:
-                    mb_ids = mb_attn = mb_mask = mb_inf_lp = t_mb_ids = t_mb_attn = t_mb_mask = None
-
-                mb_ids, mb_attn = broadcast_minibatch(is_student, mb_ids, mb_attn, device, all_group)
-                t_mb_ids, t_mb_attn, t_mb_mask = broadcast_teacher_inputs(is_student, t_mb_ids, t_mb_attn, t_mb_mask, device, all_group)
-
-                is_pg = args.algorithm == "mopd_pg_loss"
-                result = minibatch_exchange(
-                    is_student, is_teacher, mb_ids, mb_attn, mb_mask,
-                    t_mb_ids, t_mb_attn, t_mb_mask,
-                    student if is_student else None, teacher if is_teacher else None,
-                    select_topk_by, K, args.student_chunk_size, args.teacher_chunk_size,
-                    teacher_global_rank, all_group, device,
-                    is_pg=is_pg,
-                )
-
-                if is_student and result.is_pg:
-                    # PG form: result.pg holds sampled-token log-probs only, no
-                    # top-K distribution to gather from.
-                    loss = mopd_pg_loss_and_backward(
-                        student=student, pg=result.pg, loss_fn=loss_fn,
-                        student_logits=result.student_logits, sampled_ids=mb_ids[:, 1:], s_shift_mask=result.s_shift_mask,
-                        inf_lp_shifted=mb_inf_lp[:, 1:] if args.tis_clip > 0.0 else None,
-                        tis_clip=args.tis_clip, divisor=args.grad_accum_steps,
-                        mask_fn=lambda m: apply_token_skip_mask(m, args.num_loss_tokens_to_skip),
-                    )
-                    total_loss += loss.item()
-                    n_batches += 1
-
-                elif is_student:
-                    tk = result.topk
-                    student_logits = result.student_logits
-                    s_log_resp = F.log_softmax(result.s_resp.float(), dim=-1)
-                    s_logprobs = s_log_resp.gather(-1, tk.topk_idx)
-                    effective_mask = apply_token_skip_mask(
-                        result.s_compact_mask * tk.t_compact_mask, args.num_loss_tokens_to_skip
-                    )
-
-                    if effective_mask.sum() == 0:
-                        print0(f"[warn mb] effective_mask is all-zero: s_mask={result.s_compact_mask.sum().item():.0f} t_mask={tk.t_compact_mask.sum().item():.0f}", flush=True)
-
-                    if args.tis_clip > 0.0:
-                        s_lp_sampled = student_logprob_at_sampled_tokens(student_logits, mb_ids[:, 1:])
-                        tis_full = (s_lp_sampled - mb_inf_lp[:, 1:].to(s_lp_sampled.dtype)).exp().clamp(max=args.tis_clip)
-                        tis_resp, _ = pack_response_logits(tis_full.unsqueeze(-1).expand_as(student_logits), result.s_shift_mask)
-                        tis_weights = tis_resp[..., 0]
-                    else:
-                        tis_weights = None
-
-                    loss = loss_fn(s_logprobs, tk.t_logprobs, effective_mask, tis_weights=tis_weights) / args.grad_accum_steps
-                    student._scale_loss(loss).backward()
-                    total_loss += loss.item()
-                    n_batches += 1
-
-                    with torch.no_grad():
-                        s_lp_metrics = s_log_resp.gather(-1, tk.student_topk_idx)
-                        overlap_ratio += compute_overlap_ratio(tk.student_topk_idx, tk.teacher_topk_idx).item()
-                        overlap_advantage += compute_overlap_token_advantage(tk.student_topk_idx, tk.teacher_topk_idx, s_lp_metrics, tk.t_logprobs_at_student).item()
-                        entropy_gap_val += compute_entropy_gap(s_lp_metrics, tk.teacher_own_logprobs).item()
-
-                if is_student and (mb_idx + 1) % args.grad_accum_steps == 0:
-                    student._optimizer_step()
-
-            # -- Final optimizer step if minibatches don't divide evenly --
-            if is_student and n_mb % args.grad_accum_steps != 0:
-                student._optimizer_step()
-
-            # -- EMA sync: after each optimizer step, teacher tracks student --
-            # This is the core SDFT mechanism: teacher φ ← α·θ + (1−α)·φ
-            # A slowly-updating teacher provides a stable distillation target
-            # while still incorporating the student's improving capabilities.
-            sync_student_to_teacher(
-                student_fsdp_model=student.model if is_student else None,
-                teacher=teacher if is_teacher else None,
-                syncer=syncer,
-                global_step=step,
-                is_student=is_student,
-                is_teacher=is_teacher,
-                all_group=all_group,
-            )
-
-        # -- Push updated student weights into vLLM for next step's rollouts --
-        if is_student:
-            sync_weights_to_vllm_inplace(student.model, args.rollout_worker_url, model_update_group, fsdp=True)
-
-        # -- Pass@4 eval (master rank only; others wait at the barrier below) --
+        # -- Pass@k eval (master rank only) --
         if args.eval_every > 0 and (step + 1) % args.eval_every == 0 and master_process and eval_dataset:
             k = args.eval_k
             pass_at_k, avg_at_k = eval_pass_at_k(eval_dataset, len(eval_dataset), args, student, grader, k=k)
             print0(f"[eval step={step+1}] pass@{k}={pass_at_k:.3f} avg@{k}={avg_at_k:.3f} (n={len(eval_dataset)})")
-            if use_wandb:
-                wandb.log({f"eval/pass_at_{k}": pass_at_k, f"eval/avg_at_{k}": avg_at_k}, step=step + 1)
-
-        if is_student:
-            dt = time.time() - t0
-            avg_loss = total_loss / max(n_batches, 1)
-            current_lr = (
-                student.scheduler.get_last_lr()[0]
-                if student.scheduler is not None
-                else args.lr
+            log_eval_metrics(
+                {f"eval/pass_at_{k}": pass_at_k, f"eval/avg_at_{k}": avg_at_k},
+                step + 1, master_process, use_wandb,
             )
-            tokens = input_ids.numel()
-            log_step_metrics(
-                step, args.num_steps, avg_loss, current_lr, tokens, dt,
-                overlap_ratio / max(n_batches, 1),
-                overlap_advantage / max(n_batches, 1),
-                entropy_gap_val / max(n_batches, 1),
-                master_process, use_wandb,
-            )
-            maybe_save_checkpoint(student, args.save_dir, args.save_every, step)
 
-        dist.barrier(group=all_group)
+        trainer.barrier()
 
     compute_cleanup()
-    if master_process and use_wandb:
-        wandb.finish()
+    finish_wandb(master_process, use_wandb)

@@ -255,62 +255,6 @@ def broadcast_n_minibatches(
     return int(n_mb_t.item()), perm
 
 
-def log_step_metrics(
-    step: int,
-    num_steps: int,
-    avg_loss: float,
-    current_lr: float,
-    tokens: int,
-    dt: float,
-    overlap_ratio: float,
-    overlap_advantage: float,
-    entropy_gap: float,
-    master_process: bool,
-    use_wandb: bool,
-) -> None:
-    """Prints a one-line step summary and logs the same metrics to wandb.
-
-    Called on student ranks only, after averaging a step's per-minibatch
-    losses and distillation health metrics (see `compute_topk_health_metrics`).
-
-    Args:
-        step: Zero-indexed training step.
-        num_steps: Total number of training steps, for the printed progress
-          fraction.
-        avg_loss: Mean distillation loss over this step's minibatches.
-        current_lr: Current learning rate.
-        tokens: Total tokens processed in this step's rollout batch.
-        dt: Wall-clock seconds this step took.
-        overlap_ratio: Mean student/teacher top-K overlap ratio.
-        overlap_advantage: Mean overlap-token advantage.
-        entropy_gap: Mean student/teacher entropy gap.
-        master_process: Whether this is the rank-0 process (only it logs to
-          wandb).
-        use_wandb: Whether wandb logging is enabled for this run.
-    """
-    print0(
-        f"step {step + 1:4d}/{num_steps} | loss {avg_loss:.4f} "
-        f"| lr {current_lr:.2e} | tokens {tokens} | dt {dt:.1f}s "
-        f"| overlap {overlap_ratio:.3f} "
-        f"| adv {overlap_advantage:.4f} "
-        f"| ent_gap {entropy_gap:.4f}"
-    )
-    if master_process and use_wandb:
-        import wandb
-        wandb.log(
-            {
-                "train/loss": avg_loss,
-                "train/learning_rate": current_lr,
-                "train/step_time_s": dt,
-                "train/tokens_per_step": tokens,
-                "metrics/overlap_ratio": overlap_ratio,
-                "metrics/overlap_token_advantage": overlap_advantage,
-                "metrics/entropy_gap": entropy_gap,
-            },
-            step=step + 1,
-        )
-
-
 def maybe_save_checkpoint(
     student: StudentModel, save_dir: str, save_every: int, step: int
 ) -> None:

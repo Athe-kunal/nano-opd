@@ -7,6 +7,12 @@ exchanging top-K log-prob distributions for the KL losses, the lighter
 sampled-token-only exchange for the MOPD policy-gradient loss, and syncing the
 student's weights into a self-teacher (SDPO/SDFT).
 
+Most functions here take a `ctx: DistributedContext` (the same object
+`init_distributed` returns once at startup) instead of separately re-passing
+`is_student`/`is_teacher`/`teacher_global_rank`/`all_group`/`device` — that
+cluster of rank-topology facts is fixed for the whole run, so it travels as
+one named object rather than five independent arguments at every call site.
+
 Sections:
   1. Low-level broadcast primitives
   2. Batch preparation (packing, padding, alignment)
@@ -32,7 +38,7 @@ from opd.fsdp.algorithms import (
     teacher_topk_logprobs,
 )
 from opd.fsdp.model import StudentModel, TeacherModel
-from opd.trainer.setup_utils import print0
+from opd.trainer.setup_utils import DistributedContext, print0
 from opd.trainer.sync_teacher import TeacherSyncer
 
 # ---------------------------------------------------------------------------
@@ -113,10 +119,8 @@ def bcast_or_alloc_many(
 
 
 def _broadcast_shape(
-    is_student: bool,
+    ctx: DistributedContext,
     local_shape: tuple[int, int] | None,
-    device: torch.device,
-    all_group: Any,
 ) -> tuple[int, int]:
     """Broadcasts a 2D tensor's `(dim0, dim1)` shape from student rank 0 to all ranks.
 
@@ -125,18 +129,16 @@ def _broadcast_shape(
     the actual payload broadcast.
 
     Args:
-        is_student: Whether this rank owns `local_shape`.
+        ctx: Distributed rank/topology info for this run.
         local_shape: This rank's local `(dim0, dim1)` shape (student ranks only).
-        device: Device to allocate the broadcast buffer on.
-        all_group: Process group spanning student and teacher ranks.
 
     Returns:
         The broadcast `(dim0, dim1)` shape.
     """
-    shape_t = torch.tensor(local_shape, dtype=torch.long, device=device) if is_student else None
+    shape_t = torch.tensor(local_shape, dtype=torch.long, device=ctx.device) if ctx.is_student else None
     shape_t, handle = bcast_or_alloc_async(
-        tensor=shape_t, is_owner=is_student, shape=(2,), dtype=torch.long,
-        src=0, device=device, group=all_group,
+        tensor=shape_t, is_owner=ctx.is_student, shape=(2,), dtype=torch.long,
+        src=0, device=ctx.device, group=ctx.all_group,
     )
     handle.wait()
     return int(shape_t[0].item()), int(shape_t[1].item())
@@ -266,9 +268,7 @@ def sync_student_to_teacher(
     teacher: TeacherModel | None,
     syncer: TeacherSyncer,
     global_step: int,
-    is_student: bool,
-    is_teacher: bool,
-    all_group: Any,
+    ctx: DistributedContext,
 ) -> None:
     """Broadcasts full student parameters to the teacher rank and applies the syncer.
 
@@ -287,23 +287,21 @@ def sync_student_to_teacher(
         teacher: The teacher model (teacher rank only).
         syncer: The sync strategy to apply on the teacher rank.
         global_step: Current training step, passed through to `syncer.step`.
-        is_student: Whether this rank is a student (FSDP) rank.
-        is_teacher: Whether this rank is the teacher rank.
-        all_group: Process group spanning student and teacher ranks.
+        ctx: Distributed rank/topology info for this run.
     """
-    if is_student:
+    if ctx.is_student:
         with FSDP.summon_full_params(student_fsdp_model, writeback=False, recurse=True):
             for s_param in student_fsdp_model.parameters():
                 # Rank 0 sends; other student ranks and teacher rank receive.
                 # writeback=False ensures the receive on non-zero student ranks
                 # does not corrupt the FSDP shards.
-                dist.broadcast(s_param.data, src=0, group=all_group)
+                dist.broadcast(s_param.data, src=0, group=ctx.all_group)
 
-    if is_teacher:
+    if ctx.is_teacher:
         received = []
         for t_param in teacher.model.parameters():
             buf = torch.empty_like(t_param.data)
-            dist.broadcast(buf, src=0, group=all_group)
+            dist.broadcast(buf, src=0, group=ctx.all_group)
             received.append(buf)
         syncer.step(received, teacher.model.parameters(), global_step)
         # print directly — this runs only on the teacher rank, not rank 0, so
@@ -317,31 +315,27 @@ def sync_student_to_teacher(
 
 
 def broadcast_minibatch(
-    is_student: bool,
+    ctx: DistributedContext,
     mb_ids: torch.Tensor | None,
     mb_attn: torch.Tensor | None,
-    device: torch.device,
-    all_group: Any,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Broadcasts input_ids and attention_mask from student rank 0 to all ranks."""
     B, T = _broadcast_shape(
-        is_student, (mb_ids.shape[0], mb_ids.shape[1]) if is_student else None, device, all_group,
+        ctx, (mb_ids.shape[0], mb_ids.shape[1]) if ctx.is_student else None,
     )
 
     mb_ids, mb_attn = bcast_or_alloc_many(
         specs=[(mb_ids, (B, T), torch.long), (mb_attn, (B, T), torch.long)],
-        is_owner=is_student, src=0, device=device, group=all_group,
+        is_owner=ctx.is_student, src=0, device=ctx.device, group=ctx.all_group,
     )
     return mb_ids, mb_attn
 
 
 def broadcast_teacher_inputs(
-    is_student: bool,
+    ctx: DistributedContext,
     t_mb_ids: torch.Tensor | None,
     t_mb_attn: torch.Tensor | None,
     t_mb_mask: torch.Tensor | None,
-    device: torch.device,
-    all_group: Any,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Broadcasts teacher-specific tensors from student rank 0 to all ranks.
 
@@ -349,7 +343,7 @@ def broadcast_teacher_inputs(
     teacher prompt includes a worked demonstration).
     """
     B, T_t = _broadcast_shape(
-        is_student, (t_mb_ids.shape[0], t_mb_ids.shape[1]) if is_student else None, device, all_group,
+        ctx, (t_mb_ids.shape[0], t_mb_ids.shape[1]) if ctx.is_student else None,
     )
 
     t_mb_ids, t_mb_attn, t_mb_mask = bcast_or_alloc_many(
@@ -358,7 +352,7 @@ def broadcast_teacher_inputs(
             (t_mb_attn, (B, T_t), torch.long),
             (t_mb_mask, (B, T_t), torch.float),
         ],
-        is_owner=is_student, src=0, device=device, group=all_group,
+        is_owner=ctx.is_student, src=0, device=ctx.device, group=ctx.all_group,
     )
     return t_mb_ids, t_mb_attn, t_mb_mask
 
@@ -370,15 +364,12 @@ def broadcast_teacher_inputs(
 
 def exchange_sampled_teacher_logprob(
     *,
-    is_teacher: bool,
+    ctx: DistributedContext,
     teacher_logits: torch.Tensor | None,   # [B, T, V], teacher rank only
     token_ids: torch.Tensor,               # [B, T], sampled tokens (already on every rank via broadcast_minibatch)
     B: int,
     T: int,
-    t_chunk: int = -1,
-    teacher_global_rank: int = 0,
-    all_group: Any = None,
-    device: torch.device | None = None,
+    teacher_chunk_size: int = -1,
 ) -> torch.Tensor:
     """Broadcasts log π_φd(y_t): teacher log-prob at the student's sampled token.
 
@@ -386,13 +377,13 @@ def exchange_sampled_teacher_logprob(
     crosses the wire here, versus [B, T, K] for exchange_topk — the PG form
     needs no top-K selection at all, just this one scalar per position.
     """
-    if is_teacher:
-        t_logprob = teacher_logprobs_at_indices(teacher_logits, token_ids.unsqueeze(-1), t_chunk).squeeze(-1)
+    if ctx.is_teacher:
+        t_logprob = teacher_logprobs_at_indices(teacher_logits, token_ids.unsqueeze(-1), teacher_chunk_size).squeeze(-1)
     else:
         t_logprob = None
     t_logprob, h = bcast_or_alloc_async(
-        tensor=t_logprob, is_owner=is_teacher, shape=(B, T), dtype=torch.bfloat16,
-        src=teacher_global_rank, device=device, group=all_group,
+        tensor=t_logprob, is_owner=ctx.is_teacher, shape=(B, T), dtype=torch.bfloat16,
+        src=ctx.teacher_global_rank, device=ctx.device, group=ctx.all_group,
     )
     h.wait()
     return t_logprob
@@ -409,8 +400,7 @@ class MopdPGExchange:
 
 def exchange_mopd_pg_packed(
     *,
-    is_student: bool,
-    is_teacher: bool,
+    ctx: DistributedContext,
     student_logits: torch.Tensor | None,   # [B, T_s-1, V], student rank only, grad-carrying
     teacher_logits: torch.Tensor | None,   # [B, T_t-1, V], teacher rank only, no-grad
     student_ids: torch.Tensor | None,      # [B, T_s], student rank only (full, unshifted)
@@ -419,10 +409,7 @@ def exchange_mopd_pg_packed(
     t_shift_mask: torch.Tensor | None,     # [B, T_t-1], teacher rank only
     R_max: int,
     B: int,
-    t_chunk: int = -1,
-    teacher_global_rank: int = 0,
-    all_group: Any = None,
-    device: torch.device | None = None,
+    teacher_chunk_size: int = -1,
 ) -> MopdPGExchange:
     """MOPD policy-gradient exchange for packed-response setups (SDPO / OPSD /
     SDFT self-teacher training, where teacher prompts include extra feedback
@@ -433,7 +420,7 @@ def exchange_mopd_pg_packed(
     no top-K, no full-vocab packing — then pack to response-only positions
     [B, R_max] and broadcast only the teacher's small result.
     """
-    if is_student:
+    if ctx.is_student:
         s_logprob_full = student_logprobs_at_indices(
             student_logits, student_ids[:, 1:].unsqueeze(-1), -1
         ).squeeze(-1)                                                  # [B, T_s-1], grad
@@ -444,9 +431,9 @@ def exchange_mopd_pg_packed(
     else:
         s_logprob_resp = s_compact_mask = None
 
-    if is_teacher:
+    if ctx.is_teacher:
         t_logprob_full = teacher_logprobs_at_indices(
-            teacher_logits, teacher_ids[:, 1:].unsqueeze(-1), t_chunk
+            teacher_logits, teacher_ids[:, 1:].unsqueeze(-1), teacher_chunk_size
         ).squeeze(-1)                                                  # [B, T_t-1], no grad
         t_logprob_resp, t_compact_mask = pack_response_logits(
             t_logprob_full.unsqueeze(-1), t_shift_mask
@@ -464,7 +451,7 @@ def exchange_mopd_pg_packed(
             (t_logprob_resp, (B, R_max), torch.bfloat16),
             (t_compact_mask, (B, R_max), torch.float32),
         ],
-        is_owner=is_teacher, src=teacher_global_rank, device=device, group=all_group,
+        is_owner=ctx.is_teacher, src=ctx.teacher_global_rank, device=ctx.device, group=ctx.all_group,
     )
 
     return MopdPGExchange(
@@ -540,20 +527,16 @@ class TopKExchange:
 
 def exchange_topk(
     *,
+    ctx: DistributedContext,
     select_topk_by: Literal["student", "teacher"],
-    is_student: bool,
-    is_teacher: bool,
     student_logits: torch.Tensor | None,          # [B, T, V], student rank only
     teacher_logits: torch.Tensor | None,          # [B, T, V], teacher rank only
     t_compact_mask: torch.Tensor | None = None,   # [B, T], teacher rank only; None → broadcast all-ones
     B: int = 0,
     T: int = 0,
-    K: int = 0,
-    s_chunk: int = -1,
-    t_chunk: int = -1,
-    teacher_global_rank: int = 0,
-    all_group: Any = None,
-    device: torch.device | None = None,
+    top_k: int = 0,
+    student_chunk_size: int = -1,
+    teacher_chunk_size: int = -1,
 ) -> TopKExchange:
     """Top-K log-prob exchange between student and teacher ranks.
 
@@ -573,34 +556,34 @@ def exchange_topk(
     `select_topk_by` — so the two cases share one code path instead of being
     near-duplicate branches.
     """
-    if is_teacher and t_compact_mask is None:
-        t_compact_mask = torch.ones(B, T, dtype=torch.float32, device=device)
+    if ctx.is_teacher and t_compact_mask is None:
+        t_compact_mask = torch.ones(B, T, dtype=torch.float32, device=ctx.device)
 
     # The student always selects and broadcasts its own top-K indices.
-    student_topk_idx = student_topk_indices(student_logits, K, s_chunk) if is_student else None
+    student_topk_idx = student_topk_indices(student_logits, top_k, student_chunk_size) if ctx.is_student else None
     student_topk_idx, h = bcast_or_alloc_async(
-        tensor=student_topk_idx, is_owner=is_student, shape=(B, T, K), dtype=torch.long,
-        src=0, device=device, group=all_group,
+        tensor=student_topk_idx, is_owner=ctx.is_student, shape=(B, T, top_k), dtype=torch.long,
+        src=0, device=ctx.device, group=ctx.all_group,
     )
     h.wait()
 
     # The teacher computes its own top-K (+ log-probs there) and its
     # log-probs at the student's top-K — both needed regardless of
     # select_topk_by, either for the loss or for diagnostics.
-    if is_teacher:
-        teacher_topk_idx, teacher_own_logprobs = teacher_topk_logprobs(teacher_logits, K, t_chunk)
-        t_logprobs_at_student = teacher_logprobs_at_indices(teacher_logits, student_topk_idx, t_chunk)
+    if ctx.is_teacher:
+        teacher_topk_idx, teacher_own_logprobs = teacher_topk_logprobs(teacher_logits, top_k, teacher_chunk_size)
+        t_logprobs_at_student = teacher_logprobs_at_indices(teacher_logits, student_topk_idx, teacher_chunk_size)
     else:
         teacher_topk_idx = teacher_own_logprobs = t_logprobs_at_student = None
 
     teacher_topk_idx, teacher_own_logprobs, t_logprobs_at_student, t_compact_mask = bcast_or_alloc_many(
         specs=[
-            (teacher_topk_idx, (B, T, K), torch.long),
-            (teacher_own_logprobs, (B, T, K), torch.bfloat16),
-            (t_logprobs_at_student, (B, T, K), torch.bfloat16),
+            (teacher_topk_idx, (B, T, top_k), torch.long),
+            (teacher_own_logprobs, (B, T, top_k), torch.bfloat16),
+            (t_logprobs_at_student, (B, T, top_k), torch.bfloat16),
             (t_compact_mask, (B, T), torch.float32),
         ],
-        is_owner=is_teacher, src=teacher_global_rank, device=device, group=all_group,
+        is_owner=ctx.is_teacher, src=ctx.teacher_global_rank, device=ctx.device, group=ctx.all_group,
     )
 
     # The loss's shared support is whichever side select_topk_by names — the
@@ -644,8 +627,7 @@ class MinibatchExchangeResult:
 
 
 def minibatch_exchange(
-    is_student: bool,
-    is_teacher: bool,
+    ctx: DistributedContext,
     mb_ids: torch.Tensor | None,
     mb_attn: torch.Tensor | None,
     mb_mask: torch.Tensor | None,
@@ -655,12 +637,9 @@ def minibatch_exchange(
     student: StudentModel | None,
     teacher: TeacherModel | None,
     select_topk_by: Literal["student", "teacher"],
-    K: int,
-    s_chunk: int,
-    t_chunk: int,
-    teacher_global_rank: int,
-    all_group: Any,
-    device: torch.device,
+    top_k: int,
+    student_chunk_size: int,
+    teacher_chunk_size: int,
     is_pg: bool = False,
 ) -> MinibatchExchangeResult:
     """Student + teacher forward, then top-K exchange (or, for MOPD-PG, the
@@ -670,8 +649,7 @@ def minibatch_exchange(
     produces a different-length sequence than the student's.
 
     Args:
-        is_student: Whether this rank is a student (FSDP) rank.
-        is_teacher: Whether this rank is the teacher rank.
+        ctx: Distributed rank/topology info for this run.
         mb_ids: Student input ids, `[B, T_s]` (student ranks only).
         mb_attn: Student attention mask, `[B, T_s]` (student ranks only).
         mb_mask: Student response mask, `[B, T_s]` (student ranks only).
@@ -682,12 +660,9 @@ def minibatch_exchange(
         teacher: The teacher model (teacher rank only).
         select_topk_by: Whether the student or the teacher selects top-K
           indices (ignored when `is_pg` is True).
-        K: Top-K vocab size for the distillation exchange.
-        s_chunk: Chunk size along T for student top-K computation.
-        t_chunk: Chunk size along T for teacher top-K computation.
-        teacher_global_rank: Global rank of the teacher process.
-        all_group: Process group spanning student and teacher ranks.
-        device: Device to allocate broadcast tensors on.
+        top_k: Top-K vocab size for the distillation exchange.
+        student_chunk_size: Chunk size along T for student top-K computation.
+        teacher_chunk_size: Chunk size along T for teacher top-K computation.
         is_pg: If True, use the lighter MOPD-PG sampled-token exchange
           instead of a full top-K exchange.
 
@@ -695,7 +670,7 @@ def minibatch_exchange(
         A `MinibatchExchangeResult` with `pg` set (and `topk` `None`) when
         `is_pg` is True, or `topk` set (and `pg` `None`) otherwise.
     """
-    if is_student:
+    if ctx.is_student:
         student_logits = student.get_logits(mb_ids, mb_attn)[:, :-1]
         s_shift_mask = mb_mask[:, 1:]
         if is_pg:
@@ -713,11 +688,11 @@ def minibatch_exchange(
         R_max_local = 0
 
     # Broadcast R_max so the teacher can allocate matching tensors.
-    R_max_t = torch.tensor([R_max_local if is_student else 0], dtype=torch.long, device=device)
-    dist.broadcast(R_max_t, src=0, group=all_group)
+    R_max_t = torch.tensor([R_max_local if ctx.is_student else 0], dtype=torch.long, device=ctx.device)
+    dist.broadcast(R_max_t, src=0, group=ctx.all_group)
     R_max = int(R_max_t.item())
 
-    if is_teacher:
+    if ctx.is_teacher:
         with torch.no_grad():
             teacher_logits = teacher.get_logits(t_mb_ids, t_mb_attn)[:, :-1]
         t_shift_mask = t_mb_mask[:, 1:]
@@ -729,16 +704,15 @@ def minibatch_exchange(
 
     if is_pg:
         pg = exchange_mopd_pg_packed(
-            is_student=is_student, is_teacher=is_teacher,
-            student_logits=student_logits if is_student else None,
-            teacher_logits=teacher_logits if is_teacher else None,
-            student_ids=mb_ids if is_student else None,
-            teacher_ids=t_mb_ids if is_teacher else None,
-            s_shift_mask=s_shift_mask if is_student else None,
-            t_shift_mask=t_shift_mask if is_teacher else None,
+            ctx=ctx,
+            student_logits=student_logits if ctx.is_student else None,
+            teacher_logits=teacher_logits if ctx.is_teacher else None,
+            student_ids=mb_ids if ctx.is_student else None,
+            teacher_ids=t_mb_ids if ctx.is_teacher else None,
+            s_shift_mask=s_shift_mask if ctx.is_student else None,
+            t_shift_mask=t_shift_mask if ctx.is_teacher else None,
             R_max=R_max, B=mb_ids.shape[0],
-            t_chunk=t_chunk,
-            teacher_global_rank=teacher_global_rank, all_group=all_group, device=device,
+            teacher_chunk_size=teacher_chunk_size,
         )
         return MinibatchExchangeResult(
             is_pg=True, topk=None, pg=pg,
@@ -747,11 +721,10 @@ def minibatch_exchange(
         )
 
     topk = exchange_topk(
-        select_topk_by=select_topk_by, is_student=is_student, is_teacher=is_teacher,
+        ctx=ctx, select_topk_by=select_topk_by,
         student_logits=s_resp, teacher_logits=t_resp, t_compact_mask=t_compact_mask,
-        B=mb_ids.shape[0], T=R_max, K=K,
-        s_chunk=s_chunk, t_chunk=t_chunk,
-        teacher_global_rank=teacher_global_rank, all_group=all_group, device=device,
+        B=mb_ids.shape[0], T=R_max, top_k=top_k,
+        student_chunk_size=student_chunk_size, teacher_chunk_size=teacher_chunk_size,
     )
     return MinibatchExchangeResult(
         is_pg=False, topk=topk, pg=None,

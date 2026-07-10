@@ -5,7 +5,7 @@ import json
 import os
 import random
 import time
-from typing import Iterator, Literal
+from typing import Literal
 
 import torch
 import torch.nn.functional as F
@@ -46,40 +46,9 @@ from opd.generator.rollout import (
     sync_weights_to_vllm_inplace,
     prepare_batch,
 )
+from opd.envs.dataset import distributed_opd_loader
 from opd.envs.sdft_science import load_sdft_science, load_sdft_science_eval, grade_science_response
 from opd.envs.sdft_tooluse import load_sdft_tooluse, load_sdft_tooluse_eval, grade_tooluse_response
-
-
-def distributed_sdft_loader(
-    dataset: list[dict],
-    prompts_per_step: int,
-    world_size: int,
-    rank: int,
-    seed: int = 0,
-) -> Iterator[list[dict]]:
-    """Yield per-rank slices of the SDFT dataset, shuffled each epoch."""
-    n = len(dataset)
-    assert prompts_per_step % world_size == 0
-    per_rank = prompts_per_step // world_size
-
-    epoch, cursor = 0, 0
-
-    def _shuffle(epoch_idx):
-        rng = random.Random(seed * 1_000_003 + epoch_idx)
-        order = list(range(n))
-        rng.shuffle(order)
-        return order
-
-    order = _shuffle(epoch)
-    while True:
-        if cursor + prompts_per_step > n:
-            epoch += 1
-            cursor = 0
-            order = _shuffle(epoch)
-        step_idx = order[cursor : cursor + prompts_per_step]
-        rank_idx = step_idx[rank * per_rank : (rank + 1) * per_rank]
-        yield [dataset[i] for i in rank_idx]
-        cursor += prompts_per_step
 
 
 # ---------------------------------------------------------------------------
@@ -227,7 +196,7 @@ def build_sdft_dataset(args) -> list[dict]:
     """Load the SDFT training dataset from a built-in source or a custom JSONL.
 
     Returns a list of {"question": str, "demonstration": str} dicts consumed
-    by distributed_sdft_loader. The --dataset-path flag takes precedence over
+    by distributed_opd_loader. The --dataset-path flag takes precedence over
     --dataset so users can drop in arbitrary JSONL files without changing code.
     """
     if args.dataset_path:
@@ -539,7 +508,7 @@ if __name__ == "__main__":
         if args.eval_every > 0:
             eval_dataset = build_sdft_eval_dataset(args)
             grader = build_sdft_grader(args)
-        loader = distributed_sdft_loader(
+        loader = distributed_opd_loader(
             dataset, args.prompts_per_step, train_world_size, ddp_rank, seed=args.seed
         )
         loader_iter = iter(loader)
@@ -551,7 +520,7 @@ if __name__ == "__main__":
 
         # -- Rollout generation (student ranks only) --
         if is_student:
-            examples = next(loader_iter)  # list of {question, demonstration}
+            examples, _ = next(loader_iter)  # list of {question, demonstration}, state dict
 
             # Student prompt: question only — π_θ(y|x)
             prompts = [

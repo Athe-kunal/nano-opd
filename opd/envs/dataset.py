@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import random as _random
+import random 
 from typing import Iterator, Literal, Sequence, TypeVar
 
 from opd.envs.base import OPDEnvBase
@@ -44,7 +44,7 @@ def distributed_opd_loader(
     per_rank = prompts_per_step // world_size
 
     def _epoch_order(epoch_idx: int) -> list[int]:
-        rng = _random.Random(seed * 1_000_003 + epoch_idx)
+        rng = random.Random(seed * 1_000_003 + epoch_idx)
         order = list(range(n))
         rng.shuffle(order)
         return order

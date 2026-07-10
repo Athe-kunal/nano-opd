@@ -157,8 +157,11 @@ class HardSyncSyncer(TeacherSyncer):
 # 4. On-Policy (live copy) — teacher IS the student
 # ---------------------------------------------------------------------------
 
-class OnPolicySyncer(TeacherSyncer):
+class OnPolicySyncer(HardSyncSyncer):
     """ϕ ← θ at every step (teacher = live student).
+
+    Mathematically just `HardSyncSyncer` with `sync_every_n_steps=1`: the
+    step-count gate always passes, so the copy runs every step.
 
     Only safe for the *inference* pass where the teacher conditions on feedback
     context. Do NOT use this during training — any gradient update immediately
@@ -168,15 +171,8 @@ class OnPolicySyncer(TeacherSyncer):
     production training use EMASyncer instead.
     """
 
-    def step(
-        self,
-        student_params: Iterable[torch.Tensor],
-        teacher_params: Iterable[nn.Parameter],
-        global_step: int,
-    ) -> None:
-        with torch.no_grad():
-            for theta, phi in zip(student_params, teacher_params):
-                phi.data.copy_(theta.data)
+    def __init__(self) -> None:
+        super().__init__(sync_every_n_steps=1)
 
 
 # ---------------------------------------------------------------------------

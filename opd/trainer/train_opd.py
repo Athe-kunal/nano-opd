@@ -263,10 +263,7 @@ if __name__ == "__main__":
 
                 # -- Student forward (with grad) --
                 if is_student:
-                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                        student_logits = student.model(
-                            input_ids=mb_ids, attention_mask=mb_attn
-                        ).logits[:, :-1]               # [B, T-1, V]
+                    student_logits = student.get_logits(mb_ids, mb_attn)[:, :-1]  # [B, T-1, V]
 
                 # -- Teacher: compute top-K log-probs and broadcast --
                 # Broadcasts only [B, T-1, K] instead of the full [B, T-1, V] logit
@@ -276,7 +273,7 @@ if __name__ == "__main__":
                 else:
                     teacher_logits = None
                 if args.algorithm == "mopd_pg_loss":
-                    # -- PG form (Eq. 3-4): no top-K exchange needed for the loss
+                    # -- PG form: no top-K exchange needed for the loss
                     # itself, just the sampled token's log-prob under each policy.
                     # mb_ids is already on every rank (broadcast above), so
                     # sampled_ids needs no extra communication — only the
@@ -293,15 +290,6 @@ if __name__ == "__main__":
                         all_group=all_group,
                         device=device,
                     )
-
-                    # -- Diagnostics-only top-K exchange --
-                    # The overlap/advantage/entropy-gap metrics are loss-agnostic
-                    # (they just compare the two policies' top-K distributions),
-                    # so they're just as meaningful for the PG form as for the KL
-                    # variants. But computing them needs student/teacher top-K,
-                    # which the PG form otherwise skips to avoid this exact
-                    # broadcast cost — so this is deliberately paid only here,
-                    # separately from the (cheaper) loss computation above.
                     topk = exchange_topk(
                         select_topk_by=select_topk_by,
                         is_student=is_student,

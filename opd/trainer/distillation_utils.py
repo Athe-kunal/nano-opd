@@ -652,7 +652,7 @@ def minibatch_exchange(
     t_mb_ids: torch.Tensor | None,
     t_mb_attn: torch.Tensor | None,
     t_mb_mask: torch.Tensor | None,
-    student_model: torch.nn.Module | None,
+    student: StudentModel | None,
     teacher: TeacherModel | None,
     select_topk_by: Literal["student", "teacher"],
     K: int,
@@ -678,7 +678,7 @@ def minibatch_exchange(
         t_mb_ids: Teacher input ids, `[B, T_t]` (teacher rank only).
         t_mb_attn: Teacher attention mask, `[B, T_t]` (teacher rank only).
         t_mb_mask: Teacher response mask, `[B, T_t]` (teacher rank only).
-        student_model: The FSDP-wrapped student model (student ranks only).
+        student: The student model wrapper (student ranks only).
         teacher: The teacher model (teacher rank only).
         select_topk_by: Whether the student or the teacher selects top-K
           indices (ignored when `is_pg` is True).
@@ -696,8 +696,7 @@ def minibatch_exchange(
         `is_pg` is True, or `topk` set (and `pg` `None`) otherwise.
     """
     if is_student:
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            student_logits = student_model(input_ids=mb_ids, attention_mask=mb_attn).logits[:, :-1]
+        student_logits = student.get_logits(mb_ids, mb_attn)[:, :-1]
         s_shift_mask = mb_mask[:, 1:]
         if is_pg:
             # PG form only needs the sampled token's log-prob, not the full

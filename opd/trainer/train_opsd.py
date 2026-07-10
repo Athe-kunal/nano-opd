@@ -393,7 +393,7 @@ if __name__ == "__main__":
                 result = minibatch_exchange(
                     is_student, is_teacher, mb_ids, mb_attn, mb_mask,
                     t_mb_ids, t_mb_attn, t_mb_mask,
-                    student.model if is_student else None, teacher if is_teacher else None,
+                    student if is_student else None, teacher if is_teacher else None,
                     select_topk_by, K, args.student_chunk_size, args.teacher_chunk_size,
                     teacher_global_rank, all_group, device,
                     is_pg=is_pg,

@@ -138,6 +138,23 @@ class StudentModel(FSDPWorker):
     def _scale_loss(self, loss: torch.Tensor) -> torch.Tensor:
         return self.data_parallel_size * loss
 
+    def get_logits(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Returns raw logits ``(B, T, V)``, under bf16 autocast, retaining the gradient graph.
+
+        Unlike `TeacherModel.get_logits`, this is not `@torch.no_grad()` (the
+        student is backpropped through) and does not call `.train()`/`.eval()`
+        itself — the caller sets train mode once per step, not per minibatch.
+        """
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            return self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            ).logits
+
     def save_model(self, save_dir: str) -> None:
         """See base class. Barriers within `process_group` (student ranks) only.
 

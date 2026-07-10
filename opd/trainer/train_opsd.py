@@ -1,8 +1,8 @@
+"""On-Policy Self-Distillation (OPSD) training loop — frozen reference-solution teacher."""
 
-import os
-import math
-import time
 import argparse
+import os
+import time
 from typing import Literal
 
 import torch
@@ -20,12 +20,17 @@ from opd.trainer.distillation_utils import (
     prepare_teacher_batch,
 )
 from opd.trainer.setup_utils import (
-    compute_cleanup,
-    print0,
-    init_distributed,
+    assert_prompts_divisible,
+    broadcast_n_minibatches,
     build_student,
     build_teacher,
+    compute_cleanup,
+    init_distributed,
     init_vllm_transfer,
+    log_step_metrics,
+    maybe_save_checkpoint,
+    print0,
+    topk_selector_for,
 )
 from opd.envs.opsd_dataset import OPSDMathEnv
 from opd.envs.dataset import distributed_opd_loader
@@ -217,10 +222,7 @@ if __name__ == "__main__":
             },
         )
 
-    assert args.prompts_per_step % train_world_size == 0, (
-        f"prompts_per_step ({args.prompts_per_step}) must be divisible by "
-        f"train_world_size ({train_world_size})"
-    )
+    assert_prompts_divisible(args.prompts_per_step, train_world_size)
 
     # -------------------------------------------------------------------------
     # Model setup
@@ -253,9 +255,7 @@ if __name__ == "__main__":
     # For forward KL the teacher selects the top-K indices (the teacher-weighted
     # sum means we need tokens where the teacher has non-negligible probability).
     loss_fn = ALGORITHMS[args.algorithm]
-    select_topk_by: Literal["student", "teacher"] = (
-        "teacher" if args.algorithm in ("forward_kl", "mopd_loss") else "student"
-    )
+    select_topk_by: Literal["student", "teacher"] = topk_selector_for(args.algorithm)
     K = args.distill_top_k
 
     # -------------------------------------------------------------------------
@@ -353,14 +353,13 @@ if __name__ == "__main__":
         # -- Distillation epochs --
         for _epoch in range(args.epochs):
 
-            if is_student:
-                n_mb = math.ceil(input_ids.shape[0] / args.train_batch_size)
-                perm = torch.randperm(input_ids.shape[0], device=device)
-                n_mb_t = torch.tensor([n_mb], dtype=torch.long, device=device)
-            else:
-                n_mb_t = torch.zeros(1, dtype=torch.long, device=device)
-            dist.broadcast(n_mb_t, src=0, group=all_group)
-            n_mb = int(n_mb_t.item())
+            n_mb, perm = broadcast_n_minibatches(
+                is_student,
+                input_ids.shape[0] if is_student else 0,
+                args.train_batch_size,
+                device,
+                all_group,
+            )
 
             for mb_idx in range(n_mb):
 
@@ -480,32 +479,14 @@ if __name__ == "__main__":
             avg_loss   = total_loss / max(n_batches, 1)
             current_lr = student.scheduler.get_last_lr()[0] if student.scheduler is not None else args.lr
             tokens     = input_ids.numel()
-            print0(
-                f"step {step + 1:4d}/{args.num_steps} | loss {avg_loss:.4f} "
-                f"| lr {current_lr:.2e} | tokens {tokens} | dt {dt:.1f}s "
-                f"| overlap {overlap_ratio / max(n_batches, 1):.3f} "
-                f"| adv {overlap_advantage / max(n_batches, 1):.4f} "
-                f"| ent_gap {entropy_gap_val / max(n_batches, 1):.4f}"
+            log_step_metrics(
+                step, args.num_steps, avg_loss, current_lr, tokens, dt,
+                overlap_ratio / max(n_batches, 1),
+                overlap_advantage / max(n_batches, 1),
+                entropy_gap_val / max(n_batches, 1),
+                master_process, use_wandb,
             )
-
-            if master_process and use_wandb:
-                wandb.log(
-                    {
-                        "train/loss": avg_loss,
-                        "train/learning_rate": current_lr,
-                        "train/step_time_s": dt,
-                        "train/tokens_per_step": tokens,
-                        "metrics/overlap_ratio": overlap_ratio / max(n_batches, 1),
-                        "metrics/overlap_token_advantage": overlap_advantage / max(n_batches, 1),
-                        "metrics/entropy_gap": entropy_gap_val / max(n_batches, 1),
-                    },
-                    step=step + 1,
-                )
-
-            if args.save_every > 0 and (step + 1) % args.save_every == 0:
-                save_path = f"{args.save_dir}/step_{step + 1}"
-                student.save_model(save_path)
-                print0(f"Saved checkpoint to {save_path}")
+            maybe_save_checkpoint(student, args.save_dir, args.save_every, step)
 
         dist.barrier(group=all_group)
 

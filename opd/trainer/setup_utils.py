@@ -1,6 +1,7 @@
+import math
 import os
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import torch
 import torch.distributed as dist
@@ -181,3 +182,147 @@ def init_vllm_transfer(
 
     dist.barrier(group=all_group)
     return model_update_group
+
+
+def assert_prompts_divisible(prompts_per_step: int, train_world_size: int) -> None:
+    """Raises if `prompts_per_step` doesn't divide evenly across student ranks.
+
+    Args:
+        prompts_per_step: Number of distinct prompts sampled per step.
+        train_world_size: Number of student (FSDP) ranks.
+
+    Raises:
+        AssertionError: If `prompts_per_step % train_world_size != 0`.
+    """
+    assert prompts_per_step % train_world_size == 0, (
+        f"prompts_per_step ({prompts_per_step}) must be divisible by "
+        f"train_world_size ({train_world_size})"
+    )
+
+
+def topk_selector_for(algorithm: str) -> Literal["student", "teacher"]:
+    """Returns which policy should select the top-K vocab indices for `algorithm`.
+
+    `reverse_kl`/`jsd`/`mopd_pg_loss` weight the divergence by the student
+    distribution, so only tokens with student mass matter — the student
+    selects. `forward_kl`/`mopd_loss` weight by the teacher distribution, so
+    the teacher selects instead.
+
+    Args:
+        algorithm: Key into `opd.loss.ALGORITHMS`.
+
+    Returns:
+        `"student"` or `"teacher"`.
+    """
+    return "teacher" if algorithm in ("forward_kl", "mopd_loss") else "student"
+
+
+def broadcast_n_minibatches(
+    is_student: bool,
+    num_sequences: int,
+    train_batch_size: int,
+    device: torch.device,
+    all_group: Any,
+) -> tuple[int, torch.Tensor | None]:
+    """Computes this epoch's minibatch count and shuffle permutation, then broadcasts the count.
+
+    The teacher rank has no rollout batch of its own but must still know how
+    many minibatch iterations to participate in, so the student-computed
+    count is broadcast to it.
+
+    Args:
+        is_student: Whether this rank is a student (FSDP) rank.
+        num_sequences: Number of sequences in the student's rollout batch
+          (ignored on non-student ranks).
+        train_batch_size: Sequences per minibatch.
+        device: Device to allocate the broadcast tensor on.
+        all_group: Process group spanning both student and teacher ranks.
+
+    Returns:
+        `(n_mb, perm)`: the number of minibatches this epoch, and a random
+        permutation over `[0, num_sequences)` used to slice minibatches.
+        `perm` is `None` on non-student ranks, which have no batch to slice.
+    """
+    if is_student:
+        n_mb = math.ceil(num_sequences / train_batch_size)
+        perm = torch.randperm(num_sequences, device=device)
+        n_mb_t = torch.tensor([n_mb], dtype=torch.long, device=device)
+    else:
+        perm = None
+        n_mb_t = torch.zeros(1, dtype=torch.long, device=device)
+    dist.broadcast(n_mb_t, src=0, group=all_group)
+    return int(n_mb_t.item()), perm
+
+
+def log_step_metrics(
+    step: int,
+    num_steps: int,
+    avg_loss: float,
+    current_lr: float,
+    tokens: int,
+    dt: float,
+    overlap_ratio: float,
+    overlap_advantage: float,
+    entropy_gap: float,
+    master_process: bool,
+    use_wandb: bool,
+) -> None:
+    """Prints a one-line step summary and logs the same metrics to wandb.
+
+    Called on student ranks only, after averaging a step's per-minibatch
+    losses and distillation health metrics (see `compute_topk_health_metrics`).
+
+    Args:
+        step: Zero-indexed training step.
+        num_steps: Total number of training steps, for the printed progress
+          fraction.
+        avg_loss: Mean distillation loss over this step's minibatches.
+        current_lr: Current learning rate.
+        tokens: Total tokens processed in this step's rollout batch.
+        dt: Wall-clock seconds this step took.
+        overlap_ratio: Mean student/teacher top-K overlap ratio.
+        overlap_advantage: Mean overlap-token advantage.
+        entropy_gap: Mean student/teacher entropy gap.
+        master_process: Whether this is the rank-0 process (only it logs to
+          wandb).
+        use_wandb: Whether wandb logging is enabled for this run.
+    """
+    print0(
+        f"step {step + 1:4d}/{num_steps} | loss {avg_loss:.4f} "
+        f"| lr {current_lr:.2e} | tokens {tokens} | dt {dt:.1f}s "
+        f"| overlap {overlap_ratio:.3f} "
+        f"| adv {overlap_advantage:.4f} "
+        f"| ent_gap {entropy_gap:.4f}"
+    )
+    if master_process and use_wandb:
+        import wandb
+        wandb.log(
+            {
+                "train/loss": avg_loss,
+                "train/learning_rate": current_lr,
+                "train/step_time_s": dt,
+                "train/tokens_per_step": tokens,
+                "metrics/overlap_ratio": overlap_ratio,
+                "metrics/overlap_token_advantage": overlap_advantage,
+                "metrics/entropy_gap": entropy_gap,
+            },
+            step=step + 1,
+        )
+
+
+def maybe_save_checkpoint(
+    student: StudentModel, save_dir: str, save_every: int, step: int
+) -> None:
+    """Saves a checkpoint every `save_every` steps, if checkpointing is enabled.
+
+    Args:
+        student: The student model to save.
+        save_dir: Directory checkpoints are written under
+          (`{save_dir}/step_{step+1}`).
+        save_every: Save every this many steps; 0 disables checkpointing.
+        step: Zero-indexed training step.
+    """
+    if save_every > 0 and (step + 1) % save_every == 0:
+        save_path = f"{save_dir}/step_{step + 1}"
+        student.save_model(save_path)
+        print0(f"Saved checkpoint to {save_path}")

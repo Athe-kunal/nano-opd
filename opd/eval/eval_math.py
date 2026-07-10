@@ -3,6 +3,7 @@ import asyncio
 import json
 from collections import Counter
 from pathlib import Path
+from typing import Any
 
 import wandb
 from datasets import load_dataset
@@ -65,6 +66,16 @@ def extract_boxed_answer(text: str) -> str:
 
 
 def grade_answer(predicted: str, ground_truth: str) -> bool:
+    """Checks whether `predicted` is mathematically equivalent to `ground_truth`.
+
+    Args:
+        predicted: Model-extracted boxed answer text, or None if not found.
+        ground_truth: The reference answer.
+
+    Returns:
+        True if `math_verify` confirms equivalence, or (as a fallback) if the
+        normalized strings match exactly.
+    """
     if predicted is None:
         return False
     try:
@@ -76,6 +87,10 @@ def grade_answer(predicted: str, ground_truth: str) -> bool:
         gt_parsed = parse(ground_truth, fallback_mode="no_fallback")
         return verify(gt_parsed, pred_parsed, timeout_seconds=5)
     except Exception:
+        # math_verify's LaTeX/sympy parsing can raise many different
+        # exception types on malformed model output (and can time out); any
+        # failure here falls back to plain normalized string comparison
+        # rather than treating the answer as ungraded.
         pred_norm = predicted.replace("$", "").replace(" ", "").lower().strip()
         gt_norm = ground_truth.replace("$", "").replace(" ", "").lower().strip()
         return pred_norm == gt_norm
@@ -89,6 +104,22 @@ def load_vllm_model(
     max_model_len: int = None,
     enable_thinking: bool = True,
 ):
+    """Loads a model into vLLM, enabling LoRA if adapter weights are found.
+
+    Args:
+        base_model_path: HuggingFace model id or local path to the base model.
+        lora_adapter_path: Directory to check for LoRA adapter weights
+          (`adapter_model.safetensors` or `.bin`); None disables the check.
+        gpu_memory_utilization: Fraction of GPU memory vLLM may use.
+        tensor_parallel_size: vLLM's internal tensor-parallel degree.
+        max_model_len: Max context length; auto-set from `enable_thinking`
+          if None.
+        enable_thinking: Whether the model's chat template should enable
+          thinking mode; also affects the auto-computed `max_model_len`.
+
+    Returns:
+        `(llm, tokenizer)`: the vLLM `LLM` engine and matching tokenizer.
+    """
     print(f"Loading model with vLLM from: {base_model_path}")
 
     if max_model_len is None:
@@ -136,7 +167,18 @@ async def prepare_dataset(
     num_samples: int = None,
     enable_thinking: bool = True,
 ) -> dict:
-    """Load dataset and build prompts (I/O-bound, runs concurrently via asyncio.gather)."""
+    """Loads a dataset and builds chat-templated prompts (I/O-bound, runs concurrently via asyncio.gather).
+
+    Args:
+        dataset_name: Key into `DATASETS`.
+        tokenizer: Tokenizer used to render the chat template.
+        num_samples: If set, cap the dataset to this many problems.
+        enable_thinking: Passed to the tokenizer's chat template.
+
+    Returns:
+        A dict with `dataset_name`, `prompts`, `gt_answers`, `problems`,
+        `question_ids`, and `num_problems`.
+    """
     cfg = DATASETS[dataset_name]
     print(f"Loading {dataset_name} from {cfg['hf_path']}...")
 
@@ -177,89 +219,103 @@ async def prepare_dataset(
     }
 
 
-async def process_results(
-    dataset_info: dict,
-    outputs: list,
+async def _grade_single_problem(
+    idx: int,
+    output: Any,
+    problem: str,
+    gt_answer: str,
+    question_id: Any,
     val_n: int,
-    max_new_tokens: int,
-    temperature: float,
-    top_p: float,
-    top_k: int,
-    min_p: float,
-    presence_penalty: float,
-    enable_thinking: bool,
-    base_model_name: str,
-    output_file: str = None,
-    step: int = None,
 ) -> dict:
-    """Grade outputs and compute metrics (CPU-bound grading, runs concurrently via asyncio.gather)."""
-    dataset_name = dataset_info["dataset_name"]
-    problems = dataset_info["problems"]
-    gt_answers = dataset_info["gt_answers"]
-    question_ids = dataset_info["question_ids"]
-    num_problems = dataset_info["num_problems"]
+    """Grades every sampled generation for one problem and summarizes them.
 
-    print(f"\nProcessing results for {dataset_name}...")
+    Args:
+        idx: Problem's position in the dataset, used as a fallback id.
+        output: vLLM `RequestOutput` holding `val_n` sampled generations.
+        problem: The problem text.
+        gt_answer: Ground-truth answer string.
+        question_id: Dataset-provided problem id, if any.
+        val_n: Number of sampled generations per problem.
 
-    total = 0
-    formatted_count = 0
-    pass_at_n = 0
-    total_correct_per_problem = 0
-    results = []
+    Returns:
+        A dict with per-generation grading detail plus this problem's
+        pass@n / majority-vote outcome, matching one entry of
+        `process_results`'s `results` list.
+    """
+    generations, predicted_answers, is_correct_list, is_formatted_list = [], [], [], []
 
-    for idx, (output, problem, gt_answer, question_id) in enumerate(
-        zip(outputs, problems, gt_answers, question_ids)
-    ):
-        generations, predicted_answers, is_correct_list, is_formatted_list = [], [], [], []
+    for out in output.outputs:
+        predicted_answer = extract_boxed_answer(out.text)
+        is_correct = await asyncio.to_thread(grade_answer, predicted_answer, gt_answer)
+        is_formatted = predicted_answer is not None
 
-        for out in output.outputs:
-            predicted_answer = extract_boxed_answer(out.text)
-            is_correct = await asyncio.to_thread(grade_answer, predicted_answer, gt_answer)
-            is_formatted = predicted_answer is not None
+        generations.append(out.text)
+        predicted_answers.append(predicted_answer if predicted_answer else "[No boxed answer found]")
+        is_correct_list.append(is_correct)
+        is_formatted_list.append(is_formatted)
 
-            generations.append(out.text)
-            predicted_answers.append(predicted_answer if predicted_answer else "[No boxed answer found]")
-            is_correct_list.append(is_correct)
-            is_formatted_list.append(is_formatted)
+    num_formatted = sum(is_formatted_list)
+    has_correct = any(is_correct_list)
 
-        num_correct = sum(is_correct_list)
-        num_formatted = sum(is_formatted_list)
-        has_correct = any(is_correct_list)
+    majority_vote_correct = False
+    if num_formatted > 0:
+        formatted_predictions = [p for p, f in zip(predicted_answers, is_formatted_list) if f]
+        most_common = Counter(formatted_predictions).most_common(1)[0][0]
+        majority_vote_correct = await asyncio.to_thread(grade_answer, most_common, gt_answer)
 
-        majority_vote_correct = False
-        if num_formatted > 0:
-            formatted_predictions = [p for p, f in zip(predicted_answers, is_formatted_list) if f]
-            most_common = Counter(formatted_predictions).most_common(1)[0][0]
-            majority_vote_correct = await asyncio.to_thread(grade_answer, most_common, gt_answer)
+    return {
+        "problem_id": question_id if question_id is not None else idx,
+        "problem": problem,
+        "ground_truth": gt_answer,
+        "val_n": val_n,
+        "generations": [
+            {"predicted_answer": pred, "full_generation": gen, "correct": corr, "formatted": fmt}
+            for pred, gen, corr, fmt in zip(predicted_answers, generations, is_correct_list, is_formatted_list)
+        ],
+        "num_correct": sum(is_correct_list),
+        "pass_at_n": has_correct,
+        "majority_vote_correct": majority_vote_correct,
+        "predicted_answer": predicted_answers[0],
+        "full_generation": generations[0],
+        "correct": is_correct_list[0],
+        "formatted": is_formatted_list[0],
+    }
 
-        if has_correct:
-            pass_at_n += 1
-        total_correct_per_problem += num_correct
-        formatted_count += num_formatted
-        total += val_n
 
-        results.append({
-            "problem_id": question_id if question_id is not None else idx,
-            "problem": problem,
-            "ground_truth": gt_answer,
-            "val_n": val_n,
-            "generations": [
-                {"predicted_answer": pred, "full_generation": gen, "correct": corr, "formatted": fmt}
-                for pred, gen, corr, fmt in zip(predicted_answers, generations, is_correct_list, is_formatted_list)
-            ],
-            "num_correct": num_correct,
-            "pass_at_n": has_correct,
-            "majority_vote_correct": majority_vote_correct,
-            "predicted_answer": predicted_answers[0],
-            "full_generation": generations[0],
-            "correct": is_correct_list[0],
-            "formatted": is_formatted_list[0],
-        })
+def _summarize_and_log_results(
+    dataset_name: str,
+    results: list[dict],
+    val_n: int,
+    num_problems: int,
+    eval_config: dict,
+    output_file: str | None,
+    step: int | None,
+) -> dict:
+    """Aggregates per-problem results into a summary, prints it, and logs/saves it.
+
+    Args:
+        dataset_name: Name of the dataset these results belong to.
+        results: Per-problem grading dicts from `_grade_single_problem`.
+        val_n: Number of sampled generations per problem.
+        num_problems: Number of problems graded.
+        eval_config: Generation/eval hyperparameters to record in the summary
+          (temperature, top_p, top_k, min_p, presence_penalty, max_new_tokens,
+          enable_thinking, base_model).
+        output_file: If set, write the summary JSON here.
+        step: Training step for the W&B x-axis, if logging to an active run.
+
+    Returns:
+        The summary dict (also written to `output_file` and logged to W&B).
+    """
+    total = num_problems * val_n
+    formatted_count = sum(g["formatted"] for r in results for g in r["generations"])
+    total_correct_per_problem = sum(r["num_correct"] for r in results)
+    pass_at_n = sum(1 for r in results if r["pass_at_n"])
+    majority_vote_correct_count = sum(1 for r in results if r["majority_vote_correct"])
 
     format_rate = formatted_count / total * 100
     pass_at_n_pct = pass_at_n / num_problems * 100
     average_at_n_pct = total_correct_per_problem / total * 100
-    majority_vote_correct_count = sum(1 for r in results if r["majority_vote_correct"])
     majority_vote_at_n_pct = majority_vote_correct_count / num_problems * 100
 
     print(f"\n{'='*70}")
@@ -280,15 +336,8 @@ async def process_results(
         wandb.log(log_data, step=step)
 
     summary = {
-        "base_model": base_model_name,
+        **eval_config,
         "dataset": dataset_name,
-        "enable_thinking": enable_thinking,
-        "temperature": temperature,
-        "top_p": top_p,
-        "top_k": top_k,
-        "min_p": min_p,
-        "presence_penalty": presence_penalty,
-        "max_new_tokens": max_new_tokens,
         "val_n": val_n,
         "num_problems": num_problems,
         "total_solutions": total,
@@ -311,6 +360,72 @@ async def process_results(
         print(f"Results saved to: {output_file}")
 
     return summary
+
+
+async def process_results(
+    dataset_info: dict,
+    outputs: list,
+    val_n: int,
+    max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    min_p: float,
+    presence_penalty: float,
+    enable_thinking: bool,
+    base_model_name: str,
+    output_file: str = None,
+    step: int = None,
+) -> dict:
+    """Grades every problem's outputs and returns the aggregated summary.
+
+    Args:
+        dataset_info: Dict from `prepare_dataset` (problems, gt_answers, etc).
+        outputs: vLLM `RequestOutput` list, one per problem, `val_n` samples each.
+        val_n: Number of sampled generations per problem.
+        max_new_tokens: Max generation length, recorded in the summary.
+        temperature: Sampling temperature, recorded in the summary.
+        top_p: Sampling top-p, recorded in the summary.
+        top_k: Sampling top-k, recorded in the summary.
+        min_p: Sampling min-p, recorded in the summary.
+        presence_penalty: Sampling presence penalty, recorded in the summary.
+        enable_thinking: Whether thinking mode was enabled, recorded in the summary.
+        base_model_name: Model name, recorded in the summary.
+        output_file: If set, write the summary JSON here.
+        step: Training step for the W&B x-axis, if logging to an active run.
+
+    Returns:
+        The aggregated summary dict for this dataset (CPU-bound grading runs
+        concurrently with other datasets via the caller's `asyncio.gather`).
+    """
+    dataset_name = dataset_info["dataset_name"]
+    problems = dataset_info["problems"]
+    gt_answers = dataset_info["gt_answers"]
+    question_ids = dataset_info["question_ids"]
+    num_problems = dataset_info["num_problems"]
+
+    print(f"\nProcessing results for {dataset_name}...")
+
+    results = [
+        await _grade_single_problem(idx, output, problem, gt_answer, question_id, val_n)
+        for idx, (output, problem, gt_answer, question_id) in enumerate(
+            zip(outputs, problems, gt_answers, question_ids)
+        )
+    ]
+
+    eval_config = {
+        "base_model": base_model_name,
+        "enable_thinking": enable_thinking,
+        "temperature": temperature,
+        "top_p": top_p,
+        "top_k": top_k,
+        "min_p": min_p,
+        "presence_penalty": presence_penalty,
+        "max_new_tokens": max_new_tokens,
+    }
+    return _summarize_and_log_results(
+        dataset_name, results, val_n, num_problems, eval_config, output_file, step
+    )
 
 
 def build_output_path(base_model, checkpoint_dir, dataset_name, enable_thinking, temperature, val_n):
@@ -409,6 +524,61 @@ async def run_evaluation(args, llm, tokenizer, lora_request, step: int = None):
     return {s["dataset"]: s for s in summaries}
 
 
+def _apply_arg_defaults(args: argparse.Namespace) -> None:
+    """Applies smoke-test overrides and auto-computed defaults to parsed args, in place.
+
+    Args:
+        args: Parsed CLI args, mutated in place.
+
+    Raises:
+        SystemExit: If `--checkpoint_dir` is set but doesn't exist.
+    """
+    if args.smoke_test:
+        args.num_samples = 1
+        args.val_n = 4
+        print("SMOKE TEST MODE: 1 sample per dataset, val_n=1")
+
+    if args.checkpoint_dir is not None and not Path(args.checkpoint_dir).exists():
+        print(f"ERROR: Checkpoint directory does not exist: {args.checkpoint_dir}")
+        exit(1)
+
+    if args.top_p is None:
+        args.top_p = 0.95 if args.enable_thinking else 0.8
+        print(f"Auto-setting top_p to {args.top_p}")
+
+    if args.enable_thinking and args.temperature == 0.0:
+        print("WARNING: greedy decoding in thinking mode may cause repetitions; Qwen3 recommends temp=0.6")
+
+
+def _build_lora_request(checkpoint_dir: str | None) -> Any:
+    """Builds a vLLM `LoRARequest` if `checkpoint_dir` holds LoRA adapter weights.
+
+    Args:
+        checkpoint_dir: Path to a checkpoint directory, or None to skip LoRA.
+
+    Returns:
+        A `LoRARequest`, or None if no checkpoint dir was given, no adapter
+        weights were found there, or `vllm.lora` could not be imported.
+    """
+    if checkpoint_dir is None:
+        return None
+    try:
+        from vllm.lora.request import LoRARequest
+
+        adapter_safetensors = Path(checkpoint_dir) / "adapter_model.safetensors"
+        adapter_bin = Path(checkpoint_dir) / "adapter_model.bin"
+
+        if adapter_safetensors.exists() or adapter_bin.exists():
+            print(f"✓ LoRA request created for: {checkpoint_dir}")
+            return LoRARequest("checkpoint_lora", 1, checkpoint_dir)
+        print(f"Warning: No LoRA weights found at {checkpoint_dir}. Using base model only.")
+    except ImportError:
+        print("Warning: Could not import LoRARequest. Running without LoRA.")
+    except Exception as e:
+        print(f"Warning: Could not create LoRA request: {e}")
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate models on AIME 2024, AIME 2025, and HMMT 2025")
     parser.add_argument(
@@ -442,22 +612,7 @@ def main():
     parser.add_argument("--step", type=int, default=None, help="Training step for x-axis in W&B plots")
 
     args = parser.parse_args()
-
-    if args.smoke_test:
-        args.num_samples = 1
-        args.val_n = 4
-        print("SMOKE TEST MODE: 1 sample per dataset, val_n=1")
-
-    if args.checkpoint_dir is not None and not Path(args.checkpoint_dir).exists():
-        print(f"ERROR: Checkpoint directory does not exist: {args.checkpoint_dir}")
-        exit(1)
-
-    if args.top_p is None:
-        args.top_p = 0.95 if args.enable_thinking else 0.8
-        print(f"Auto-setting top_p to {args.top_p}")
-
-    if args.enable_thinking and args.temperature == 0.0:
-        print("WARNING: greedy decoding in thinking mode may cause repetitions; Qwen3 recommends temp=0.6")
+    _apply_arg_defaults(args)
 
     if args.wandb_project:
         wandb.init(project=args.wandb_project, name=args.wandb_run_name, config=vars(args))
@@ -471,23 +626,7 @@ def main():
         enable_thinking=args.enable_thinking,
     )
 
-    lora_request = None
-    if args.checkpoint_dir is not None:
-        try:
-            from vllm.lora.request import LoRARequest
-
-            adapter_safetensors = Path(args.checkpoint_dir) / "adapter_model.safetensors"
-            adapter_bin = Path(args.checkpoint_dir) / "adapter_model.bin"
-
-            if adapter_safetensors.exists() or adapter_bin.exists():
-                lora_request = LoRARequest("checkpoint_lora", 1, args.checkpoint_dir)
-                print(f"✓ LoRA request created for: {args.checkpoint_dir}")
-            else:
-                print(f"Warning: No LoRA weights found at {args.checkpoint_dir}. Using base model only.")
-        except ImportError:
-            print("Warning: Could not import LoRARequest. Running without LoRA.")
-        except Exception as e:
-            print(f"Warning: Could not create LoRA request: {e}")
+    lora_request = _build_lora_request(args.checkpoint_dir)
 
     all_summaries = asyncio.run(run_evaluation(args, llm, tokenizer, lora_request, step=args.step))
 

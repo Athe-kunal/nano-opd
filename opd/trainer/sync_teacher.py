@@ -29,11 +29,16 @@ class TeacherSyncer(ABC):
     @abstractmethod
     def step(
         self,
-        student_params: Iterable[nn.Parameter],
+        student_params: Iterable[torch.Tensor],
         teacher_params: Iterable[nn.Parameter],
         global_step: int,
     ) -> None:
-        """Update teacher parameters in-place given current student parameters."""
+        """Update teacher parameters in-place given current student parameters.
+
+        `student_params` is often a plain tensor iterable (e.g. broadcast
+        receive buffers), not necessarily `nn.Parameter` — only `.data`
+        access is required, which both support.
+        """
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +64,7 @@ class EMASyncer(TeacherSyncer):
 
     def step(
         self,
-        student_params: Iterable[nn.Parameter],
+        student_params: Iterable[torch.Tensor],
         teacher_params: Iterable[nn.Parameter],
         global_step: int,
     ) -> None:
@@ -103,7 +108,7 @@ class TrustRegionSyncer(TeacherSyncer):
 
     def step(
         self,
-        student_params: Iterable[nn.Parameter],
+        student_params: Iterable[torch.Tensor],
         teacher_params: Iterable[nn.Parameter],
         global_step: int,
     ) -> None:
@@ -136,7 +141,7 @@ class HardSyncSyncer(TeacherSyncer):
 
     def step(
         self,
-        student_params: Iterable[nn.Parameter],
+        student_params: Iterable[torch.Tensor],
         teacher_params: Iterable[nn.Parameter],
         global_step: int,
     ) -> None:
@@ -165,7 +170,7 @@ class OnPolicySyncer(TeacherSyncer):
 
     def step(
         self,
-        student_params: Iterable[nn.Parameter],
+        student_params: Iterable[torch.Tensor],
         teacher_params: Iterable[nn.Parameter],
         global_step: int,
     ) -> None:

@@ -1,4 +1,4 @@
-from typing import Dict, cast
+from typing import cast
 
 import torch
 import torch.distributed as dist
@@ -6,7 +6,7 @@ from omegaconf import OmegaConf, DictConfig
 from accelerate import init_empty_weights
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from .base import FSDPWoker
+from .base import FSDPWorker
 from .data_parallelism import prepare_dp_model
 
 
@@ -49,7 +49,7 @@ class TeacherModel:
         ).logits
 
 
-class StudentModel(FSDPWoker):
+class StudentModel(FSDPWorker):
     """
     Student model for on-policy distillation training using FSDP only.
 
@@ -100,7 +100,10 @@ class StudentModel(FSDPWoker):
     # ------------------------------------------------------------------
 
     def _init_weight_context(self, use_meta_tensor: bool = True):
-        # Global rank 0 is always a student rank; load weights there on CPU.
+        """See base class. Unlike `FSDPWorker`, there is no tensor-parallel rank to check.
+
+        Global rank 0 is always a student rank; load weights there on CPU.
+        """
         if any([
             dist.get_rank() == 0,
             getattr(self.config, "offload_model", False),
@@ -109,7 +112,8 @@ class StudentModel(FSDPWoker):
             return torch.device("cpu")
         return init_empty_weights()
 
-    def _prepare_model_optimizer(self):
+    def _prepare_model_optimizer(self) -> None:
+        """See base class. Builds FSDP over `process_group` (student ranks only), not a device mesh."""
         if self.config.enable_gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
 
@@ -124,7 +128,7 @@ class StudentModel(FSDPWoker):
         )
 
         optimizer_config = cast(
-            Dict, OmegaConf.to_container(self.config.optimizer, resolve=True)
+            dict, OmegaConf.to_container(self.config.optimizer, resolve=True)
         )
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(), **optimizer_config
@@ -134,9 +138,12 @@ class StudentModel(FSDPWoker):
     def _scale_loss(self, loss: torch.Tensor) -> torch.Tensor:
         return self.data_parallel_size * loss
 
-    def save_model(self, save_dir: str):
-        # Override to barrier within student_group only; teacher ranks must not
-        # participate in this barrier (they don't call save_model).
+    def save_model(self, save_dir: str) -> None:
+        """See base class. Barriers within `process_group` (student ranks) only.
+
+        Teacher ranks must not participate in this barrier since they never
+        call `save_model`.
+        """
         state_dict = self._get_model_state_dict(full_state_dict=True)
         if dist.get_rank() == 0:
             self.tokenizer.save_pretrained(save_dir)

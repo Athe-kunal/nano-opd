@@ -1,11 +1,14 @@
+"""FSDP data-parallel wrapping helpers: sharding strategies and model prep."""
+
 import functools
+
 import torch
-import torch.nn as nn
 import torch.distributed as dist
+import torch.nn as nn
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
     MixedPrecision,
-    ShardingStrategy
+    ShardingStrategy,
 )
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
@@ -25,10 +28,16 @@ DP_SHARDING_STRATEGIES: dict[str, ShardingStrategy] = {
     "_HYBRID_SHARD_ZERO2": ShardingStrategy._HYBRID_SHARD_ZERO2,
 }
 
-def _param_init_fn(module: nn.Module):
-    # FSDP already walks the module tree itself when applying wrapping policies. 
-    # If your init function also recursed into children, you'd be double-initializing 
+
+def _param_init_fn(module: nn.Module) -> None:
+    """Materializes one meta-device submodule in place, for FSDP's param_init_fn hook.
+
+    FSDP already walks the module tree itself when applying wrapping
+    policies, so this must not recurse into children or they would be
+    double-initialized.
+    """
     module.to_empty(device=torch.cuda.current_device(), recurse=False)
+
 
 def prepare_dp_model(
     model: nn.Module,
@@ -38,11 +47,34 @@ def prepare_dp_model(
     process_group=None,
     sharding_strategy: str = "HYBRID_SHARD",
 ) -> FSDP:
-    def _get_module_cls_from_name(name: str) -> type[nn.Module]:
+    """Wraps `model` in FSDP with the given mixed-precision and sharding config.
+
+    Args:
+        model: The module to wrap. Its `_no_split_modules` attribute names
+          the transformer layer classes FSDP should treat as atomic
+          wrapping units.
+        dtype: Name of a `torch` dtype (e.g. "bfloat16") used for
+          parameters, gradient reduction, and buffers.
+        sync_module_states: If True, broadcast rank-0 parameter values to
+          all ranks on construction (needed when other ranks were
+          initialized on the meta device).
+        device_mesh: Optional device mesh FSDP should shard over.
+        process_group: Optional process group FSDP should shard over.
+        sharding_strategy: Key into `DP_SHARDING_STRATEGIES`.
+
+    Returns:
+        The FSDP-wrapped model.
+
+    Raises:
+        ValueError: If `sharding_strategy` is not a known strategy name.
+    """
+    def _get_module_cls_from_name(name: str) -> type[nn.Module] | None:
+        """Returns the first submodule class in `model` named `name`, if any."""
         for module in model.modules():
             if module.__class__.__name__ == name:
                 return module.__class__
-    
+        return None
+
     transformer_layer_cls = {
         _get_module_cls_from_name(name)
         for name in model._no_split_modules
@@ -51,13 +83,13 @@ def prepare_dp_model(
         transformer_auto_wrap_policy,
         transformer_layer_cls=transformer_layer_cls
     )
-    dtype: torch.dtype = getattr(torch, dtype)
+    torch_dtype: torch.dtype = getattr(torch, dtype)
     mixed_precision = MixedPrecision(
-        param_dtype = dtype,
+        param_dtype=torch_dtype,
         # gradient all reduce
-        reduce_dtype=dtype,
+        reduce_dtype=torch_dtype,
         # batch norm, running stats
-        buffer_dtype=dtype
+        buffer_dtype=torch_dtype,
     )
     try:
         strat = DP_SHARDING_STRATEGIES[sharding_strategy]

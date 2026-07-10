@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 import torch
 import torch.distributed as dist
@@ -128,9 +128,9 @@ def sync_student_to_teacher(
             buf = torch.empty_like(t_param.data)
             dist.broadcast(buf, src=0, group=all_group)
             received.append(buf)
-        student_proxy = (torch.nn.Parameter(r, requires_grad=False) for r in received)
-        syncer.step(student_proxy, teacher.model.parameters(), global_step)
-        # print directly — this runs only on the teacher rank, not rank 0
+        syncer.step(received, teacher.model.parameters(), global_step)
+        # print directly — this runs only on the teacher rank, not rank 0, so
+        # print0's rank-0-only gating would silently drop it.
         print(f"[sync step={global_step}] teacher updated via {syncer.__class__.__name__}", flush=True)
 
 
@@ -440,23 +440,58 @@ def align_to_rmax(t_resp, t_compact_mask, R_max):
 
 
 def minibatch_exchange(
-    is_student, is_teacher, mb_ids, mb_attn, mb_mask,
-    t_mb_ids, t_mb_attn, t_mb_mask, student_model, teacher,
-    select_topk_by, K, s_chunk, t_chunk, teacher_global_rank, all_group, device,
-    is_pg=False,
-):
+    is_student: bool,
+    is_teacher: bool,
+    mb_ids: torch.Tensor | None,
+    mb_attn: torch.Tensor | None,
+    mb_mask: torch.Tensor | None,
+    t_mb_ids: torch.Tensor | None,
+    t_mb_attn: torch.Tensor | None,
+    t_mb_mask: torch.Tensor | None,
+    student_model: torch.nn.Module | None,
+    teacher: Any | None,
+    select_topk_by: Literal["student", "teacher"],
+    K: int,
+    s_chunk: int,
+    t_chunk: int,
+    teacher_global_rank: int,
+    all_group: Any,
+    device: torch.device,
+    is_pg: bool = False,
+) -> tuple[TopKExchange | dict, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
     """Student + teacher forward, then top-K exchange (or, for MOPD-PG, the
     lighter sampled-token-only exchange). Shared by SDPO / OPSD / SDFT — the
     three self-teacher scripts where the teacher's prompt carries extra
     context (feedback, a reference solution, or a demonstration) and so
     produces a different-length sequence than the student's.
 
-    Returns (tk, s_resp, s_compact_mask, s_shift_mask, student_logits).
+    Args:
+        is_student: Whether this rank is a student (FSDP) rank.
+        is_teacher: Whether this rank is the teacher rank.
+        mb_ids: Student input ids, `[B, T_s]` (student ranks only).
+        mb_attn: Student attention mask, `[B, T_s]` (student ranks only).
+        mb_mask: Student response mask, `[B, T_s]` (student ranks only).
+        t_mb_ids: Teacher input ids, `[B, T_t]` (teacher rank only).
+        t_mb_attn: Teacher attention mask, `[B, T_t]` (teacher rank only).
+        t_mb_mask: Teacher response mask, `[B, T_t]` (teacher rank only).
+        student_model: The FSDP-wrapped student model (student ranks only).
+        teacher: The teacher model (teacher rank only).
+        select_topk_by: Whether the student or the teacher selects top-K
+          indices (ignored when `is_pg` is True).
+        K: Top-K vocab size for the distillation exchange.
+        s_chunk: Chunk size along T for student top-K computation.
+        t_chunk: Chunk size along T for teacher top-K computation.
+        teacher_global_rank: Global rank of the teacher process.
+        all_group: Process group spanning student and teacher ranks.
+        device: Device to allocate broadcast tensors on.
+        is_pg: If True, use the lighter MOPD-PG sampled-token exchange
+          instead of a full top-K exchange.
 
-    When is_pg=True: s_resp/s_compact_mask are None (never packed — the PG
-    form doesn't need the full top-K distribution) and tk is the dict
-    {"s_logprob", "t_logprob", "s_compact_mask", "t_compact_mask"} from
-    exchange_mopd_pg_packed, instead of a TopKExchange.
+    Returns:
+        `(tk, s_resp, s_compact_mask, s_shift_mask, student_logits)`. When
+        `is_pg` is True, `s_resp`/`s_compact_mask` are `None` (never packed)
+        and `tk` is the dict from `exchange_mopd_pg_packed` instead of a
+        `TopKExchange`.
     """
     if is_student:
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):

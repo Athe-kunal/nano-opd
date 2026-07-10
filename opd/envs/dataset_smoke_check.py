@@ -1,4 +1,9 @@
-"""Smoke tests for OPDEnvBase subclasses (init / step / compute_reward / get_feedback)."""
+"""Manual smoke checks for OPDEnvBase subclasses (init / step / compute_reward / get_feedback).
+
+Not a pytest suite: these call `.load()` against live HuggingFace datasets
+(and, with --vllm, a running vLLM server) and print traces for manual
+inspection. Run directly: `python -m opd.envs.dataset_smoke_check [--vllm]`.
+"""
 
 from opd.envs.dapo_dataset import DapoMathEnv
 from opd.envs.livecodebench import LiveCodeBenchEnv
@@ -58,7 +63,7 @@ def _show_step(env, action: str, label: str, **extra_rows):
         print(f"  feedback: {result['metadata']['feedback']}")
 
 
-def test_dapo_math():
+def smoke_check_dapo_math():
     c = _rich_console
     if c:
         c.rule("[bold]DapoMathEnv[/bold]")
@@ -70,7 +75,7 @@ def test_dapo_math():
         _show_step(env, FAKE_MATH_WRONG, f"DapoMath [{i}] wrong")
 
 
-def test_livecodebench():
+def smoke_check_livecodebench():
     c = _rich_console
     if c:
         c.rule("[bold]LiveCodeBenchEnv[/bold]")
@@ -82,7 +87,7 @@ def test_livecodebench():
         _show_step(env, FAKE_CODE_WRONG, f"LiveCodeBench [{i}] no code block")
 
 
-def test_sciknoweval():
+def smoke_check_sciknoweval():
     c = _rich_console
     if c:
         c.rule("[bold]SciKnowEvalEnv[/bold]")
@@ -128,7 +133,7 @@ def _render_trace(
     console.print(Panel(table, title=title, border_style="dim", expand=True))
 
 
-def test_vllm_server(
+def run_vllm_smoke_check(
     base_url: str = "http://localhost:8000",
     model: str | None = None,
     n_prompts: int = 3,
@@ -155,10 +160,10 @@ def test_vllm_server(
     try:
         from openai import OpenAI
     except ImportError as e:
-        raise ImportError("pip install openai to use test_vllm_server") from e
+        raise ImportError("pip install openai to use run_vllm_smoke_check") from e
 
     if _rich_console is None:
-        raise ImportError("pip install rich to use test_vllm_server")
+        raise ImportError("pip install rich to use run_vllm_smoke_check")
 
     console = _rich_console
     client = OpenAI(base_url=f"{base_url}/v1", api_key="EMPTY")
@@ -241,7 +246,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.vllm:
-        test_vllm_server(
+        run_vllm_smoke_check(
             base_url=args.base_url,
             model=args.model,
             n_prompts=args.n_prompts,
@@ -249,7 +254,7 @@ if __name__ == "__main__":
             max_tokens=args.max_tokens,
         )
     else:
-        test_dapo_math()
-        test_livecodebench()
-        test_sciknoweval()
+        smoke_check_dapo_math()
+        smoke_check_livecodebench()
+        smoke_check_sciknoweval()
         print("\n\nDone.")

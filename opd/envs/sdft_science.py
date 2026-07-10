@@ -3,10 +3,9 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from datasets import load_dataset
 from skyrl_gym.envs.base_text_env import ConversationType
 
-from opd.envs.base import OPDEnvBase
+from opd.envs.base import OPDEnvBase, build_system_user_conversation, load_arrow_split
 
 _BASE_URL = "https://github.com/idanshen/Self-Distillation/raw/main/data/science_data"
 
@@ -29,8 +28,7 @@ def load_sdft_science(split: str = "train") -> list[dict]:
     Returns:
         List of {"question": str, "demonstration": str} dicts.
     """
-    url = f"{_BASE_URL}/{split}_data/data-00000-of-00001.arrow"
-    ds = load_dataset("arrow", data_files={split: url}, split=split)
+    ds = load_arrow_split(_BASE_URL, split)
 
     records = []
     for row in ds:
@@ -47,8 +45,7 @@ def load_sdft_science_eval() -> list[dict]:
     The eval split has a different schema from train: each row has `prompt`
     (the MCQ question) and `answer` (correct letter A/B/C/D).
     """
-    url = f"{_BASE_URL}/eval_data/data-00000-of-00001.arrow"
-    ds = load_dataset("arrow", data_files={"eval": url}, split="eval")
+    ds = load_arrow_split(_BASE_URL, "eval")
     return [{"question": row["prompt"], "answer": row["answer"]} for row in ds]
 
 
@@ -80,11 +77,7 @@ class SdftScienceEnv(OPDEnvBase):
         self.demonstration = demonstration
 
     def init(self, prompt: ConversationType) -> tuple[ConversationType, dict[str, Any]]:
-        conversation = [
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": self.question},
-        ]
-        return conversation, {}
+        return build_system_user_conversation(_SYSTEM_PROMPT, self.question), {}
 
     def compute_reward(self, response: str) -> tuple[float, bool]:
         return 1.0, True

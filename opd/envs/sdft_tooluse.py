@@ -3,10 +3,9 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from datasets import load_dataset
 from skyrl_gym.envs.base_text_env import ConversationType
 
-from opd.envs.base import OPDEnvBase
+from opd.envs.base import OPDEnvBase, build_system_user_conversation, load_arrow_split
 
 _BASE_URL = "https://github.com/idanshen/Self-Distillation/raw/main/data/tooluse_data"
 
@@ -45,8 +44,7 @@ def load_sdft_tooluse(split: str = "train") -> list[dict]:
     Returns:
         List of {"question": str, "demonstration": str} dicts.
     """
-    url = f"{_BASE_URL}/{split}_data/data-00000-of-00001.arrow"
-    ds = load_dataset("arrow", data_files={split: url}, split=split)
+    ds = load_arrow_split(_BASE_URL, split)
 
     records = []
     for row in ds:
@@ -64,8 +62,7 @@ def load_sdft_tooluse_eval() -> list[dict]:
     Unlike load_sdft_tooluse, keeps golden_answer as a raw list[dict] so the
     grader can compare action names directly.
     """
-    url = f"{_BASE_URL}/eval_data/data-00000-of-00001.arrow"
-    ds = load_dataset("arrow", data_files={"eval": url}, split="eval")
+    ds = load_arrow_split(_BASE_URL, "eval")
     records: list[dict] = []
     for row in ds:
         prompt = (row.get("prompt") or "").strip()
@@ -100,11 +97,7 @@ class SdftToolUseEnv(OPDEnvBase):
         self.demonstration = demonstration
 
     def init(self, prompt: ConversationType) -> tuple[ConversationType, dict[str, Any]]:
-        conversation = [
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": self.question},
-        ]
-        return conversation, {}
+        return build_system_user_conversation(_SYSTEM_PROMPT, self.question), {}
 
     def compute_reward(self, response: str) -> tuple[float, bool]:
         return 1.0, True

@@ -2,23 +2,15 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Optional, List, Dict
+from typing import Any
 
-from math import comb
 import wandb
 from datasets import Dataset, load_dataset
 from skyrl_gym.envs.base_text_env import ConversationType
 
-from opd.trainer.setup_utils import print0
-from opd.envs.base import OPDEnvBase
+from opd.envs.base import OPDEnvBase, build_system_user_conversation, pass_at_k
 from opd.generator.rollout import generate_rollouts_remote
-
-def pass_at_k(n: int, c: int, k: int) -> float:
-    """Unbiased pass@k estimator."""
-    if n - c < k:
-        return 1.0
-    return 1.0 - comb(n - c, k) / comb(n, k)
-
+from opd.trainer.setup_utils import print0
 
 SYSTEM_PROMPT = """
 Given a question and four options, please select the right answer. Respond in the following format:
@@ -36,7 +28,7 @@ A
 """
 
 
-def format_choices(choices: Dict[str, str]) -> str:
+def format_choices(choices: dict[str, list[str]]) -> str:
     texts, labels = choices['text'], choices['label']
     return "\n".join([f"{label}: {text}" for label, text in zip(labels, texts)])
 
@@ -61,9 +53,9 @@ def _extract_answer(response: str) -> str | None:
 
 
 def load_sciknoweval(
-    domains: Optional[List[str]] = None,
-    levels: Optional[List[str]] = None,
-    types: Optional[List[str]] = None,
+    domains: list[str] | None = None,
+    levels: list[str] | None = None,
+    types: list[str] | None = None,
 ) -> Dataset:
     ds = load_dataset("hicai-zju/SciKnowEval", split='test')
 
@@ -79,7 +71,7 @@ def load_sciknoweval(
     # The raw dataset generates multiple MCQ variants from the same question stem.
     # Deduplicate by description so each underlying question appears only once.
     seen: set[str] = set()
-    def _is_unique(row):
+    def _is_unique(row: dict[str, Any]) -> bool:
         if row["description"] in seen:
             return False
         seen.add(row["description"])
@@ -91,9 +83,9 @@ def load_sciknoweval(
 def load_sciknoweval_split(
     test_size: float,
     seed: int = 42,
-    domains: Optional[List[str]] = None,
-    levels: Optional[List[str]] = None,
-    types: Optional[List[str]] = None,
+    domains: list[str] | None = None,
+    levels: list[str] | None = None,
+    types: list[str] | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """Return (train_rows, test_rows) as plain lists. Split is deterministic."""
     ds = load_sciknoweval(domains=domains, levels=levels, types=types)
@@ -111,8 +103,6 @@ class SciKnowEvalEnv(OPDEnvBase):
     evaluate runs the held-out 10% test split via the rollout worker.
     """
 
-    _test_rows: list[dict] = []
-
     def __init__(self, prompt: str, answer_key: str, choices_text: str = "", system: str = SYSTEM_PROMPT) -> None:
         super().__init__(kind="mcq", dataset="sciknoweval")
         self.prompt = prompt
@@ -121,11 +111,7 @@ class SciKnowEvalEnv(OPDEnvBase):
         self.system = system
 
     def init(self, prompt: ConversationType) -> tuple[ConversationType, dict[str, Any]]:
-        messages: ConversationType = [
-            {"role": "system", "content": self.system},
-            {"role": "user", "content": self.prompt},
-        ]
-        return messages, {}
+        return build_system_user_conversation(self.system, self.prompt), {}
 
     def compute_reward(self, action: str) -> tuple[float, bool]:
         pred = _extract_answer(action)
@@ -162,9 +148,9 @@ class SciKnowEvalEnv(OPDEnvBase):
     def load(
         cls,
         test_size: float = 0.01,
-        domains: Optional[List[str]] = None,
-        levels: Optional[List[str]] = None,
-        types: Optional[List[str]] = None,
+        domains: list[str] | None = None,
+        levels: list[str] | None = None,
+        types: list[str] | None = None,
         seed: int = 42,
     ) -> list[SciKnowEvalEnv]:
         train_rows, _ = load_sciknoweval_split(test_size=test_size, seed=seed, domains=domains, levels=levels, types=types)

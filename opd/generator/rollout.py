@@ -210,9 +210,9 @@ def prepare_batch(
     Raises:
         ValueError: If any rollout's prompt exceeds `max_prompt_len`.
     """
-    input_ids_list = []
-    response_mask_list = []
-    inference_logprobs_list = []
+    input_ids_list: list[int] = []
+    response_mask_list: list[int] = []
+    inference_logprobs_list: list[float] = []
     for rollout in rollouts:
         prompt_ids = rollout["prompt_ids"]
         response_ids = rollout["response_ids"]

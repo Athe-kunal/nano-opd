@@ -165,6 +165,7 @@ def init_vllm_transfer(
     transfer_world_size = train_world_size + rollout_worker_world_size
 
     if master_process:
+        # vLLM initializes dummy weights
         remote_vllm_init_weight_transfer(
             rollout_worker_url,
             master_address=master_addr,

@@ -35,7 +35,7 @@ def _masked_token_mean(
 
 def _tail_probs(probs: torch.Tensor) -> torch.Tensor:
     """Probability mass outside the top-K support: 1 - Σ_K p(k)."""
-    return (1.0 - probs.sum(dim=-1)).clamp(min=1e-8)  # [B, T]
+    return (1.0 - torch.einsum("btk->bt", probs)).clamp(min=1e-8)  # [B, T]
 
 
 def compute_reverse_kl_loss(
@@ -195,7 +195,7 @@ def compute_mopd_loss(
     teacher_probs = teacher_logprobs.exp()
 
     per_token = torch.einsum("btk,btk->bt", student_probs, student_logprobs - teacher_logprobs)
-    per_token = per_token - student_probs.sum(dim=-1) + teacher_probs.sum(dim=-1)
+    per_token = per_token - torch.einsum("btk->bt", student_probs) + torch.einsum("btk->bt", teacher_probs)
     return _masked_token_mean(per_token, response_mask, tis_weights, kl_clip)
 
 

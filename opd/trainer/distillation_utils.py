@@ -72,6 +72,46 @@ def bcast_or_alloc_async(
     return tensor, handle
 
 
+def bcast_or_alloc_many(
+    *,
+    specs: list[tuple[torch.Tensor | None, tuple[int, ...], torch.dtype]],
+    is_owner: bool,
+    src: int,
+    device: torch.device,
+    group: Any,
+) -> list[torch.Tensor]:
+    """Issues `bcast_or_alloc_async` for each `(tensor, shape, dtype)` in `specs`, then waits on all.
+
+    Broadcasting several independent tensors is a repeated pattern in this
+    module (a minibatch's ids + attention mask, a top-K exchange's four
+    result tensors, ...). Doing it through one call instead of a manual
+    `h1, h2, h3, ... = ...; h1.wait(); h2.wait(); ...` sequence removes that
+    per-call-site bookkeeping while keeping the same overlap-on-the-wire
+    behavior (all broadcasts are issued before any wait happens).
+
+    Args:
+        specs: `(tensor, shape, dtype)` triples, one per tensor to broadcast.
+          `tensor` is only read on the owning rank; non-owning ranks use
+          `shape`/`dtype` to allocate a placeholder.
+        is_owner: Whether this rank is `src` and holds the real data for
+          every tensor in `specs`.
+        src: Source rank of the broadcast.
+        device: Device to allocate placeholders on.
+        group: Process group to broadcast within.
+
+    Returns:
+        The broadcast tensors, in the same order as `specs`.
+    """
+    pending = [
+        bcast_or_alloc_async(tensor=tensor, is_owner=is_owner, shape=shape, dtype=dtype, src=src, device=device, group=group)
+        for tensor, shape, dtype in specs
+    ]
+    tensors, handles = zip(*pending)
+    for handle in handles:
+        handle.wait()
+    return list(tensors)
+
+
 def _broadcast_shape(
     is_student: bool,
     local_shape: tuple[int, int] | None,
@@ -126,7 +166,7 @@ def pack_response_logits(
         `compact_mask` is `[B, R_max]`, 1 where a response token exists.
     """
     B, _, V = logits.shape
-    resp_counts = shift_mask.long().sum(dim=1)     # [B]
+    resp_counts = torch.einsum("bt->b", shift_mask.long())     # [B]
     R_max = int(resp_counts.max().item())
     if R_max == 0:
         return logits.new_zeros(B, 0, V), shift_mask.new_zeros(B, 0)
@@ -288,16 +328,10 @@ def broadcast_minibatch(
         is_student, (mb_ids.shape[0], mb_ids.shape[1]) if is_student else None, device, all_group,
     )
 
-    mb_ids, h1 = bcast_or_alloc_async(
-        tensor=mb_ids, is_owner=is_student, shape=(B, T), dtype=torch.long,
-        src=0, device=device, group=all_group,
+    mb_ids, mb_attn = bcast_or_alloc_many(
+        specs=[(mb_ids, (B, T), torch.long), (mb_attn, (B, T), torch.long)],
+        is_owner=is_student, src=0, device=device, group=all_group,
     )
-    mb_attn, h2 = bcast_or_alloc_async(
-        tensor=mb_attn, is_owner=is_student, shape=(B, T), dtype=torch.long,
-        src=0, device=device, group=all_group,
-    )
-    h1.wait()
-    h2.wait()
     return mb_ids, mb_attn
 
 
@@ -318,20 +352,14 @@ def broadcast_teacher_inputs(
         is_student, (t_mb_ids.shape[0], t_mb_ids.shape[1]) if is_student else None, device, all_group,
     )
 
-    t_mb_ids, h1 = bcast_or_alloc_async(
-        tensor=t_mb_ids, is_owner=is_student, shape=(B, T_t), dtype=torch.long,
-        src=0, device=device, group=all_group,
+    t_mb_ids, t_mb_attn, t_mb_mask = bcast_or_alloc_many(
+        specs=[
+            (t_mb_ids, (B, T_t), torch.long),
+            (t_mb_attn, (B, T_t), torch.long),
+            (t_mb_mask, (B, T_t), torch.float),
+        ],
+        is_owner=is_student, src=0, device=device, group=all_group,
     )
-    t_mb_attn, h2 = bcast_or_alloc_async(
-        tensor=t_mb_attn, is_owner=is_student, shape=(B, T_t), dtype=torch.long,
-        src=0, device=device, group=all_group,
-    )
-    t_mb_mask, h3 = bcast_or_alloc_async(
-        tensor=t_mb_mask, is_owner=is_student, shape=(B, T_t), dtype=torch.float,
-        src=0, device=device, group=all_group,
-    )
-    for h in (h1, h2, h3):
-        h.wait()
     return t_mb_ids, t_mb_attn, t_mb_mask
 
 
@@ -431,16 +459,13 @@ def exchange_mopd_pg_packed(
     else:
         t_logprob_resp = t_compact_mask = None
 
-    t_logprob_resp, h1 = bcast_or_alloc_async(
-        tensor=t_logprob_resp, is_owner=is_teacher, shape=(B, R_max), dtype=torch.bfloat16,
-        src=teacher_global_rank, device=device, group=all_group,
+    t_logprob_resp, t_compact_mask = bcast_or_alloc_many(
+        specs=[
+            (t_logprob_resp, (B, R_max), torch.bfloat16),
+            (t_compact_mask, (B, R_max), torch.float32),
+        ],
+        is_owner=is_teacher, src=teacher_global_rank, device=device, group=all_group,
     )
-    t_compact_mask, h2 = bcast_or_alloc_async(
-        tensor=t_compact_mask, is_owner=is_teacher, shape=(B, R_max), dtype=torch.float32,
-        src=teacher_global_rank, device=device, group=all_group,
-    )
-    h1.wait()
-    h2.wait()
 
     return MopdPGExchange(
         s_logprob=s_logprob_resp,
@@ -568,24 +593,15 @@ def exchange_topk(
     else:
         teacher_topk_idx = teacher_own_logprobs = t_logprobs_at_student = None
 
-    teacher_topk_idx, h1 = bcast_or_alloc_async(
-        tensor=teacher_topk_idx, is_owner=is_teacher, shape=(B, T, K), dtype=torch.long,
-        src=teacher_global_rank, device=device, group=all_group,
+    teacher_topk_idx, teacher_own_logprobs, t_logprobs_at_student, t_compact_mask = bcast_or_alloc_many(
+        specs=[
+            (teacher_topk_idx, (B, T, K), torch.long),
+            (teacher_own_logprobs, (B, T, K), torch.bfloat16),
+            (t_logprobs_at_student, (B, T, K), torch.bfloat16),
+            (t_compact_mask, (B, T), torch.float32),
+        ],
+        is_owner=is_teacher, src=teacher_global_rank, device=device, group=all_group,
     )
-    teacher_own_logprobs, h2 = bcast_or_alloc_async(
-        tensor=teacher_own_logprobs, is_owner=is_teacher, shape=(B, T, K), dtype=torch.bfloat16,
-        src=teacher_global_rank, device=device, group=all_group,
-    )
-    t_logprobs_at_student, h3 = bcast_or_alloc_async(
-        tensor=t_logprobs_at_student, is_owner=is_teacher, shape=(B, T, K), dtype=torch.bfloat16,
-        src=teacher_global_rank, device=device, group=all_group,
-    )
-    t_compact_mask, h4 = bcast_or_alloc_async(
-        tensor=t_compact_mask, is_owner=is_teacher, shape=(B, T), dtype=torch.float32,
-        src=teacher_global_rank, device=device, group=all_group,
-    )
-    for h in (h1, h2, h3, h4):
-        h.wait()
 
     # The loss's shared support is whichever side select_topk_by names — the
     # other side's quantities above remain available for diagnostics only.
@@ -689,7 +705,7 @@ def minibatch_exchange(
             # [B, R_max, V], which would materialise a same-sized copy of the
             # logits for nothing.
             s_resp = s_compact_mask = None
-            R_max_local = int(s_shift_mask.long().sum(dim=1).max().item())
+            R_max_local = int(torch.einsum("bt->b", s_shift_mask.long()).max().item())
         else:
             s_resp, s_compact_mask = pack_response_logits(student_logits, s_shift_mask)
             R_max_local = s_resp.shape[1]

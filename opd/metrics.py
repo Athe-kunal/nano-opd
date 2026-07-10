@@ -19,7 +19,7 @@ def compute_overlap_ratio(
     """Fraction of student top-K tokens that also appear in the teacher's top-K."""
     in_intersection = _topk_intersection_mask(student_topk_idx, teacher_topk_idx)
     top_k = student_topk_idx.shape[-1]
-    overlap_per_position = in_intersection.float().sum(dim=-1) / top_k  # [B, T]
+    overlap_per_position = torch.einsum("btk->bt", in_intersection.float()) / top_k  # [B, T]
     return overlap_per_position.mean()
 
 
@@ -43,8 +43,8 @@ def compute_overlap_token_advantage(
 
     # Average over intersection tokens, then over (B, T)
     advantage = advantage.masked_fill(~in_intersection, 0.0)
-    n_overlap = in_intersection.float().sum(dim=-1).clamp(min=1)        # [B, T]
-    return (advantage.sum(dim=-1) / n_overlap).mean()
+    n_overlap = torch.einsum("btk->bt", in_intersection.float()).clamp(min=1)  # [B, T]
+    return (torch.einsum("btk->bt", advantage) / n_overlap).mean()
 
 
 def compute_entropy_gap(
@@ -54,8 +54,8 @@ def compute_entropy_gap(
     """Mean absolute gap between student and teacher entropy, over their own top-K."""
     s_lp = student_topk_logprobs - torch.logsumexp(student_topk_logprobs, dim=-1, keepdim=True)
     t_lp = teacher_topk_logprobs - torch.logsumexp(teacher_topk_logprobs, dim=-1, keepdim=True)
-    s_entropy = -(s_lp.exp() * s_lp).sum(dim=-1)  # [B, T]
-    t_entropy = -(t_lp.exp() * t_lp).sum(dim=-1)  # [B, T]
+    s_entropy = -torch.einsum("btk,btk->bt", s_lp.exp(), s_lp)  # [B, T]
+    t_entropy = -torch.einsum("btk,btk->bt", t_lp.exp(), t_lp)  # [B, T]
     return torch.abs(t_entropy - s_entropy).mean()
 
 

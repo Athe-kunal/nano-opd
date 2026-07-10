@@ -390,7 +390,7 @@ if __name__ == "__main__":
                 # it acts as a fixed target distribution (OPSD Eq. 1). The teacher
                 # is the frozen initial policy and never updated.
                 is_pg = args.algorithm == "mopd_pg_loss"
-                tk, s_resp, s_compact_mask, s_shift_mask, student_logits = minibatch_exchange(
+                result = minibatch_exchange(
                     is_student, is_teacher, mb_ids, mb_attn, mb_mask,
                     t_mb_ids, t_mb_attn, t_mb_mask,
                     student.model if is_student else None, teacher if is_teacher else None,
@@ -399,11 +399,11 @@ if __name__ == "__main__":
                     is_pg=is_pg,
                 )
 
-                if is_pg:
+                if result.is_pg:
                     if is_student:
                         loss = mopd_pg_loss_and_backward(
-                            student=student, pg=tk, loss_fn=loss_fn,
-                            student_logits=student_logits, sampled_ids=mb_ids[:, 1:], s_shift_mask=s_shift_mask,
+                            student=student, pg=result.pg, loss_fn=loss_fn,
+                            student_logits=result.student_logits, sampled_ids=mb_ids[:, 1:], s_shift_mask=result.s_shift_mask,
                             inf_lp_shifted=mb_inf_lp[:, 1:] if args.tis_clip > 0.0 else None,
                             tis_clip=args.tis_clip, divisor=n_mb,
                         )
@@ -413,17 +413,19 @@ if __name__ == "__main__":
 
                 # -- Loss and backward (student ranks only) --
                 if is_student:
-                    s_log_resp = F.log_softmax(s_resp.float(), dim=-1)
+                    tk = result.topk
+                    student_logits = result.student_logits
+                    s_log_resp = F.log_softmax(result.s_resp.float(), dim=-1)
                     s_logprobs      = s_log_resp.gather(-1, tk.topk_idx)
                     s_lp_at_student = s_log_resp.gather(-1, tk.student_topk_idx)
 
                     # Exclude positions where the teacher sequence was truncated
                     # (reference solution may push teacher prompt past max context).
-                    effective_mask = s_compact_mask * tk.t_compact_mask   # [B, R_max]
+                    effective_mask = result.s_compact_mask * tk.t_compact_mask   # [B, R_max]
                     if effective_mask.sum() == 0:
                         print0(
                             f"[warn mb] effective_mask is all-zero: "
-                            f"s_mask={s_compact_mask.sum().item():.0f} "
+                            f"s_mask={result.s_compact_mask.sum().item():.0f} "
                             f"t_mask={tk.t_compact_mask.sum().item():.0f}",
                             flush=True,
                         )
@@ -440,7 +442,7 @@ if __name__ == "__main__":
                         inf_lp_shifted = mb_inf_lp[:, 1:].to(s_lp_sampled.dtype)
                         tis_full       = (s_lp_sampled - inf_lp_shifted).exp().clamp(max=args.tis_clip)
                         tis_resp, _    = pack_response_logits(
-                            tis_full.unsqueeze(-1).expand_as(student_logits), s_shift_mask
+                            tis_full.unsqueeze(-1).expand_as(student_logits), result.s_shift_mask
                         )
                         tis_weights = tis_resp[..., 0]   # [B, R_max]
 

@@ -610,6 +610,23 @@ def exchange_topk(
 # ---------------------------------------------------------------------------
 
 
+@dataclass
+class MinibatchExchangeResult:
+    """Result of minibatch_exchange: exactly one of `topk`/`pg` is set, per `is_pg`.
+
+    Packed student tensors (`s_resp`, `s_compact_mask`) are only produced in
+    the top-K path (`is_pg=False`) — the PG path skips packing the full
+    logits and leaves them `None`.
+    """
+    is_pg: bool
+    topk: TopKExchange | None
+    pg: MopdPGExchange | None
+    s_resp: torch.Tensor | None
+    s_compact_mask: torch.Tensor | None
+    s_shift_mask: torch.Tensor | None
+    student_logits: torch.Tensor | None
+
+
 def minibatch_exchange(
     is_student: bool,
     is_teacher: bool,
@@ -629,7 +646,7 @@ def minibatch_exchange(
     all_group: Any,
     device: torch.device,
     is_pg: bool = False,
-) -> tuple[TopKExchange | MopdPGExchange, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+) -> MinibatchExchangeResult:
     """Student + teacher forward, then top-K exchange (or, for MOPD-PG, the
     lighter sampled-token-only exchange). Shared by SDPO / OPSD / SDFT — the
     three self-teacher scripts where the teacher's prompt carries extra
@@ -659,11 +676,8 @@ def minibatch_exchange(
           instead of a full top-K exchange.
 
     Returns:
-        `(tk, s_resp, s_compact_mask, s_shift_mask, student_logits)`. The
-        caller already holds `is_pg` (it passed it in) and branches on it
-        immediately, so it always knows which type `tk` is: when `is_pg` is
-        True, `s_resp`/`s_compact_mask` are `None` (never packed) and `tk`
-        is a `MopdPGExchange`; otherwise `tk` is a `TopKExchange`.
+        A `MinibatchExchangeResult` with `pg` set (and `topk` `None`) when
+        `is_pg` is True, or `topk` set (and `pg` `None`) otherwise.
     """
     if is_student:
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
@@ -699,7 +713,7 @@ def minibatch_exchange(
         teacher_logits = t_shift_mask = t_resp = t_compact_mask = None
 
     if is_pg:
-        tk = exchange_mopd_pg_packed(
+        pg = exchange_mopd_pg_packed(
             is_student=is_student, is_teacher=is_teacher,
             student_logits=student_logits if is_student else None,
             teacher_logits=teacher_logits if is_teacher else None,
@@ -711,13 +725,21 @@ def minibatch_exchange(
             t_chunk=t_chunk,
             teacher_global_rank=teacher_global_rank, all_group=all_group, device=device,
         )
-        return tk, s_resp, s_compact_mask, s_shift_mask, student_logits
+        return MinibatchExchangeResult(
+            is_pg=True, topk=None, pg=pg,
+            s_resp=s_resp, s_compact_mask=s_compact_mask,
+            s_shift_mask=s_shift_mask, student_logits=student_logits,
+        )
 
-    tk = exchange_topk(
+    topk = exchange_topk(
         select_topk_by=select_topk_by, is_student=is_student, is_teacher=is_teacher,
         student_logits=s_resp, teacher_logits=t_resp, t_compact_mask=t_compact_mask,
         B=mb_ids.shape[0], T=R_max, K=K,
         s_chunk=s_chunk, t_chunk=t_chunk,
         teacher_global_rank=teacher_global_rank, all_group=all_group, device=device,
     )
-    return tk, s_resp, s_compact_mask, s_shift_mask, student_logits
+    return MinibatchExchangeResult(
+        is_pg=False, topk=topk, pg=None,
+        s_resp=s_resp, s_compact_mask=s_compact_mask,
+        s_shift_mask=s_shift_mask, student_logits=student_logits,
+    )

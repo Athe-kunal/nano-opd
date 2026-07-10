@@ -646,7 +646,7 @@ if __name__ == "__main__":
                 t_mb_ids, t_mb_attn, t_mb_mask = broadcast_teacher_inputs(is_student, t_mb_ids, t_mb_attn, t_mb_mask, device, all_group)
 
                 is_pg = args.algorithm == "mopd_pg_loss"
-                tk, s_resp, s_compact_mask, s_shift_mask, student_logits = minibatch_exchange(
+                result = minibatch_exchange(
                     is_student, is_teacher, mb_ids, mb_attn, mb_mask,
                     t_mb_ids, t_mb_attn, t_mb_mask,
                     student.model if is_student else None, teacher if is_teacher else None,
@@ -655,12 +655,12 @@ if __name__ == "__main__":
                     is_pg=is_pg,
                 )
 
-                if is_student and is_pg:
-                    # PG form: tk holds {"s_logprob","t_logprob",...} — sampled-token
-                    # log-probs only, no top-K distribution to gather from.
+                if is_student and result.is_pg:
+                    # PG form: result.pg holds sampled-token log-probs only, no
+                    # top-K distribution to gather from.
                     loss = mopd_pg_loss_and_backward(
-                        student=student, pg=tk, loss_fn=loss_fn,
-                        student_logits=student_logits, sampled_ids=mb_ids[:, 1:], s_shift_mask=s_shift_mask,
+                        student=student, pg=result.pg, loss_fn=loss_fn,
+                        student_logits=result.student_logits, sampled_ids=mb_ids[:, 1:], s_shift_mask=result.s_shift_mask,
                         inf_lp_shifted=mb_inf_lp[:, 1:] if args.tis_clip > 0.0 else None,
                         tis_clip=args.tis_clip, divisor=args.grad_accum_steps,
                         mask_fn=lambda m: apply_token_skip_mask(m, args.num_loss_tokens_to_skip),
@@ -669,19 +669,21 @@ if __name__ == "__main__":
                     n_batches += 1
 
                 elif is_student:
-                    s_log_resp = F.log_softmax(s_resp.float(), dim=-1)
+                    tk = result.topk
+                    student_logits = result.student_logits
+                    s_log_resp = F.log_softmax(result.s_resp.float(), dim=-1)
                     s_logprobs = s_log_resp.gather(-1, tk.topk_idx)
                     effective_mask = apply_token_skip_mask(
-                        s_compact_mask * tk.t_compact_mask, args.num_loss_tokens_to_skip
+                        result.s_compact_mask * tk.t_compact_mask, args.num_loss_tokens_to_skip
                     )
 
                     if effective_mask.sum() == 0:
-                        print0(f"[warn mb] effective_mask is all-zero: s_mask={s_compact_mask.sum().item():.0f} t_mask={tk.t_compact_mask.sum().item():.0f}", flush=True)
+                        print0(f"[warn mb] effective_mask is all-zero: s_mask={result.s_compact_mask.sum().item():.0f} t_mask={tk.t_compact_mask.sum().item():.0f}", flush=True)
 
                     if args.tis_clip > 0.0:
                         s_lp_sampled = student_logprob_at_sampled_tokens(student_logits, mb_ids[:, 1:])
                         tis_full = (s_lp_sampled - mb_inf_lp[:, 1:].to(s_lp_sampled.dtype)).exp().clamp(max=args.tis_clip)
-                        tis_resp, _ = pack_response_logits(tis_full.unsqueeze(-1).expand_as(student_logits), s_shift_mask)
+                        tis_resp, _ = pack_response_logits(tis_full.unsqueeze(-1).expand_as(student_logits), result.s_shift_mask)
                         tis_weights = tis_resp[..., 0]
                     else:
                         tis_weights = None

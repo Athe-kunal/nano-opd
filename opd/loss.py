@@ -7,6 +7,17 @@ def _masked_token_mean(
     tis_weights: torch.Tensor | None = None,
     kl_clip: float | None = None,
 ) -> torch.Tensor:
+    """Averages per-token `values` over the response tokens marked in `mask`.
+
+    Args:
+        values: Per-token loss/divergence values, `[B, T]`.
+        mask: Response mask, `[B, T]` (1 for response tokens, 0 for prompt).
+        tis_weights: Optional per-token importance weights, `[B, T]`.
+        kl_clip: If set, clamp `values` to this max before averaging.
+
+    Returns:
+        A scalar: the mask-weighted mean of `values`.
+    """
     mask = mask.to(values.dtype)
     # Per-token pointwise KL clipping (OPSD paper Section 3.2).
     # Stylistic tokens can dominate the gradient signal with very high divergence
@@ -24,7 +35,7 @@ def _masked_token_mean(
 
 def _tail_probs(probs: torch.Tensor) -> torch.Tensor:
     """Probability mass outside the top-K support: 1 - Σ_K p(k)."""
-    return (1.0 - probs.sum(dim=-1)).clamp(min=1e-8)  # [B, T]
+    return (1.0 - torch.einsum("btk->bt", probs)).clamp(min=1e-8)  # [B, T]
 
 
 def compute_reverse_kl_loss(
@@ -40,6 +51,16 @@ def compute_reverse_kl_loss(
         tail = (1 - Σ_K p_s) · [log(1 - Σ_K p_s) - log(1 - Σ_K p_t)]
     This preserves the signal when the teacher wants to upweight a token the
     student ranked below K — exactly where feedback-driven corrections live.
+
+    Args:
+        student_logprobs: Student log-probs at the top-K indices, `[B, T, K]`.
+        teacher_logprobs: Teacher log-probs at the same indices, `[B, T, K]`.
+        response_mask: Response mask, `[B, T]`.
+        tis_weights: Optional per-token TIS importance weights, `[B, T]`.
+        kl_clip: If set, clamp each token's KL contribution to this max.
+
+    Returns:
+        A scalar loss, averaged over response tokens.
     """
     student_logprobs = student_logprobs.float()
     teacher_logprobs = teacher_logprobs.float()
@@ -65,6 +86,16 @@ def compute_forward_kl_loss(
 
     Tail term:
         tail = (1 - Σ_K p_t) · [log(1 - Σ_K p_t) - log(1 - Σ_K p_s)]
+
+    Args:
+        student_logprobs: Student log-probs at the top-K indices, `[B, T, K]`.
+        teacher_logprobs: Teacher log-probs at the same indices, `[B, T, K]`.
+        response_mask: Response mask, `[B, T]`.
+        tis_weights: Optional per-token TIS importance weights, `[B, T]`.
+        kl_clip: If set, clamp each token's KL contribution to this max.
+
+    Returns:
+        A scalar loss, averaged over response tokens.
     """
     student_logprobs = student_logprobs.float()
     teacher_logprobs = teacher_logprobs.float()
@@ -94,6 +125,17 @@ def compute_jsd_loss(
 
     The mixture M is formed over both the top-K support and the tail bucket:
         M_tail = α · (1 - Σ_K p_s) + (1-α) · (1 - Σ_K p_t)
+
+    Args:
+        student_logprobs: Student log-probs at the top-K indices, `[B, T, K]`.
+        teacher_logprobs: Teacher log-probs at the same indices, `[B, T, K]`.
+        response_mask: Response mask, `[B, T]`.
+        tis_weights: Optional per-token TIS importance weights, `[B, T]`.
+        kl_clip: If set, clamp each token's JSD contribution to this max.
+        jsd_alpha: Mixture weight on the student distribution.
+
+    Returns:
+        A scalar loss, averaged over response tokens.
     """
     student_logprobs = student_logprobs.float()
     teacher_logprobs = teacher_logprobs.float()
@@ -117,6 +159,7 @@ def compute_jsd_loss(
     per_token_jsd = jsd_alpha * kl_s + (1.0 - jsd_alpha) * kl_t
     return _masked_token_mean(per_token_jsd, response_mask, tis_weights, kl_clip)
 
+
 def compute_mopd_loss(
     student_logprobs: torch.Tensor,         # [B, T, K]
     teacher_logprobs: torch.Tensor,         # [B, T, K]
@@ -135,6 +178,16 @@ def compute_mopd_loss(
     pointwise, for any k independently) so, unlike plain top-K reverse KL, no
     tail/renormalization correction is needed — the K-token sum alone is
     already unbiased.
+
+    Args:
+        student_logprobs: Student log-probs at the top-K indices, `[B, T, K]`.
+        teacher_logprobs: Teacher log-probs at the same indices, `[B, T, K]`.
+        response_mask: Response mask, `[B, T]`.
+        tis_weights: Optional per-token TIS importance weights, `[B, T]`.
+        kl_clip: If set, clamp each token's contribution to this max.
+
+    Returns:
+        A scalar loss, averaged over response tokens.
     """
     student_logprobs = student_logprobs.float()
     teacher_logprobs = teacher_logprobs.float()
@@ -142,7 +195,7 @@ def compute_mopd_loss(
     teacher_probs = teacher_logprobs.exp()
 
     per_token = torch.einsum("btk,btk->bt", student_probs, student_logprobs - teacher_logprobs)
-    per_token = per_token - student_probs.sum(dim=-1) + teacher_probs.sum(dim=-1)
+    per_token = per_token - torch.einsum("btk->bt", student_probs) + torch.einsum("btk->bt", teacher_probs)
     return _masked_token_mean(per_token, response_mask, tis_weights, kl_clip)
 
 
@@ -160,6 +213,18 @@ def compute_mopd_pg_loss(
     it reweights −log π_θ(y_t) (standard NLL) instead of appearing inside a
     divergence. Two-sided clip (A_max=5 in the paper) bounds how much a single
     token can dominate the gradient, same motivation as kl_clip elsewhere.
+
+    Args:
+        student_logprob: Grad-carrying student log-prob of the sampled
+          token, `[B, T]`.
+        teacher_logprob: No-grad teacher log-prob of the same sampled
+          token, `[B, T]`.
+        response_mask: Response mask, `[B, T]`.
+        tis_weights: Optional per-token TIS importance weights, `[B, T]`.
+        adv_clip: Two-sided clip bound for the stop-gradient advantage.
+
+    Returns:
+        A scalar loss, averaged over response tokens.
     """
     student_logprob = student_logprob.float()
     teacher_logprob = teacher_logprob.float().detach()
@@ -170,7 +235,6 @@ def compute_mopd_pg_loss(
 
     per_token = -advantage * student_logprob
     return _masked_token_mean(per_token, response_mask, tis_weights, kl_clip=None)
-
 
 
 ALGORITHMS = {

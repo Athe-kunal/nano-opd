@@ -19,12 +19,29 @@ from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngin
 import torch
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
-def generate_rollouts(vllm_engine, tokenizer, prompts, num_samples, max_new_tokens,
-                      temperature, top_k):
-    """Generate `num_samples` completions per prompt using vLLM.
+def generate_rollouts(
+    vllm_engine: Any,
+    tokenizer: Any,
+    prompts: list[str],
+    num_samples: int,
+    max_new_tokens: int,
+    temperature: float,
+    top_k: int,
+) -> list[dict[str, Any]]:
+    """Generates `num_samples` completions per prompt using vLLM.
 
-    Returns a flat list of dicts, one per (prompt, sample) pair, ordered such
-    that the N samples for prompt i occupy positions [i*N, (i+1)*N).
+    Args:
+        vllm_engine: A vLLM `LLM`-like engine exposing `.generate`.
+        tokenizer: Tokenizer used to determine the EOS stop string.
+        prompts: Prompt strings to generate completions for.
+        num_samples: Number of completions to sample per prompt.
+        max_new_tokens: Maximum number of tokens to generate per completion.
+        temperature: Sampling temperature.
+        top_k: Sampling top-k cutoff.
+
+    Returns:
+        A flat list of dicts, one per (prompt, sample) pair, ordered such
+        that the N samples for prompt i occupy positions [i*N, (i+1)*N).
     """
     sampling_params = SamplingParams(
         n=num_samples,
@@ -54,7 +71,35 @@ def generate_rollouts(vllm_engine, tokenizer, prompts, num_samples, max_new_toke
 
 
 
-def _remote_json_request(base_url, method, path, payload=None, timeout=600):
+def _remote_json_request(
+    base_url: str,
+    method: str,
+    path: str,
+    payload: dict[str, Any] | None = None,
+    timeout: float = 600,
+    op_name: str | None = None,
+) -> Any:
+    """Sends a JSON HTTP request to the rollout worker and returns the parsed response.
+
+    Args:
+        base_url: Base URL of the rollout worker.
+        method: HTTP method, e.g. "GET" or "POST".
+        path: URL path to request, appended to `base_url`.
+        payload: JSON body to send, if any.
+        timeout: Request timeout in seconds.
+        op_name: If given, treat this as a "start/finish/init"-style
+          operation that must return `{"ok": true, ...}` — raise
+          `RuntimeError` naming `op_name` if the response is missing or
+          reports failure. This collapses the repeated `if not resp or not
+          resp.get("ok"): raise ...` check duplicated across callers.
+
+    Returns:
+        The parsed JSON response, or `None` if the body was empty.
+
+    Raises:
+        RuntimeError: If the HTTP request fails, or (when `op_name` is set)
+          if the response is missing or does not report `ok: true`.
+    """
     data = None
     headers = {}
     if payload is not None:
@@ -75,13 +120,25 @@ def _remote_json_request(base_url, method, path, payload=None, timeout=600):
     except urllib.error.URLError as e:
         raise RuntimeError(f"remote rollout request failed: {e}") from e
 
-    if not body:
-        return None
-    return json.loads(body)
+    parsed = json.loads(body) if body else None
+    if op_name is not None and not (parsed and parsed.get("ok")):
+        raise RuntimeError(f"rollout worker {op_name} failed: {parsed}")
+    return parsed
 
 
-def wait_for_rollout_worker(base_url, timeout_s=300):
-    """Poll the rollout worker until it reports healthy."""
+def wait_for_rollout_worker(base_url: str, timeout_s: float = 300) -> dict[str, Any]:
+    """Polls the rollout worker until it reports healthy.
+
+    Args:
+        base_url: Base URL of the rollout worker.
+        timeout_s: How long to keep polling before giving up.
+
+    Returns:
+        The worker's health-check response payload.
+
+    Raises:
+        RuntimeError: If the worker does not report healthy within `timeout_s`.
+    """
     deadline = time.time() + timeout_s
     last_err = None
     while time.time() < deadline:
@@ -98,9 +155,27 @@ def wait_for_rollout_worker(base_url, timeout_s=300):
     )
 
 
-def generate_rollouts_remote(base_url, prompts, num_samples, max_new_tokens,
-                             temperature, top_k):
-    """Generate rollouts via a separate rollout worker process."""
+def generate_rollouts_remote(
+    base_url: str,
+    prompts: list[str],
+    num_samples: int,
+    max_new_tokens: int,
+    temperature: float,
+    top_k: int,
+) -> list[dict[str, Any]]:
+    """Generates rollouts via a separate rollout worker process.
+
+    Args:
+        base_url: Base URL of the rollout worker.
+        prompts: Prompt strings to generate completions for.
+        num_samples: Number of completions to sample per prompt.
+        max_new_tokens: Maximum number of tokens to generate per completion.
+        temperature: Sampling temperature.
+        top_k: Sampling top-k cutoff.
+
+    Returns:
+        A flat list of rollout dicts, in the same order as `generate_rollouts`.
+    """
     payload = {
         "prompts": prompts,
         "num_samples": num_samples,
@@ -112,11 +187,32 @@ def generate_rollouts_remote(base_url, prompts, num_samples, max_new_tokens,
     return resp["rollouts"]
 
 
-def prepare_batch(rollouts, tokenizer, max_prompt_len, max_response_len, device):
-    """Pack a list of rollouts into padded training tensors."""
-    input_ids_list = []
-    response_mask_list = []
-    inference_logprobs_list = []
+def prepare_batch(
+    rollouts: list[dict[str, Any]],
+    tokenizer: Any,
+    max_prompt_len: int,
+    max_response_len: int,
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    """Packs a list of rollouts into padded training tensors.
+
+    Args:
+        rollouts: Rollout dicts as produced by `generate_rollouts`.
+        tokenizer: Tokenizer supplying the pad token id.
+        max_prompt_len: Maximum allowed prompt length; raises if exceeded.
+        max_response_len: Response length to truncate completions to.
+        device: Device to place the returned tensors on.
+
+    Returns:
+        A dict with `input_ids`, `attention_mask`, `response_mask`, and
+        `inference_logprobs` tensors, each of shape `[B, T]`.
+
+    Raises:
+        ValueError: If any rollout's prompt exceeds `max_prompt_len`.
+    """
+    input_ids_list: list[int] = []
+    response_mask_list: list[int] = []
+    inference_logprobs_list: list[float] = []
     for rollout in rollouts:
         prompt_ids = rollout["prompt_ids"]
         response_ids = rollout["response_ids"]
@@ -155,7 +251,8 @@ def _dtype_name(dtype: torch.dtype) -> str:
     return str(dtype).split(".")[-1]
 
 
-def _iter_fsdp_full_params(model):
+def _iter_fsdp_full_params(model: torch.nn.Module):
+    """Yields `(name, param)` for each parameter, gathering FSDP shards first."""
     # summon_full_params temporarily gathers shards and exposes parameters
     # under their original (non-flattened) names instead of FSDP's _flat_param.
     with FSDP.summon_full_params(model, writeback=False, recurse=True):
@@ -163,13 +260,24 @@ def _iter_fsdp_full_params(model):
             yield name, param.detach().clone()
 
 
-def _iter_model_parameters(model, fsdp: bool):
+def _iter_model_parameters(model: torch.nn.Module, fsdp: bool):
+    """Yields `(name, param)` for each parameter, unsharding first if `fsdp`."""
     if fsdp:
         yield from _iter_fsdp_full_params(model)
         return
     yield from model.named_parameters()
 
-def collect_weight_metadata(model, fsdp: bool = False) -> dict[str, Any]:
+
+def collect_weight_metadata(model: torch.nn.Module, fsdp: bool = False) -> dict[str, Any]:
+    """Collects parameter names, dtypes, and shapes for a vLLM weight-update request.
+
+    Args:
+        model: The model to collect metadata from.
+        fsdp: Whether `model` is FSDP-wrapped (its shards are gathered first).
+
+    Returns:
+        A dict with parallel `names`, `dtype_names`, and `shapes` lists.
+    """
     names: list[str] = []
     dtype_names: list[str] = []
     shapes: list[list[int]] = []
@@ -185,7 +293,10 @@ def collect_weight_metadata(model, fsdp: bool = False) -> dict[str, Any]:
         "shapes": shapes,
     }
 
-def remote_vllm_start_update_weights(base_url, metadata: dict[str, Any], packed: bool):
+def remote_vllm_start_update_weights(
+    base_url: str, metadata: dict[str, Any], packed: bool
+) -> dict[str, Any]:
+    """Tells the rollout worker to begin receiving an in-place weight update."""
     payload = {
         "names": metadata["names"],
         "dtype_names": metadata["dtype_names"],
@@ -194,31 +305,39 @@ def remote_vllm_start_update_weights(base_url, metadata: dict[str, Any], packed:
         "is_checkpoint_format": True,
     }
     logger.info(f"Starting in-place vLLM weight update with {packed=}, {len(metadata['names'])=}")
-    resp = _remote_json_request(
+    return _remote_json_request(
         base_url, "POST", "/update_weights_start", payload=payload, timeout=1800,
+        op_name="update-start",
     )
-    if not resp or not resp.get("ok"):
-        raise RuntimeError(f"rollout worker update-start failed: {resp}")
-    return resp
 
-def remote_vllm_finish_update_weights(base_url):
+
+def remote_vllm_finish_update_weights(base_url: str) -> dict[str, Any]:
+    """Tells the rollout worker the in-place weight update finished sending."""
     logger.info("Waiting for vLLM weight update to complete.")
-    resp = _remote_json_request(
+    return _remote_json_request(
         base_url, "POST", "/update_weights_finish", payload={}, timeout=1800,
+        op_name="update-finish",
     )
-    if not resp or not resp.get("ok"):
-        raise RuntimeError(f"rollout worker update-finish failed: {resp}")
-    return resp
+
 
 def sync_weights_to_vllm_inplace(
-    train_model,
-    base_url,
-    model_update_group,
+    train_model: torch.nn.Module,
+    base_url: str,
+    model_update_group: Any,
     *,
     packed: bool = True,
     fsdp: bool = False,
-):
-    """Sync trainer weights into the running vLLM worker without checkpoints."""
+) -> None:
+    """Syncs trainer weights into the running vLLM worker without checkpoints.
+
+    Args:
+        train_model: The trainer's model (FSDP-wrapped if `fsdp` is True).
+        base_url: Base URL of the rollout worker.
+        model_update_group: NCCL process group used for the weight transfer.
+        packed: Whether to pack parameters for transfer (see
+          `NCCLWeightTransferEngine`).
+        fsdp: Whether `train_model` is FSDP-wrapped.
+    """
 
     # For FSDP, keep the FSDP wrapper so summon_full_params can unshard params
     # with their original names. For non-FSDP (e.g. DDP), unwrap .module.
@@ -239,13 +358,14 @@ def sync_weights_to_vllm_inplace(
     logger.info("Completed in-place vLLM weight update.")
 
 def remote_vllm_init_weight_transfer(
-    base_url,
+    base_url: str,
     *,
     master_address: str,
     master_port: int,
     rank_offset: int,
     world_size: int,
-):
+) -> dict[str, Any]:
+    """Tells the rollout worker to join the NCCL weight-transfer group."""
     payload = {
         "master_address": master_address,
         "master_port": master_port,
@@ -256,11 +376,9 @@ def remote_vllm_init_weight_transfer(
         "Initializing vLLM weight transfer engine with "
         f"{master_address=}, {master_port=}, {rank_offset=}, {world_size=}."
     )
-    resp = _remote_json_request(
+    return _remote_json_request(
         base_url, "POST", "/init_weight_transfer", payload=payload, timeout=1800,
+        op_name="weight-transfer init",
     )
-    if not resp or not resp.get("ok"):
-        raise RuntimeError(f"rollout worker weight-transfer init failed: {resp}")
-    return resp
 
 

@@ -1,7 +1,60 @@
 import abc
+from math import comb
 from typing import Any
 
+from datasets import Dataset, load_dataset
 from skyrl_gym.envs.base_text_env import BaseTextEnv, BaseTextEnvStepOutput, ConversationType
+
+
+def pass_at_k(n: int, c: int, k: int) -> float:
+    """Unbiased pass@k estimator (Chen et al., 2021, Eq. 1).
+
+    Args:
+        n: Number of samples generated per problem.
+        c: Number of correct samples among the `n`.
+        k: The "pass@k" cutoff to estimate.
+
+    Returns:
+        The probability that at least one of `k` samples drawn (without
+        replacement) from the `n` generated would be correct.
+    """
+    if n - c < k:
+        return 1.0
+    return 1.0 - comb(n - c, k) / comb(n, k)
+
+
+def build_system_user_conversation(system: str, user_content: str) -> ConversationType:
+    """Builds the two-message [system, user] conversation most envs' `init` returns.
+
+    Args:
+        system: The system prompt.
+        user_content: The user-turn content (the problem/question text).
+
+    Returns:
+        A `[{"role": "system", ...}, {"role": "user", ...}]` conversation.
+    """
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user_content},
+    ]
+
+
+def load_arrow_split(base_url: str, split: str) -> Dataset:
+    """Loads one arrow-format split from a GitHub-hosted data directory.
+
+    Used by the SDFT science/tool-use loaders, whose train and eval splits
+    both live at `{base_url}/{split}_data/data-00000-of-00001.arrow`.
+
+    Args:
+        base_url: Base URL of the dataset's data directory.
+        split: Split name (e.g. "train", "eval"); also the shard
+          subdirectory name (`{split}_data`).
+
+    Returns:
+        The loaded HuggingFace `Dataset` for this split.
+    """
+    url = f"{base_url}/{split}_data/data-00000-of-00001.arrow"
+    return load_dataset("arrow", data_files={split: url}, split=split)
 
 
 class OPDEnvBase(BaseTextEnv):

@@ -1,53 +1,28 @@
-
-import os
-import math
-import time
 import argparse
+import time
 from typing import Literal
 
-import torch
-import torch.distributed as dist
-import torch.nn.functional as F
-
 from opd.loss import ALGORITHMS
-from opd.fsdp.algorithms import student_logprob_at_sampled_tokens
-from opd.trainer.distillation_utils import (
-    broadcast_minibatch,
-    broadcast_teacher_inputs,
-    minibatch_exchange,
-    mopd_pg_loss_and_backward,
-    pack_response_logits,
-    prepare_teacher_batch,
-)
+from opd.trainer.logging_utils import finish_wandb, init_wandb, should_use_wandb
+from opd.trainer.self_distillation_utils import self_distill_minibatch
 from opd.trainer.setup_utils import (
-    compute_cleanup,
-    print0,
-    init_distributed,
+    assert_prompts_divisible,
     build_student,
     build_teacher,
+    compute_cleanup,
+    init_distributed,
     init_vllm_transfer,
+    print0,
+    topk_selector_for,
 )
+from opd.trainer.trainer_utils import MinibatchTensors, StepAccumulator, Trainer
 from opd.envs.opsd_dataset import OPSDMathEnv
 from opd.envs.dataset import distributed_opd_loader
-from opd.metrics import (
-    compute_overlap_ratio,
-    compute_overlap_token_advantage,
-    compute_entropy_gap,
-)
-from opd.generator.rollout import (
-    generate_rollouts_remote,
-    sync_weights_to_vllm_inplace,
-    prepare_batch,
-)
+from opd.generator.rollout import generate_rollouts_remote
 
-
-# ---------------------------------------------------------------------------
-# Teacher prompt construction (Figure 2 of the OPSD paper)
-# ---------------------------------------------------------------------------
 
 # The teacher sees the problem AND the ground-truth reference solution y*.
-# This follows Figure 2 of the paper exactly: after reading the reference
-# solution the teacher is asked to solve the problem in its own way — this
+# After reading the reference solution the teacher is asked to solve the problem in its own way — this
 # rationalization is done implicitly through a single forward pass (no
 # generation), so the teacher never actually produces new tokens here.
 _STUDENT_SUFFIX = "\n\nPlease reason step by step, and put your final answer within \\boxed{}."  # not passed through .format()
@@ -88,16 +63,8 @@ def _build_teacher_messages(
     teacher_messages.append({"role": "user", "content": teacher_user})
     return teacher_messages
 
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
 if __name__ == "__main__":
 
-    # -------------------------------------------------------------------------
-    # CLI
     parser = argparse.ArgumentParser(
         description="On-Policy Self-Distillation (OPSD) — a single LLM acts as "
                     "both student (sees problem only) and teacher (sees problem + "
@@ -172,59 +139,41 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
-    use_wandb = os.environ.get("USE_WANDB", "1").strip().lower() not in ("0", "false", "no")
-    if use_wandb:
-        import wandb
+    use_wandb = should_use_wandb()
 
-    # -------------------------------------------------------------------------
     # Distributed init — same rank split as OPD/SDFT:
     #   ranks 0..train_world_size-1  →  student (FSDP, updated by optimizer)
     #   rank  train_world_size       →  teacher (plain nn.Module, frozen initial policy)
     ctx = init_distributed(args.device_type, args.train_world_size)
-    ddp_rank            = ctx.ddp_rank
-    ddp_world_size      = ctx.ddp_world_size
-    device              = ctx.device
-    train_world_size    = ctx.train_world_size
-    teacher_global_rank = ctx.teacher_global_rank
-    is_student          = ctx.is_student
-    is_teacher          = ctx.is_teacher
-    master_process      = ctx.master_process
-    student_group       = ctx.student_group
-    all_group           = ctx.all_group
 
     print0(f"Model: {args.student_model}  (teacher = frozen initial policy)")
     print0(f"Algorithm: {args.algorithm}  distill-top-k: {args.distill_top_k}")
-    print0(f"Device: {device}  Student ranks: {train_world_size}  Total world: {ddp_world_size}")
+    print0(f"Device: {ctx.device}  Student ranks: {ctx.train_world_size}  Total world: {ctx.ddp_world_size}")
     if args.kl_clip > 0.0:
         print0(f"Per-token KL clip: {args.kl_clip}")
 
-    if master_process and use_wandb:
-        wandb.init(
-            project="nano-opd",
-            name=args.run_name,
-            config={
-                "student_model": args.student_model,
-                "algorithm": args.algorithm,
-                "distill_top_k": args.distill_top_k,
-                "kl_clip": args.kl_clip,
-                "lr": args.lr,
-                "num_steps": args.num_steps,
-                "prompts_per_step": args.prompts_per_step,
-                "train_batch_size": args.train_batch_size,
-                "epochs": args.epochs,
-                "max_new_tokens": args.max_new_tokens,
-                "temperature": args.temperature,
-            },
-        )
-
-    assert args.prompts_per_step % train_world_size == 0, (
-        f"prompts_per_step ({args.prompts_per_step}) must be divisible by "
-        f"train_world_size ({train_world_size})"
+    init_wandb(
+        args.run_name, ctx.master_process, use_wandb,
+        config={
+            "student_model": args.student_model,
+            "algorithm": args.algorithm,
+            "distill_top_k": args.distill_top_k,
+            "kl_clip": args.kl_clip,
+            "lr": args.lr,
+            "num_steps": args.num_steps,
+            "prompts_per_step": args.prompts_per_step,
+            "train_batch_size": args.train_batch_size,
+            "epochs": args.epochs,
+            "max_new_tokens": args.max_new_tokens,
+            "temperature": args.temperature,
+        },
     )
+
+    assert_prompts_divisible(args.prompts_per_step, ctx.train_world_size)
 
     # -------------------------------------------------------------------------
     # Model setup
-    if is_student:
+    if ctx.is_student:
         student = build_student(
             args.student_model,
             lr=args.lr,
@@ -232,58 +181,66 @@ if __name__ == "__main__":
             max_grad_norm=args.max_grad_norm,
             gradient_checkpointing=args.gradient_checkpointing,
             sharding_strategy=args.sharding_strategy,
-            train_world_size=train_world_size,
-            student_group=student_group,
+            train_world_size=ctx.train_world_size,
+            student_group=ctx.student_group,
             total_steps=args.num_steps * args.epochs,
             scheduler_name=args.scheduler,
             warmup_ratio=args.warmup_ratio,
         )
 
-    if is_teacher:
-        # Frozen initial policy — weights are never updated after this load.
-        # The paper (Section 4.1) finds that fixing the teacher to the initial
-        # policy stabilises training and acts as an implicit regulariser that
-        # prevents excessive deviation from the pretrained distribution.
+    if ctx.is_teacher:
         teacher = build_teacher(args.student_model)
         print(f"[teacher] Loaded initial policy from {args.student_model} (frozen)", flush=True)
 
-    # -------------------------------------------------------------------------
-    # Loss function and top-K selection
-    # OPSD paper (Table 3) recommends forward KL: KL(p_T || p_S).
-    # For forward KL the teacher selects the top-K indices (the teacher-weighted
-    # sum means we need tokens where the teacher has non-negligible probability).
-    loss_fn = ALGORITHMS[args.algorithm]
-    select_topk_by: Literal["student", "teacher"] = (
-        "teacher" if args.algorithm in ("forward_kl", "mopd_loss") else "student"
-    )
-    K = args.distill_top_k
 
-    # -------------------------------------------------------------------------
-    # vLLM weight-transfer setup (student ranks only)
+    loss_fn = ALGORITHMS[args.algorithm]
+    select_topk_by: Literal["student", "teacher"] = topk_selector_for(args.algorithm)
+    top_k = args.distill_top_k
+
     model_update_group = init_vllm_transfer(
         args.rollout_worker_url,
         rollout_worker_world_size=args.rollout_worker_world_size,
-        train_world_size=train_world_size,
-        master_process=master_process,
-        all_group=all_group,
+        train_world_size=ctx.train_world_size,
+        master_process=ctx.master_process,
+        all_group=ctx.all_group,
     )
 
-    # -------------------------------------------------------------------------
-    # Dataset (student ranks only)
-    if is_student:
+    trainer = Trainer(
+        args, ctx,
+        student if ctx.is_student else None, teacher if ctx.is_teacher else None,
+        model_update_group, use_wandb,
+    )
+
+    if ctx.is_student:
         dataset     = OPSDMathEnv.load(split=args.dataset_split, dataset_id=args.dataset_id)
         loader      = distributed_opd_loader(
-            dataset, args.prompts_per_step, train_world_size, ddp_rank, seed=args.seed
+            dataset, args.prompts_per_step, ctx.train_world_size, ctx.ddp_rank, seed=args.seed
         )
         loader_iter = iter(loader)
 
-    # -------------------------------------------------------------------------
+
+    def do_minibatch(mb: MinibatchTensors, acc: StepAccumulator) -> None:
+        # Per-token pointwise KL clipping. Stylistic
+        # tokens can exhibit much higher KL than math tokens, dominating the
+        # gradient signal. Clipping each token's divergence contribution to τ
+        # stabilises training and prevents performance collapse, especially for smaller models.
+        self_distill_minibatch(
+            mb, acc,
+            ctx=ctx, student=student if ctx.is_student else None, teacher=teacher if ctx.is_teacher else None,
+            select_topk_by=select_topk_by, top_k=top_k,
+            student_chunk_size=args.student_chunk_size, teacher_chunk_size=args.teacher_chunk_size,
+            loss_fn=loss_fn, is_pg=args.algorithm == "mopd_pg_loss",
+            tis_clip=args.tis_clip, divisor=mb.n_mb,
+            kl_clip=args.kl_clip if args.kl_clip > 0.0 else None,
+        )
+
     # Training loop — all ranks iterate together
     for step in range(args.num_steps):
         t0 = time.time()
 
         # -- Rollout generation (student ranks only) --
-        if is_student:
+        rollouts = None
+        if ctx.is_student:
             examples, _ = next(loader_iter)   # list[OPSDMathEnv], state_dict
 
             # Student prompt: problem only — p_S(· | x)
@@ -307,7 +264,7 @@ if __name__ == "__main__":
 
             # Attach reference-conditioned teacher prompt to each rollout.
             # The teacher sees: problem + ground-truth solution y* → richer
-            # context than the student (problem only), following Figure 2.
+            # context than the student (problem only).
             for i, ex in enumerate(examples):
                 r            = rollouts[i]    # one rollout per prompt (num_samples=1)
                 student_msgs = [{"role": "user", "content": ex.problem + _STUDENT_SUFFIX}]
@@ -325,190 +282,11 @@ if __name__ == "__main__":
                     flush=True,
                 )
 
-            batch = prepare_batch(
-                rollouts, tokenizer=student.tokenizer,
-                max_prompt_len=args.max_prompt_len,
-                max_response_len=args.max_response_len,
-                device=device,
-            )
-            teacher_batch = prepare_teacher_batch(
-                rollouts, tokenizer=student.tokenizer, device=device,
-            )
+        batch, teacher_batch = trainer.prepare_batches(rollouts, has_teacher_batch=True)
 
-            input_ids          = batch["input_ids"]           # [N, T_s]
-            attention_mask     = batch["attention_mask"]
-            response_mask      = batch["response_mask"]
-            inference_logprobs = batch["inference_logprobs"]
-            teacher_input_ids  = teacher_batch["input_ids"]   # [N, T_t]
-            teacher_attn_mask  = teacher_batch["attention_mask"]
-            teacher_resp_mask  = teacher_batch["response_mask"]
-            student.model.train()
+        trainer.step(step, t0, batch, teacher_batch, do_minibatch, has_teacher_batch=True)
 
-        total_loss        = 0.0
-        n_batches         = 0
-        overlap_ratio     = 0.0
-        overlap_advantage = 0.0
-        entropy_gap_val   = 0.0
-
-        # -- Distillation epochs --
-        for _epoch in range(args.epochs):
-
-            if is_student:
-                n_mb = math.ceil(input_ids.shape[0] / args.train_batch_size)
-                perm = torch.randperm(input_ids.shape[0], device=device)
-                n_mb_t = torch.tensor([n_mb], dtype=torch.long, device=device)
-            else:
-                n_mb_t = torch.zeros(1, dtype=torch.long, device=device)
-            dist.broadcast(n_mb_t, src=0, group=all_group)
-            n_mb = int(n_mb_t.item())
-
-            for mb_idx in range(n_mb):
-
-                # -- Slice minibatch (student ranks) --
-                if is_student:
-                    start     = mb_idx * args.train_batch_size
-                    idx       = perm[start : start + args.train_batch_size]
-                    mb_ids    = input_ids[idx]
-                    mb_attn   = attention_mask[idx]
-                    mb_mask   = response_mask[idx]
-                    mb_inf_lp = inference_logprobs[idx]
-                    t_mb_ids  = teacher_input_ids[idx]
-                    t_mb_attn = teacher_attn_mask[idx]
-                    t_mb_mask = teacher_resp_mask[idx]
-                else:
-                    mb_ids = mb_attn = t_mb_ids = t_mb_attn = t_mb_mask = None
-
-                mb_ids, mb_attn = broadcast_minibatch(
-                    is_student, mb_ids, mb_attn, device, all_group
-                )
-                t_mb_ids, t_mb_attn, t_mb_mask = broadcast_teacher_inputs(
-                    is_student, t_mb_ids, t_mb_attn, t_mb_mask, device, all_group
-                )
-
-                # -- Student + teacher forward, then top-K (or PG) exchange --
-                # The teacher p_T(· | x, y*) conditions on both the problem and the
-                # reference solution. Gradients must NOT flow through the teacher —
-                # it acts as a fixed target distribution (OPSD Eq. 1). The teacher
-                # is the frozen initial policy and never updated.
-                is_pg = args.algorithm == "mopd_pg_loss"
-                tk, s_resp, s_compact_mask, s_shift_mask, student_logits = minibatch_exchange(
-                    is_student, is_teacher, mb_ids, mb_attn, mb_mask,
-                    t_mb_ids, t_mb_attn, t_mb_mask,
-                    student.model if is_student else None, teacher if is_teacher else None,
-                    select_topk_by, K, args.student_chunk_size, args.teacher_chunk_size,
-                    teacher_global_rank, all_group, device,
-                    is_pg=is_pg,
-                )
-
-                if is_pg:
-                    if is_student:
-                        loss = mopd_pg_loss_and_backward(
-                            student=student, pg=tk, loss_fn=loss_fn,
-                            student_logits=student_logits, sampled_ids=mb_ids[:, 1:], s_shift_mask=s_shift_mask,
-                            inf_lp_shifted=mb_inf_lp[:, 1:] if args.tis_clip > 0.0 else None,
-                            tis_clip=args.tis_clip, divisor=n_mb,
-                        )
-                        total_loss += loss.item()
-                        n_batches  += 1
-                    continue
-
-                # -- Loss and backward (student ranks only) --
-                if is_student:
-                    s_log_resp = F.log_softmax(s_resp.float(), dim=-1)
-                    s_logprobs      = s_log_resp.gather(-1, tk.topk_idx)
-                    s_lp_at_student = s_log_resp.gather(-1, tk.student_topk_idx)
-
-                    # Exclude positions where the teacher sequence was truncated
-                    # (reference solution may push teacher prompt past max context).
-                    effective_mask = s_compact_mask * tk.t_compact_mask   # [B, R_max]
-                    if effective_mask.sum() == 0:
-                        print0(
-                            f"[warn mb] effective_mask is all-zero: "
-                            f"s_mask={s_compact_mask.sum().item():.0f} "
-                            f"t_mask={tk.t_compact_mask.sum().item():.0f}",
-                            flush=True,
-                        )
-
-                    # Per-token pointwise KL clipping (OPSD paper Section 3.2).
-                    # Stylistic tokens can exhibit much higher KL than math tokens,
-                    # dominating the gradient signal. Clipping each token's divergence
-                    # contribution to τ stabilises training and prevents performance
-                    # collapse, especially for smaller models (Figure 4).
-                    tis_weights = None
-                    if args.tis_clip > 0.0:
-                        sampled_ids    = mb_ids[:, 1:]
-                        s_lp_sampled   = student_logprob_at_sampled_tokens(student_logits, sampled_ids)
-                        inf_lp_shifted = mb_inf_lp[:, 1:].to(s_lp_sampled.dtype)
-                        tis_full       = (s_lp_sampled - inf_lp_shifted).exp().clamp(max=args.tis_clip)
-                        tis_resp, _    = pack_response_logits(
-                            tis_full.unsqueeze(-1).expand_as(student_logits), s_shift_mask
-                        )
-                        tis_weights = tis_resp[..., 0]   # [B, R_max]
-
-                    loss = loss_fn(
-                        s_logprobs, tk.t_logprobs, effective_mask,
-                        tis_weights=tis_weights,
-                        kl_clip=args.kl_clip if args.kl_clip > 0.0 else None,
-                    ) / n_mb
-                    student._scale_loss(loss).backward()
-                    total_loss += loss.item()
-                    n_batches  += 1
-
-                    with torch.no_grad():
-                        overlap_ratio     += compute_overlap_ratio(tk.student_topk_idx, tk.teacher_topk_idx).item()
-                        overlap_advantage += compute_overlap_token_advantage(
-                            tk.student_topk_idx, tk.teacher_topk_idx, s_lp_at_student, tk.t_logprobs_at_student
-                        ).item()
-                        entropy_gap_val   += compute_entropy_gap(s_lp_at_student, tk.teacher_own_logprobs).item()
-
-            if is_student:
-                student._optimizer_step()
-
-            # No teacher sync: the teacher is the frozen initial policy and is
-            # never updated. This is the key design choice in OPSD (Section 4.1):
-            # fixing the teacher to the initial policy stabilises the distillation
-            # target and acts as an implicit regulariser anchoring the student to
-            # the pretrained distribution.
-
-        # -- Push updated student weights into vLLM for next step's rollouts --
-        if is_student:
-            sync_weights_to_vllm_inplace(
-                student.model, args.rollout_worker_url, model_update_group, fsdp=True,
-            )
-
-            dt = time.time() - t0
-            avg_loss   = total_loss / max(n_batches, 1)
-            current_lr = student.scheduler.get_last_lr()[0] if student.scheduler is not None else args.lr
-            tokens     = input_ids.numel()
-            print0(
-                f"step {step + 1:4d}/{args.num_steps} | loss {avg_loss:.4f} "
-                f"| lr {current_lr:.2e} | tokens {tokens} | dt {dt:.1f}s "
-                f"| overlap {overlap_ratio / max(n_batches, 1):.3f} "
-                f"| adv {overlap_advantage / max(n_batches, 1):.4f} "
-                f"| ent_gap {entropy_gap_val / max(n_batches, 1):.4f}"
-            )
-
-            if master_process and use_wandb:
-                wandb.log(
-                    {
-                        "train/loss": avg_loss,
-                        "train/learning_rate": current_lr,
-                        "train/step_time_s": dt,
-                        "train/tokens_per_step": tokens,
-                        "metrics/overlap_ratio": overlap_ratio / max(n_batches, 1),
-                        "metrics/overlap_token_advantage": overlap_advantage / max(n_batches, 1),
-                        "metrics/entropy_gap": entropy_gap_val / max(n_batches, 1),
-                    },
-                    step=step + 1,
-                )
-
-            if args.save_every > 0 and (step + 1) % args.save_every == 0:
-                save_path = f"{args.save_dir}/step_{step + 1}"
-                student.save_model(save_path)
-                print0(f"Saved checkpoint to {save_path}")
-
-        dist.barrier(group=all_group)
+        trainer.barrier()
 
     compute_cleanup()
-    if master_process and use_wandb:
-        wandb.finish()
+    finish_wandb(ctx.master_process, use_wandb)

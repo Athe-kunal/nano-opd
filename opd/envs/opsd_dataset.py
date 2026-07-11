@@ -6,8 +6,8 @@ from typing import Any
 from datasets import load_dataset
 from skyrl_gym.envs.base_text_env import ConversationType
 
-from opd.envs.base import OPDEnvBase
-from opd.envs.dapo_dataset import extract_last_boxed, check_answer
+from opd.envs.base import OPDEnvBase, build_system_user_conversation
+from opd.envs.dapo_dataset import check_answer, extract_last_boxed
 
 logger = logging.getLogger(__name__)
 
@@ -37,11 +37,7 @@ class OPSDMathEnv(OPDEnvBase):
         self.solution = solution
 
     def init(self, prompt: ConversationType) -> tuple[ConversationType, dict[str, Any]]:
-        messages: ConversationType = [
-            {"role": "system", "content": DEFAULT_SYSTEM_PROMPT},
-            {"role": "user", "content": self.problem},
-        ]
-        return messages, {}
+        return build_system_user_conversation(DEFAULT_SYSTEM_PROMPT, self.problem), {}
 
     def compute_reward(self, action: str) -> tuple[float, bool]:
         pred = extract_last_boxed(action)

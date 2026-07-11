@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
+import pickle
 import re
-import subprocess
-import sys
-import textwrap
+import zlib
 from datetime import datetime
 from typing import Any
 
@@ -13,17 +13,10 @@ import wandb
 from datasets import Dataset, concatenate_datasets, load_dataset
 from skyrl_gym.envs.base_text_env import ConversationType
 
-from opd.trainer.setup_utils import print0
-from opd.envs.base import OPDEnvBase
+from opd.envs.base import OPDEnvBase, pass_at_k
+from opd.envs.code_execution import execute_all
 from opd.generator.rollout import generate_rollouts_remote
-
-def pass_at_k(n: int, c: int, k: int) -> float:
-    """Unbiased pass@k estimator."""
-    if n - c < k:
-        return 1.0
-    from math import comb
-    return 1.0 - comb(n - c, k) / comb(n, k)
-
+from opd.trainer.setup_utils import print0
 
 LCB_TEST_CUTOFF = datetime(2025, 2, 1)
 LCB_TRAIN_CUTOFF = datetime(2025, 2, 1)
@@ -40,7 +33,6 @@ def _parse_signature(starter_code: str) -> str:
 
 
 def _translate_private_test_cases(encoded_data, fn_name: str) -> str:
-    import base64, pickle, zlib
     decoded_data = base64.b64decode(encoded_data)
     decompressed_data = zlib.decompress(decoded_data)
     original_data = pickle.loads(decompressed_data)
@@ -102,87 +94,22 @@ def _extract_code(response: str) -> str | None:
     return blocks[-1].strip() if blocks else None
 
 
-def _run_functional(code: str, fn_name: str, inputs: list, outputs: list, time_limit: int) -> list[dict]:
-    """Execute code as a function call per test case. Returns structured result dicts."""
-    results = []
-    for inp, expected in zip(inputs, outputs):
-        driver = textwrap.dedent(f"""
-import json, sys
-{code}
-
-_inp = json.loads(sys.stdin.read())
-_result = {fn_name}(*_inp)
-print(json.dumps(_result))
-""")
-        inp_str = json.dumps(inp)
-        try:
-            proc = subprocess.run(
-                [sys.executable, "-c", driver],
-                input=inp_str,
-                capture_output=True, text=True, timeout=time_limit,
-            )
-            if proc.returncode != 0:
-                results.append({"status": "runtime_error", "input": inp_str, "stderr": proc.stderr.strip()})
-                continue
-            got = json.loads(proc.stdout.strip())
-            if got == expected:
-                results.append({"status": "pass"})
-            else:
-                results.append({"status": "wrong_answer", "input": inp_str,
-                                "expected": json.dumps(expected), "actual": json.dumps(got)})
-        except subprocess.TimeoutExpired:
-            results.append({"status": "timeout", "input": inp_str, "time_limit": time_limit})
-        except Exception as e:
-            results.append({"status": "runtime_error", "input": inp_str, "stderr": str(e)})
-    return results
-
-
-def _run_stdio(code: str, inputs: list, outputs: list, time_limit: int) -> list[dict]:
-    """Execute code with stdin per test case. Returns structured result dicts."""
-    results = []
-    for inp, expected in zip(inputs, outputs):
-        stdin_text = inp if isinstance(inp, str) else "\n".join(str(x) for x in inp)
-        expected_text = expected if isinstance(expected, str) else str(expected)
-        try:
-            proc = subprocess.run(
-                [sys.executable, "-c", code],
-                input=stdin_text,
-                capture_output=True, text=True, timeout=time_limit,
-            )
-            if proc.returncode != 0:
-                results.append({"status": "runtime_error", "input": stdin_text, "stderr": proc.stderr.strip()})
-                continue
-            got = proc.stdout.strip()
-            if got == expected_text.strip():
-                results.append({"status": "pass"})
-            else:
-                results.append({"status": "wrong_answer", "input": stdin_text,
-                                "expected": expected_text, "actual": got})
-        except subprocess.TimeoutExpired:
-            results.append({"status": "timeout", "input": stdin_text, "time_limit": time_limit})
-        except Exception as e:
-            results.append({"status": "runtime_error", "input": stdin_text, "stderr": str(e)})
-    return results
-
-
 def _execute_tests(code: str, tests: dict) -> list[dict]:
-    """
-    Dispatch to the FastAPI executor server (CODE_EXECUTOR_URL) or
-    fall back to local subprocesses.
+    """Dispatches to the FastAPI executor server (CODE_EXECUTOR_URL), if set.
+
+    Otherwise falls back to running locally via
+    `opd.envs.code_execution.execute_all`.
     """
     if os.environ.get("CODE_EXECUTOR_URL"):
+        # httpx is only needed for this optional remote-executor path, so it
+        # isn't a hard top-level dependency of this module.
         import httpx
         url = os.environ["CODE_EXECUTOR_URL"].rstrip("/") + "/execute"
         resp = httpx.post(url, json={"code": code, "tests": tests}, timeout=120.0)
         resp.raise_for_status()
         return resp.json()["results"]
 
-    fn_name = tests.get("fn_name", "")
-    testtype = tests.get("testtype", "stdio")
-    time_limit = tests.get("time_limit", TIME_LIMIT)
-    if testtype == "functional" and fn_name:
-        return _run_functional(code, fn_name, tests["inputs"], tests["outputs"], time_limit)
-    return _run_stdio(code, tests["inputs"], tests["outputs"], time_limit)
+    return execute_all(code, tests)
 
 
 def _all_tests_pass(code: str, tests: dict) -> bool:

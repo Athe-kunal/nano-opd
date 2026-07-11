@@ -26,10 +26,19 @@ def _logprobs_at(logits_slice: torch.Tensor, idx: torch.Tensor, lse: torch.Tenso
 
 def student_topk_indices(
     student_logits: torch.Tensor,   # [B, T, V]
-    K: int,
+    top_k: int,
     chunk_size: int = -1,
 ) -> torch.Tensor:                  # [B, T, K]
-    """Select top-K vocab indices from student logits (no grad)."""
+    """Selects top-K vocab indices from student logits (no grad).
+
+    Args:
+        student_logits: Student logits, `[B, T, V]`.
+        top_k: Number of vocab indices to keep per position.
+        chunk_size: Chunk size along T (-1 = no chunking).
+
+    Returns:
+        Top-K vocab indices, `[B, T, K]`.
+    """
     T = student_logits.shape[1]
     chunk = _effective_chunk(T, chunk_size)
     parts = []
@@ -37,7 +46,7 @@ def student_topk_indices(
     for t0, t1 in _chunk_range(T, chunk):
         curr_student_logits = student_logits[:,t0:t1]
         with torch.no_grad():
-            parts.append(curr_student_logits.topk(K, dim=-1).indices)
+            parts.append(curr_student_logits.topk(top_k, dim=-1).indices)
     return torch.cat(parts, dim=1)
 
 
@@ -46,7 +55,16 @@ def teacher_logprobs_at_indices(
     topk_idx: torch.Tensor,         # [B, T, K]
     chunk_size: int = -1,
 ) -> torch.Tensor:                  # [B, T, K]
-    """Compute teacher log-probs at pre-selected top-K indices (no grad)."""
+    """Computes teacher log-probs at pre-selected top-K indices (no grad).
+
+    Args:
+        teacher_logits: Teacher logits, `[B, T, V]`.
+        topk_idx: Vocab indices to gather log-probs at, `[B, T, K]`.
+        chunk_size: Chunk size along T (-1 = no chunking).
+
+    Returns:
+        Teacher log-probs at `topk_idx`, `[B, T, K]`.
+    """
     T = teacher_logits.shape[1]
     chunk = _effective_chunk(T, chunk_size)
     parts = []
@@ -61,10 +79,19 @@ def teacher_logprobs_at_indices(
 
 def teacher_topk_logprobs(
     teacher_logits: torch.Tensor,   # [B, T, V]
-    K: int,
+    top_k: int,
     chunk_size: int = -1,
 ) -> tuple[torch.Tensor, torch.Tensor]:  # ([B, T, K], [B, T, K])
-    """Teacher selects top-K indices and computes its own log-probs (no grad)."""
+    """Teacher selects top-K indices and computes its own log-probs (no grad).
+
+    Args:
+        teacher_logits: Teacher logits, `[B, T, V]`.
+        top_k: Number of vocab indices to keep per position.
+        chunk_size: Chunk size along T (-1 = no chunking).
+
+    Returns:
+        `(topk_idx, topk_logprobs)`, each `[B, T, K]`.
+    """
     T = teacher_logits.shape[1]
     chunk = _effective_chunk(T, chunk_size)
     idx_parts, lp_parts = [], []
@@ -72,7 +99,7 @@ def teacher_topk_logprobs(
         for t0, t1 in _chunk_range(T, chunk):
             sl = teacher_logits[:, t0:t1]
             lse = torch.logsumexp(sl, dim=-1)
-            _, idx = sl.topk(K, dim=-1)
+            _, idx = sl.topk(top_k, dim=-1)
             idx_parts.append(idx)
             lp_parts.append(_logprobs_at(sl, idx, lse))
     del teacher_logits
@@ -83,12 +110,19 @@ def student_logprob_at_sampled_tokens(
     student_logits: torch.Tensor,   # [B, T, V]
     token_ids: torch.Tensor,        # [B, T]
 ) -> torch.Tensor:                  # [B, T]
-    """Log-prob of the specific sampled token at each position (no grad).
+    """Returns the log-prob of the specific sampled token at each position (no grad).
 
     Used to compute per-token TIS weights:
         w_t = exp(log π_train(y_t) − log π_vllm(y_t))
     which correct for the numerical gap between vLLM inference log-probs and
     the training-time forward pass (SDPO paper, Appendix A.4).
+
+    Args:
+        student_logits: Student logits, `[B, T, V]`.
+        token_ids: The sampled token id at each position, `[B, T]`.
+
+    Returns:
+        Log-prob of `token_ids` under `student_logits`, `[B, T]`.
     """
     with torch.no_grad():
         lse = torch.logsumexp(student_logits, dim=-1)          # [B, T]
@@ -101,7 +135,16 @@ def student_logprobs_at_indices(
     topk_idx: torch.Tensor,         # [B, T, K]
     chunk_size: int = -1,
 ) -> torch.Tensor:                  # [B, T, K]
-    """Compute student log-probs at given indices, preserving the gradient graph."""
+    """Computes student log-probs at given indices, preserving the gradient graph.
+
+    Args:
+        student_logits: Student logits, `[B, T, V]`, with grad enabled.
+        topk_idx: Vocab indices to gather log-probs at, `[B, T, K]`.
+        chunk_size: Chunk size along T (-1 = no chunking).
+
+    Returns:
+        Student log-probs at `topk_idx`, `[B, T, K]`, differentiable.
+    """
     T = student_logits.shape[1]
     chunk = _effective_chunk(T, chunk_size)
     parts = []
@@ -117,25 +160,37 @@ def student_logprobs_at_indices(
 # ---------------------------------------------------------------------------
 
 def _topk_logprobs_slice(
-    s: torch.Tensor,   # [B, C, V]
-    t: torch.Tensor,   # [B, C, V]
+    student_logits_slice: torch.Tensor,   # [B, C, V]
+    teacher_logits_slice: torch.Tensor,   # [B, C, V]
     top_k: int,
     select_topk_by: Literal["student", "teacher"],
-):
-    """Core top-K log-prob computation for one [B, C, V] slice."""
-    s_lse = torch.logsumexp(s, dim=-1)              # [B, C]
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Core top-K log-prob computation for one [B, C, V] slice.
+
+    Args:
+        student_logits_slice: Student logits for this T-chunk, `[B, C, V]`.
+        teacher_logits_slice: Teacher logits for this T-chunk, `[B, C, V]`.
+        top_k: Number of vocab indices to keep per position.
+        select_topk_by: Whether the student or the teacher picks the top-K
+          indices used by both.
+
+    Returns:
+        `(student_logprobs, teacher_logprobs, topk_idx)`, each `[B, C, K]`
+        (`student_logprobs` is the only one with a gradient graph).
+    """
+    s_lse = torch.logsumexp(student_logits_slice, dim=-1)              # [B, C]
     with torch.no_grad():
-        t_lse = torch.logsumexp(t, dim=-1)          # [B, C]
+        t_lse = torch.logsumexp(teacher_logits_slice, dim=-1)          # [B, C]
 
     if select_topk_by == "student":
-        _, topk_idx = s.topk(top_k, dim=-1)         # [B, C, K]
+        _, topk_idx = student_logits_slice.topk(top_k, dim=-1)         # [B, C, K]
     else:
         with torch.no_grad():
-            _, topk_idx = t.topk(top_k, dim=-1)
+            _, topk_idx = teacher_logits_slice.topk(top_k, dim=-1)
 
-    s_lp = _logprobs_at(s, topk_idx, s_lse)
+    s_lp = _logprobs_at(student_logits_slice, topk_idx, s_lse)
     with torch.no_grad():
-        t_lp = _logprobs_at(t, topk_idx, t_lse)
+        t_lp = _logprobs_at(teacher_logits_slice, topk_idx, t_lse)
 
     return s_lp, t_lp, topk_idx
 
@@ -148,13 +203,22 @@ def compute_topk_logprobs_for_distillation(
     student_chunk_size: int = -1,
     teacher_chunk_size: int = -1,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Compute top-K log-probabilities for distillation (non-distributed).
+    """Computes top-K log-probabilities for distillation (non-distributed).
+
+    Args:
+        student_logits: Student logits, `[B, T, V]`.
+        teacher_logits: Teacher logits, `[B, T, V]`.
+        top_k: Number of vocab indices to keep per position.
+        select_topk_by: Whether the student or the teacher picks the top-K
+          indices used by both.
+        student_chunk_size: Chunk size along T for the student (-1 = no
+          chunking).
+        teacher_chunk_size: Chunk size along T for the teacher (-1 = no
+          chunking).
 
     Returns:
-        s_topk_logprobs: [B, T, K]
-        t_topk_logprobs: [B, T, K]
-        topk_idx:        [B, T, K]
+        A tuple `(student_topk_logprobs, teacher_topk_logprobs, topk_idx)`,
+        each `[B, T, K]`.
     """
     T = student_logits.shape[1]
     chunk = _effective_chunk(T, student_chunk_size, teacher_chunk_size)

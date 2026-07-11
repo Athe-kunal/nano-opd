@@ -20,9 +20,11 @@ The trainer keeps semantics strict by:
 import argparse
 import json
 import sys
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
+
 from loguru import logger
 from transformers import AutoTokenizer
 from vllm import LLM
@@ -30,7 +32,38 @@ from vllm.config import WeightTransferConfig
 from opd.generator.rollout import generate_rollouts
 
 class RolloutState:
-    def __init__(self, model_path, tokenizer_path, dtype, gpu_memory_utilization, tensor_parallel_size,weight_transfer_backend):
+    """Owns the vLLM engine and in-place weight-update state for one worker process.
+
+    Weight updates run on a background thread so the HTTP handler that
+    kicked them off can return immediately; `start_update_weights` and
+    `finish_update_weights` together bracket one such update.
+
+    Attributes:
+        tokenizer: Tokenizer for the served model.
+        model_path: Path or HF id of the served model.
+        engine: The vLLM `LLM` engine instance.
+    """
+
+    def __init__(
+        self,
+        model_path: str,
+        tokenizer_path: str,
+        dtype: str,
+        gpu_memory_utilization: float,
+        tensor_parallel_size: int,
+        weight_transfer_backend: str | None,
+    ):
+        """Loads the tokenizer and starts the vLLM engine.
+
+        Args:
+            model_path: Path or HF id of the model to serve.
+            tokenizer_path: Path or HF id of the tokenizer to load.
+            dtype: vLLM dtype string, e.g. "bfloat16".
+            gpu_memory_utilization: Fraction of GPU memory vLLM may use.
+            tensor_parallel_size: vLLM's internal tensor-parallel degree.
+            weight_transfer_backend: "nccl", "ipc", or None to disable
+              in-place weight transfer from the trainer.
+        """
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -61,14 +94,16 @@ class RolloutState:
             **llm_kwargs,
         )
 
-    def wait_for_generation_slot(self):
+    def wait_for_generation_slot(self) -> None:
+        """Blocks until no in-place weight update is paused generation."""
         while True:
             with self._pause_lock:
                 if not self._is_generation_paused:
                     return
             time.sleep(0.01)
 
-    def _run_update(self, payload):
+    def _run_update(self, payload: dict[str, Any]) -> None:
+        """Applies a weight update on a background thread; stores any error."""
         try:
             logger.info(f"Applying in-place vLLM update with {len(payload['names'])=}, {payload['packed']=}.")
             self.engine.update_weights({"update_info": payload})
@@ -77,7 +112,12 @@ class RolloutState:
         finally:
             self._update_in_flight = False
     
-    def start_update_weights(self, payload):
+    def start_update_weights(self, payload: dict[str, Any]) -> None:
+        """Begins an in-place weight update on a background thread.
+
+        Raises:
+            RuntimeError: If a weight update is already in progress.
+        """
         with self._pause_lock:
             if self._update_in_flight:
                 raise RuntimeError("weight update already in progress")
@@ -91,22 +131,31 @@ class RolloutState:
             )
             self._update_thread.start()
     
-    def init_weight_transfer(self, payload):
+    def init_weight_transfer(self, payload: dict[str, Any]) -> None:
+        """Joins the NCCL/IPC weight-transfer group in the background.
+
+        Runs in a background thread so the HTTP response returns
+        immediately; the trainer must call its side of the rendezvous
+        concurrently, or this would deadlock.
+        """
         logger.info(
             "Initializing worker weight transfer with "
             f"{payload['master_address']=}, {payload['master_port']=}, "
             f"{payload['rank_offset']=}, {payload['world_size']=}."
         )
-        # Run in a background thread so the HTTP response returns immediately.
-        # The trainer must call trainer_init() concurrently to complete the
-        # NCCL rendezvous; blocking here would deadlock.
         threading.Thread(
             target=self.engine.init_weight_transfer_engine,
             args=({"init_info": payload},),
             daemon=True,
         ).start()
 
-    def finish_update_weights(self):
+    def finish_update_weights(self) -> None:
+        """Waits for the in-progress weight update to complete and resets the KV cache.
+
+        Raises:
+            RuntimeError: If no update was started, or if the update thread
+              raised an error while applying weights.
+        """
         if self._update_thread is None:
             raise RuntimeError("no weight update has been started")
         self._update_thread.join()
@@ -123,14 +172,18 @@ class RolloutState:
         logger.info("In-place vLLM update completed and prefix cache reset.")
 
 class Handler(BaseHTTPRequestHandler):
+    """HTTP handler exposing `RolloutState` over the endpoints listed in the module docstring."""
+
     server_version = "opd-rollout-worker/0.1"
 
-    def _read_json(self):
+    def _read_json(self) -> dict[str, Any]:
+        """Reads and parses the request body as JSON (empty dict if no body)."""
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length) if length > 0 else b"{}"
         return json.loads(body.decode("utf-8"))
 
-    def _write_json(self, payload, status=200):
+    def _write_json(self, payload: dict[str, Any], status: int = 200) -> None:
+        """Writes `payload` as a JSON HTTP response."""
         data = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -145,7 +198,7 @@ class Handler(BaseHTTPRequestHandler):
             fmt % args,
         ))
 
-    def do_GET(self):
+    def do_GET(self) -> None:
         if self.path != "/health":
             self._write_json({"ok": False, "error": "not found"}, status=404)
             return
@@ -155,7 +208,7 @@ class Handler(BaseHTTPRequestHandler):
             "model_path": state.model_path,
         })
 
-    def do_POST(self):
+    def do_POST(self) -> None:
         if self.path == "/generate":
             payload = self._read_json()
             state = self.server.state
@@ -195,7 +248,8 @@ class Handler(BaseHTTPRequestHandler):
         self._write_json({"ok": False, "error": "not found"}, status=404)
 
 
-def main():
+def main() -> None:
+    """Parses CLI args, starts the vLLM engine, and serves the rollout worker HTTP API."""
     parser = argparse.ArgumentParser(description="opd rollout worker")
     parser.add_argument("--model", type=str, required=True)
     parser.add_argument("--tokenizer", type=str, default="")

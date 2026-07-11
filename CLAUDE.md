@@ -182,6 +182,25 @@ The shift by 1 (`[:, 1:]` on mask, `[:, :-1]` on logits) aligns token t's logits
 
 ---
 
+## Code style
+
+@CODE.md
+
+- Follow the **Google Python Style Guide** (see `CODE.md`) **strictly** for
+  every code change: docstrings in Google format (`Args:`, `Returns:`,
+  `Raises:`), 4-space indentation, `snake_case` for functions/variables,
+  `CapWords` for classes, module-level constants in `ALL_CAPS`. Avoid overly
+  clever one-liners; prefer readable, explicit code — this is a teaching
+  codebase, clarity beats brevity.
+- Type hints on public function signatures.
+- No unnecessary abstractions — this codebase favors directly readable code
+  over generic frameworks, since the point is for the user to be able to
+  trace execution end to end.
+- Prefer fewer lines of code, but never at the expense of readability —
+  collapse boilerplate, don't collapse clarity.
+
+---
+
 ## Files at a glance
 
 | File | Purpose |

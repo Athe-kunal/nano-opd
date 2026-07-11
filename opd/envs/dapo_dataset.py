@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Any
 
 from datasets import load_dataset
 from skyrl_gym.envs.base_text_env import ConversationType
 
-from opd.envs.base import OPDEnvBase
+from opd.envs.base import OPDEnvBase, build_system_user_conversation
 
 logger = logging.getLogger(__name__)
 
@@ -98,11 +99,7 @@ class DapoMathEnv(OPDEnvBase):
         self.answer = answer
 
     def init(self, prompt: ConversationType) -> tuple[ConversationType, dict[str, Any]]:
-        messages: ConversationType = [
-            {"role": "system", "content": DEFAULT_SYSTEM_PROMPT},
-            {"role": "user", "content": self.prompt},
-        ]
-        return messages, {}
+        return build_system_user_conversation(DEFAULT_SYSTEM_PROMPT, self.prompt), {}
 
     def compute_reward(self, action: str) -> tuple[float, bool]:
         pred = extract_last_boxed(action)

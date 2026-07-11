@@ -14,21 +14,17 @@ batch and calls `fetch_teacher_topk`/`fetch_teacher_sampled_logprob` directly.
 from typing import Any, Literal
 
 import torch
-import torch.nn.functional as F
 
 from opd.fsdp.model import StudentModel, TeacherModel
 from opd.loss import compute_tis_weights
-from opd.metrics import (
-    compute_entropy_gap,
-    compute_overlap_ratio,
-    compute_overlap_token_advantage,
-)
+from opd.metrics import compute_topk_health_metrics
 from opd.trainer.distillation_utils import (
     minibatch_exchange,
     mopd_pg_loss_and_backward,
     pack_response_logits,
+    topk_kl_loss_and_backward,
 )
-from opd.trainer.setup_utils import DistributedContext, print0
+from opd.trainer.setup_utils import DistributedContext
 from opd.trainer.trainer_utils import MinibatchTensors, StepAccumulator
 
 
@@ -99,65 +95,44 @@ def self_distill_minibatch(
     if not ctx.is_student:
         return
 
-    if result.is_pg:
-        loss = mopd_pg_loss_and_backward(
-            student=student, pg=result.pg, loss_fn=loss_fn,
-            student_logits=result.student_logits, sampled_ids=mb.mb_ids[:, 1:], s_shift_mask=result.s_shift_mask,
-            inf_lp_shifted=mb.mb_inf_lp[:, 1:] if tis_clip > 0.0 else None,
-            tis_clip=tis_clip, divisor=divisor,
-            extra_mask=extra_mask, mask_fn=mask_fn,
-        )
-        acc.add_loss(loss)
-        return
-
-    tk = result.topk
-    student_logits = result.student_logits
-    s_log_resp = F.log_softmax(result.s_resp.float(), dim=-1)
-    s_logprobs = s_log_resp.gather(-1, tk.topk_idx)
-    s_lp_at_student = s_log_resp.gather(-1, tk.student_topk_idx)
-
-    # Exclude positions where the teacher sequence was truncated (its longer,
-    # richer-context prompt may hit max_seq_len). Those padded positions have
-    # log_softmax(0) = -log(V) — a spurious uniform distribution that would
-    # corrupt the loss signal.
-    effective_mask = result.s_compact_mask * tk.t_compact_mask   # [B, R_max]
-    if extra_mask is not None:
-        effective_mask = effective_mask * extra_mask
-    if mask_fn is not None:
-        effective_mask = mask_fn(effective_mask)
-
-    if effective_mask.sum() == 0:
-        msg = (
-            f"[warn mb] effective_mask is all-zero: "
-            f"s_mask={result.s_compact_mask.sum().item():.0f} "
-            f"t_mask={tk.t_compact_mask.sum().item():.0f}"
-        )
-        if extra_mask is not None:
-            msg += f" extra_mask={extra_mask.sum().item():.0f}"
-        print0(msg, flush=True)
-
+    # TIS needs the *unpacked* vLLM inference log-probs (only available at raw
+    # sequence positions), so it's always computed here before packing to the
+    # response-aligned shape the shared loss functions expect.
     tis_full = compute_tis_weights(
-        student_logits, mb.mb_ids[:, 1:], mb.mb_inf_lp[:, 1:], tis_clip
+        result.student_logits, mb.mb_ids[:, 1:], mb.mb_inf_lp[:, 1:], tis_clip
     )
     if tis_full is not None:
         tis_resp, _ = pack_response_logits(
-            tis_full.unsqueeze(-1).expand_as(student_logits), result.s_shift_mask
+            tis_full.unsqueeze(-1).expand_as(result.student_logits), result.s_shift_mask
         )
         tis_weights = tis_resp[..., 0]   # [B, R_max]
     else:
         tis_weights = None
 
-    loss = loss_fn(
-        s_logprobs, tk.t_logprobs, effective_mask,
-        tis_weights=tis_weights, kl_clip=kl_clip,
-    ) / divisor
-    student._scale_loss(loss).backward()
+    if result.is_pg:
+        loss = mopd_pg_loss_and_backward(
+            student=student, pg=result.pg, loss_fn=loss_fn,
+            tis_weights=tis_weights, divisor=divisor,
+            extra_mask=extra_mask, mask_fn=mask_fn,
+        )
+        acc.add_loss(loss)
+        return
+
+    # topk.topk_idx/student_topk_idx index into the *packed* response-aligned
+    # space, so the loss and health metrics below read from result.s_resp
+    # (packed), not result.student_logits (raw, unpacked — TIS-only, above).
+    tk = result.topk
+    loss = topk_kl_loss_and_backward(
+        student=student, student_logits=result.s_resp, topk=tk, loss_fn=loss_fn,
+        # Excludes positions where the teacher sequence was truncated (its
+        # longer, richer-context prompt may hit max_seq_len). Those padded
+        # positions have log_softmax(0) = -log(V) — a spurious uniform
+        # distribution that would corrupt the loss signal.
+        response_mask=result.s_compact_mask, tis_weights=tis_weights, divisor=divisor,
+        extra_mask=extra_mask, mask_fn=mask_fn, kl_clip=kl_clip,
+    )
     acc.add_loss(loss)
 
     with torch.no_grad():
-        ratio = compute_overlap_ratio(tk.student_topk_idx, tk.teacher_topk_idx).item()
-        advantage = compute_overlap_token_advantage(
-            tk.student_topk_idx, tk.teacher_topk_idx, s_lp_at_student, tk.t_logprobs_at_student
-        ).item()
-        entropy_gap = compute_entropy_gap(s_lp_at_student, tk.teacher_own_logprobs).item()
+        ratio, advantage, entropy_gap = compute_topk_health_metrics(result.s_resp, tk)
         acc.add_health_metrics(ratio, advantage, entropy_gap)

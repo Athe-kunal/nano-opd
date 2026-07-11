@@ -48,7 +48,6 @@ def init_distributed(device_type_arg: str, train_world_size: int) -> Distributed
     Rank train_world_size is the teacher rank.
     """
     if device_type_arg == "":
-        # Prefer CUDA if available, otherwise MPS, otherwise fall back to CPU.
         if torch.cuda.is_available():
             device_type = "cuda"
         elif torch.backends.mps.is_available():

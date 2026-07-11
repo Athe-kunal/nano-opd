@@ -442,7 +442,6 @@ def build_output_path(base_model, checkpoint_dir, dataset_name, enable_thinking,
 
 
 async def run_evaluation(args, llm, tokenizer, lora_request, step: int = None):
-    # Phase 1: load all datasets concurrently
     print(f"\n{'='*70}")
     print("PHASE 1: Loading all datasets concurrently...")
     print(f"{'='*70}")
@@ -451,7 +450,6 @@ async def run_evaluation(args, llm, tokenizer, lora_request, step: int = None):
         for name in args.datasets
     ])
 
-    # Phase 2: single batched vLLM generate call over all prompts
     sampling_params = SamplingParams(
         temperature=args.temperature,
         top_p=args.top_p,
@@ -489,7 +487,6 @@ async def run_evaluation(args, llm, tokenizer, lora_request, step: int = None):
         split_outputs.append(all_outputs[offset : offset + size])
         offset += size
 
-    # Phase 3: process and grade results for all datasets concurrently
     print(f"\n{'='*70}")
     print("PHASE 3: Grading results for all datasets concurrently...")
     print(f"{'='*70}")

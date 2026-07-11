@@ -168,7 +168,6 @@ def run_vllm_smoke_check(
     console = _rich_console
     client = OpenAI(base_url=f"{base_url}/v1", api_key="EMPTY")
 
-    # Auto-detect model name from the server if not provided
     if model is None:
         models = client.models.list().data
         if not models:

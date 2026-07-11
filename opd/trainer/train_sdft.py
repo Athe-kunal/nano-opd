@@ -64,7 +64,7 @@ def _build_teacher_messages(
         question=user_content,
         demonstration=demonstration,
     )
-    teacher_messages = list(student_messages[:-1])  # preserve system message if any
+    teacher_messages = list(student_messages[:-1])
     teacher_messages.append({"role": "user", "content": teacher_user})
     return teacher_messages
 

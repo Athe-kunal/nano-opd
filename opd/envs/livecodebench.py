@@ -147,7 +147,6 @@ def format_test_feedback(results: list[dict], n_total: int, max_tests_to_show: i
 
     header = f"{n_pass}/{n_total} tests passed."
 
-    # Errors/timeouts take priority; drop wrong-answer cases if any exist
     priority = [r for r in failures if r["status"] in ("runtime_error", "timeout")]
     candidates = priority if priority else sorted(
         [r for r in failures if r["status"] == "wrong_answer"],

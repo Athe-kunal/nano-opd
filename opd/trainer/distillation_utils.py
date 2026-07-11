@@ -304,8 +304,6 @@ def sync_student_to_teacher(
             dist.broadcast(buf, src=0, group=ctx.all_group)
             received.append(buf)
         syncer.step(received, teacher.model.parameters(), global_step)
-        # print directly — this runs only on the teacher rank, not rank 0, so
-        # print0's rank-0-only gating would silently drop it.
         print(f"[sync step={global_step}] teacher updated via {syncer.__class__.__name__}", flush=True)
 
 
@@ -467,19 +465,21 @@ def mopd_pg_loss_and_backward(
     student: StudentModel,
     pg: MopdPGExchange,
     loss_fn: Any,                            # compute_mopd_pg_loss
-    student_logits: torch.Tensor,            # [B, T_s-1, V], for TIS gather
-    sampled_ids: torch.Tensor,               # [B, T_s-1]
-    s_shift_mask: torch.Tensor,              # [B, T_s-1]
-    inf_lp_shifted: torch.Tensor | None,     # [B, T_s-1], vLLM inference log-probs; None disables TIS
-    tis_clip: float,
+    tis_weights: torch.Tensor | None,        # [B, R_max], already aligned with pg.s_logprob; None disables TIS
     divisor: float,
     extra_mask: torch.Tensor | None = None,  # e.g. SDPO's mb_sd_mask.unsqueeze(1)
     mask_fn: Any = None,                     # e.g. SDFT's apply_token_skip_mask
     warn: bool = True,
 ) -> torch.Tensor:
-    """Shared MOPD-PG loss step for the three packed-response training scripts
-    (SDPO / OPSD / SDFT) — computing the effective mask, TIS weights, calling
-    the loss, and backpropagating was identical across all three call sites.
+    """Shared MOPD-PG loss step, used by OPD directly and, via `exchange_mopd_pg_packed`,
+    by the three packed-response self-teacher scripts (SDPO / OPSD / SDFT) —
+    computing the effective mask, calling the loss, and backpropagating was
+    identical across all call sites.
+
+    `tis_weights` must already be computed (via `compute_tis_weights`) and, if
+    the caller packs its sequences (self-teacher scripts), already packed to
+    the same shape as `pg.s_logprob` — this function has no visibility into
+    whether packing happened, since OPD's sequences never need it.
 
     Returns the (already backward()-ed) loss tensor for accounting.
     """
@@ -494,13 +494,6 @@ def mopd_pg_loss_and_backward(
             f"[warn mb] effective_mask is all-zero: "
             f"s_mask={pg.s_compact_mask.sum().item():.0f} t_mask={pg.t_compact_mask.sum().item():.0f}",
         )
-
-    tis_full = compute_tis_weights(student_logits, sampled_ids, inf_lp_shifted, tis_clip)
-    if tis_full is not None:
-        tis_resp, _ = pack_response_logits(tis_full.unsqueeze(-1), s_shift_mask)
-        tis_weights = tis_resp[..., 0]
-    else:
-        tis_weights = None
 
     loss = loss_fn(pg.s_logprob, pg.t_logprob, effective_mask, tis_weights=tis_weights) / divisor
     student._scale_loss(loss).backward()
@@ -558,7 +551,6 @@ def fetch_teacher_topk(
     if ctx.is_teacher and t_compact_mask is None:
         t_compact_mask = torch.ones(B, T, dtype=torch.float32, device=ctx.device)
 
-    # The student always selects and broadcasts its own top-K indices.
     student_topk_idx = student_topk_indices(student_logits, top_k, student_chunk_size) if ctx.is_student else None
     student_topk_idx, h = bcast_or_alloc_async(
         tensor=student_topk_idx, is_owner=ctx.is_student, shape=(B, T, top_k), dtype=torch.long,
@@ -566,9 +558,6 @@ def fetch_teacher_topk(
     )
     h.wait()
 
-    # The teacher computes its own top-K (+ log-probs there) and its
-    # log-probs at the student's top-K — both needed regardless of
-    # select_topk_by, either for the loss or for diagnostics.
     if ctx.is_teacher:
         teacher_topk_idx, teacher_own_logprobs = teacher_topk_logprobs(teacher_logits, top_k, teacher_chunk_size)
         t_logprobs_at_student = teacher_logprobs_at_indices(teacher_logits, student_topk_idx, teacher_chunk_size)
@@ -585,8 +574,6 @@ def fetch_teacher_topk(
         is_owner=ctx.is_teacher, src=ctx.teacher_global_rank, device=ctx.device, group=ctx.all_group,
     )
 
-    # The loss's shared support is whichever side select_topk_by names — the
-    # other side's quantities above remain available for diagnostics only.
     if select_topk_by == "student":
         topk_idx, t_logprobs = student_topk_idx, t_logprobs_at_student
     else:  # "teacher": forward_kl / mopd_loss weight by the teacher distribution
@@ -601,6 +588,59 @@ def fetch_teacher_topk(
         t_logprobs_at_student=t_logprobs_at_student,
         teacher_own_logprobs=teacher_own_logprobs,
     )
+
+
+def topk_kl_loss_and_backward(
+    *,
+    student: StudentModel,
+    student_logits: torch.Tensor,            # [B, T, V], aligned with topk.topk_idx
+    topk: TopKExchange,
+    loss_fn: Any,                             # reverse_kl / forward_kl / jsd / mopd_loss
+    response_mask: torch.Tensor,              # [B, T], student-side response mask, same T as student_logits
+    tis_weights: torch.Tensor | None,         # [B, T], already aligned with response_mask; None disables TIS
+    divisor: float,
+    student_chunk_size: int = -1,
+    extra_mask: torch.Tensor | None = None,   # e.g. SDPO's mb_sd_mask.unsqueeze(1)
+    mask_fn: Any = None,                      # e.g. SDFT's apply_token_skip_mask
+    kl_clip: float | None = None,             # OPSD's per-token KL clip
+    warn: bool = True,
+) -> torch.Tensor:
+    """Shared step for the top-K KL family (reverse_kl / forward_kl / jsd /
+    mopd_loss), used directly by OPD and, via a packed `student_logits`/`topk`/
+    `response_mask`, by the three self-teacher scripts (SDPO / OPSD / SDFT).
+
+    All four share the same shape: gather student log-probs at the exchanged
+    top-K indices, assemble the effective mask, run `loss_fn` + backward.
+    `tis_weights` must already be computed (via `compute_tis_weights`) and, if
+    the caller packs its sequences, already packed to the same shape as
+    `response_mask` — this function has no visibility into whether packing
+    happened, since OPD's sequences never need it.
+
+    Returns the (already backward()-ed) loss tensor for accounting.
+    """
+    s_logprobs = student_logprobs_at_indices(student_logits, topk.topk_idx, student_chunk_size)
+
+    effective_mask = response_mask * topk.t_compact_mask
+    if extra_mask is not None:
+        effective_mask = effective_mask * extra_mask
+    if mask_fn is not None:
+        effective_mask = mask_fn(effective_mask)
+
+    if warn and effective_mask.sum() == 0:
+        msg = (
+            f"[warn mb] effective_mask is all-zero: "
+            f"s_mask={response_mask.sum().item():.0f} t_mask={topk.t_compact_mask.sum().item():.0f}"
+        )
+        if extra_mask is not None:
+            msg += f" extra_mask={extra_mask.sum().item():.0f}"
+        print0(msg, flush=True)
+
+    loss = loss_fn(
+        s_logprobs, topk.t_logprobs, effective_mask,
+        tis_weights=tis_weights, kl_clip=kl_clip,
+    ) / divisor
+    student._scale_loss(loss).backward()
+    return loss
 
 
 # ---------------------------------------------------------------------------

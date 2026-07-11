@@ -7,16 +7,10 @@ import time
 from typing import Literal
 
 import torch
-import torch.nn.functional as F
 
 from opd.loss import ALGORITHMS
-from opd.fsdp.algorithms import student_logprob_at_sampled_tokens
-from opd.trainer.distillation_utils import (
-    minibatch_exchange,
-    mopd_pg_loss_and_backward,
-    pack_response_logits,
-)
 from opd.trainer.logging_utils import finish_wandb, init_wandb, log_eval_metrics, should_use_wandb
+from opd.trainer.self_distillation_utils import self_distill_minibatch
 from opd.trainer.setup_utils import (
     assert_prompts_divisible,
     build_student,
@@ -29,11 +23,6 @@ from opd.trainer.setup_utils import (
 )
 from opd.trainer.trainer_utils import MinibatchTensors, StepAccumulator, Trainer
 from opd.trainer.sync_teacher import SYNC_METHODS, build_syncer
-from opd.metrics import (
-    compute_overlap_ratio,
-    compute_overlap_token_advantage,
-    compute_entropy_gap,
-)
 from opd.generator.rollout import generate_rollouts_remote
 from opd.envs.dataset import distributed_opd_loader
 from opd.envs.sdft_science import load_sdft_science, load_sdft_science_eval, grade_science_response
@@ -509,59 +498,15 @@ if __name__ == "__main__":
         window_start = (mb.mb_idx // G) * G
         window_size = min(window_start + G, mb.n_mb) - window_start
 
-        is_pg = args.algorithm == "mopd_pg_loss"
-        result = minibatch_exchange(
-            ctx, mb.mb_ids, mb.mb_attn, mb.mb_mask,
-            mb.t_mb_ids, mb.t_mb_attn, mb.t_mb_mask,
-            student if is_student else None, teacher if is_teacher else None,
-            select_topk_by, top_k, args.student_chunk_size, args.teacher_chunk_size,
-            is_pg=is_pg,
+        self_distill_minibatch(
+            mb, acc,
+            ctx=ctx, student=student if is_student else None, teacher=teacher if is_teacher else None,
+            select_topk_by=select_topk_by, top_k=top_k,
+            student_chunk_size=args.student_chunk_size, teacher_chunk_size=args.teacher_chunk_size,
+            loss_fn=loss_fn, is_pg=args.algorithm == "mopd_pg_loss",
+            tis_clip=args.tis_clip, divisor=window_size,
+            mask_fn=lambda m: apply_token_skip_mask(m, args.num_loss_tokens_to_skip),
         )
-
-        if is_student and result.is_pg:
-            # PG form: result.pg holds sampled-token log-probs only, no
-            # top-K distribution to gather from.
-            loss = mopd_pg_loss_and_backward(
-                student=student, pg=result.pg, loss_fn=loss_fn,
-                student_logits=result.student_logits, sampled_ids=mb.mb_ids[:, 1:], s_shift_mask=result.s_shift_mask,
-                inf_lp_shifted=mb.mb_inf_lp[:, 1:] if args.tis_clip > 0.0 else None,
-                tis_clip=args.tis_clip, divisor=window_size,
-                mask_fn=lambda m: apply_token_skip_mask(m, args.num_loss_tokens_to_skip),
-            )
-            acc.add_loss(loss)
-
-        elif is_student:
-            tk = result.topk
-            student_logits = result.student_logits
-            s_log_resp = F.log_softmax(result.s_resp.float(), dim=-1)
-            s_logprobs = s_log_resp.gather(-1, tk.topk_idx)
-            effective_mask = apply_token_skip_mask(
-                result.s_compact_mask * tk.t_compact_mask, args.num_loss_tokens_to_skip
-            )
-
-            if effective_mask.sum() == 0:
-                print0(f"[warn mb] effective_mask is all-zero: s_mask={result.s_compact_mask.sum().item():.0f} t_mask={tk.t_compact_mask.sum().item():.0f}", flush=True)
-
-            if args.tis_clip > 0.0:
-                s_lp_sampled = student_logprob_at_sampled_tokens(student_logits, mb.mb_ids[:, 1:])
-                tis_full = (s_lp_sampled - mb.mb_inf_lp[:, 1:].to(s_lp_sampled.dtype)).exp().clamp(max=args.tis_clip)
-                tis_resp, _ = pack_response_logits(tis_full.unsqueeze(-1).expand_as(student_logits), result.s_shift_mask)
-                tis_weights = tis_resp[..., 0]
-            else:
-                tis_weights = None
-
-            loss = loss_fn(s_logprobs, tk.t_logprobs, effective_mask, tis_weights=tis_weights) / window_size
-            student._scale_loss(loss).backward()
-            acc.add_loss(loss)
-
-            with torch.no_grad():
-                s_lp_metrics = s_log_resp.gather(-1, tk.student_topk_idx)
-                ratio = compute_overlap_ratio(tk.student_topk_idx, tk.teacher_topk_idx).item()
-                advantage = compute_overlap_token_advantage(
-                    tk.student_topk_idx, tk.teacher_topk_idx, s_lp_metrics, tk.t_logprobs_at_student
-                ).item()
-                entropy_gap = compute_entropy_gap(s_lp_metrics, tk.teacher_own_logprobs).item()
-                acc.add_health_metrics(ratio, advantage, entropy_gap)
 
     # -------------------------------------------------------------------------
     # Training loop
@@ -616,8 +561,6 @@ if __name__ == "__main__":
 
         # -- EMA sync: after each epoch's optimizer step(s), teacher tracks
         # student. This is the core SDFT mechanism: teacher φ ← α·θ + (1−α)·φ
-        # A slowly-updating teacher provides a stable distillation target
-        # while still incorporating the student's improving capabilities.
         trainer.step(
             step, t0, batch, teacher_batch, do_minibatch,
             has_teacher_batch=True,

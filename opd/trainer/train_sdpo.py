@@ -5,16 +5,10 @@ import time
 from typing import Literal
 
 import torch
-import torch.nn.functional as F
 
 from opd.loss import ALGORITHMS
-from opd.fsdp.algorithms import student_logprob_at_sampled_tokens
-from opd.trainer.distillation_utils import (
-    minibatch_exchange,
-    mopd_pg_loss_and_backward,
-    pack_response_logits,
-)
 from opd.trainer.logging_utils import finish_wandb, init_wandb, should_use_wandb
+from opd.trainer.self_distillation_utils import self_distill_minibatch
 from opd.trainer.setup_utils import (
     assert_prompts_divisible,
     build_student,
@@ -27,11 +21,6 @@ from opd.trainer.setup_utils import (
 )
 from opd.trainer.trainer_utils import MinibatchTensors, StepAccumulator, Trainer
 from opd.trainer.sync_teacher import SYNC_METHODS, build_syncer
-from opd.metrics import (
-    compute_overlap_ratio,
-    compute_overlap_token_advantage,
-    compute_entropy_gap,
-)
 from opd.generator.rollout import generate_rollouts_remote
 from opd.envs.dataset import distributed_opd_loader, build_opd_dataset
 from opd.envs.dapo_dataset import DapoMathEnv
@@ -274,77 +263,26 @@ if __name__ == "__main__":
     # feedback + original response. stopgrad (no_grad, inside
     # minibatch_exchange) prevents gradients from flowing through the teacher
     # back into the student's computation graph (SDPO Eq. 1).
+    #
+    # SDPO-specific: the loss divisor is the actual size of the current
+    # grad-accumulation window (the last window may be smaller than G if
+    # n_mb % G != 0), and an extra self-distillation mask excludes rollouts
+    # where the teacher had no augmented context (teacher == student prompt,
+    # so the KL signal is meaningless there).
     def do_minibatch(mb: MinibatchTensors, acc: StepAccumulator) -> None:
-        # How many minibatches are in this accumulation window? The last
-        # window may be smaller than G if n_mb % G != 0.
         G = args.grad_accum_steps
         window_start = (mb.mb_idx // G) * G
         window_size = min(window_start + G, mb.n_mb) - window_start
-        mb_sd_mask = mb.extra["sd_mask"]
 
-        is_pg = args.algorithm == "mopd_pg_loss"
-        result = minibatch_exchange(
-            ctx, mb.mb_ids, mb.mb_attn, mb.mb_mask,
-            mb.t_mb_ids, mb.t_mb_attn, mb.t_mb_mask,
-            student if is_student else None, teacher if is_teacher else None,
-            select_topk_by, top_k, args.student_chunk_size, args.teacher_chunk_size,
-            is_pg=is_pg,
+        self_distill_minibatch(
+            mb, acc,
+            ctx=ctx, student=student if is_student else None, teacher=teacher if is_teacher else None,
+            select_topk_by=select_topk_by, top_k=top_k,
+            student_chunk_size=args.student_chunk_size, teacher_chunk_size=args.teacher_chunk_size,
+            loss_fn=loss_fn, is_pg=args.algorithm == "mopd_pg_loss",
+            tis_clip=args.tis_clip, divisor=window_size,
+            extra_mask=mb.extra["sd_mask"].unsqueeze(1),
         )
-
-        # -- PG form: no top-K exchange at all, just the sampled-token
-        # log-prob under each policy, packed to response positions. --
-        if result.is_pg:
-            if is_student:
-                loss = mopd_pg_loss_and_backward(
-                    student=student, pg=result.pg, loss_fn=loss_fn,
-                    student_logits=result.student_logits, sampled_ids=mb.mb_ids[:, 1:], s_shift_mask=result.s_shift_mask,
-                    inf_lp_shifted=mb.mb_inf_lp[:, 1:] if args.tis_clip > 0.0 else None,
-                    tis_clip=args.tis_clip, divisor=window_size,
-                    extra_mask=mb_sd_mask.unsqueeze(1),
-                )
-                acc.add_loss(loss)
-
-        # -- Loss and backward (student ranks only; PG form already did its own above) --
-        elif is_student:
-            tk = result.topk
-            student_logits = result.student_logits
-            s_log_resp      = F.log_softmax(result.s_resp.float(), dim=-1)
-            s_logprobs      = s_log_resp.gather(-1, tk.topk_idx)
-            s_lp_at_student = s_log_resp.gather(-1, tk.student_topk_idx)
-
-            # Exclude positions where the teacher sequence was truncated (due to
-            # its longer feedback-augmented prompt hitting max_seq_len). Those
-            # padded positions have log_softmax(0) = -log(V) — a spurious uniform
-            # distribution that would corrupt the loss signal.
-            # Also exclude samples where the teacher had no augmented context —
-            # those have teacher == student prompt so the KL signal is meaningless.
-            effective_mask = result.s_compact_mask * tk.t_compact_mask * mb_sd_mask.unsqueeze(1)  # [B, R_max]
-            if effective_mask.sum() == 0:
-                print0(f"[warn mb] effective_mask is all-zero: s_mask={result.s_compact_mask.sum().item():.0f} t_mask={tk.t_compact_mask.sum().item():.0f} sd_mask={mb_sd_mask.sum().item():.0f}", flush=True)
-
-            if args.tis_clip > 0.0:
-                sampled_ids    = mb.mb_ids[:, 1:]
-                s_lp_sampled   = student_logprob_at_sampled_tokens(student_logits, sampled_ids)
-                inf_lp_shifted = mb.mb_inf_lp[:, 1:].to(s_lp_sampled.dtype)
-                tis_full       = (s_lp_sampled - inf_lp_shifted).exp().clamp(max=args.tis_clip)
-                tis_resp, _    = pack_response_logits(
-                    tis_full.unsqueeze(-1).expand_as(student_logits), result.s_shift_mask
-                )
-                tis_weights = tis_resp[..., 0]   # [B, R_max]
-            else:
-                tis_weights = None
-
-            loss = loss_fn(s_logprobs, tk.t_logprobs, effective_mask, tis_weights=tis_weights) / window_size
-            student._scale_loss(loss).backward()
-            acc.add_loss(loss)
-
-            with torch.no_grad():
-                ratio = compute_overlap_ratio(tk.student_topk_idx, tk.teacher_topk_idx).item()
-                advantage = compute_overlap_token_advantage(
-                    tk.student_topk_idx, tk.teacher_topk_idx, s_lp_at_student, tk.t_logprobs_at_student
-                ).item()
-                entropy_gap = compute_entropy_gap(s_lp_at_student, tk.teacher_own_logprobs).item()
-                acc.add_health_metrics(ratio, advantage, entropy_gap)
 
     # -------------------------------------------------------------------------
     # Training loop — all ranks iterate together

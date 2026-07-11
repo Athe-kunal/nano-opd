@@ -1,5 +1,3 @@
-"""On-Policy Self-Distillation (OPSD) training loop — frozen reference-solution teacher."""
-
 import argparse
 import time
 from typing import Literal
@@ -22,10 +20,6 @@ from opd.envs.opsd_dataset import OPSDMathEnv
 from opd.envs.dataset import distributed_opd_loader
 from opd.generator.rollout import generate_rollouts_remote
 
-
-# ---------------------------------------------------------------------------
-# Teacher prompt construction (Figure 2 of the OPSD paper)
-# ---------------------------------------------------------------------------
 
 # The teacher sees the problem AND the ground-truth reference solution y*.
 # This follows Figure 2 of the paper exactly: after reading the reference
@@ -69,12 +63,6 @@ def _build_teacher_messages(
     teacher_messages = list(student_messages[:-1])   # preserve system message if any
     teacher_messages.append({"role": "user", "content": teacher_user})
     return teacher_messages
-
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
 
@@ -161,24 +149,15 @@ if __name__ == "__main__":
     #   ranks 0..train_world_size-1  →  student (FSDP, updated by optimizer)
     #   rank  train_world_size       →  teacher (plain nn.Module, frozen initial policy)
     ctx = init_distributed(args.device_type, args.train_world_size)
-    ddp_rank            = ctx.ddp_rank
-    ddp_world_size      = ctx.ddp_world_size
-    device              = ctx.device
-    train_world_size    = ctx.train_world_size
-    is_student          = ctx.is_student
-    is_teacher          = ctx.is_teacher
-    master_process      = ctx.master_process
-    student_group       = ctx.student_group
-    all_group           = ctx.all_group
 
     print0(f"Model: {args.student_model}  (teacher = frozen initial policy)")
     print0(f"Algorithm: {args.algorithm}  distill-top-k: {args.distill_top_k}")
-    print0(f"Device: {device}  Student ranks: {train_world_size}  Total world: {ddp_world_size}")
+    print0(f"Device: {ctx.device}  Student ranks: {ctx.train_world_size}  Total world: {ctx.ddp_world_size}")
     if args.kl_clip > 0.0:
         print0(f"Per-token KL clip: {args.kl_clip}")
 
     init_wandb(
-        args.run_name, master_process, use_wandb,
+        args.run_name, ctx.master_process, use_wandb,
         config={
             "student_model": args.student_model,
             "algorithm": args.algorithm,
@@ -194,11 +173,11 @@ if __name__ == "__main__":
         },
     )
 
-    assert_prompts_divisible(args.prompts_per_step, train_world_size)
+    assert_prompts_divisible(args.prompts_per_step, ctx.train_world_size)
 
     # -------------------------------------------------------------------------
     # Model setup
-    if is_student:
+    if ctx.is_student:
         student = build_student(
             args.student_model,
             lr=args.lr,
@@ -206,60 +185,44 @@ if __name__ == "__main__":
             max_grad_norm=args.max_grad_norm,
             gradient_checkpointing=args.gradient_checkpointing,
             sharding_strategy=args.sharding_strategy,
-            train_world_size=train_world_size,
-            student_group=student_group,
+            train_world_size=ctx.train_world_size,
+            student_group=ctx.student_group,
             total_steps=args.num_steps * args.epochs,
             scheduler_name=args.scheduler,
             warmup_ratio=args.warmup_ratio,
         )
 
-    if is_teacher:
-        # Frozen initial policy — weights are never updated after this load.
-        # The paper (Section 4.1) finds that fixing the teacher to the initial
-        # policy stabilises training and acts as an implicit regulariser that
-        # prevents excessive deviation from the pretrained distribution.
+    if ctx.is_teacher:
         teacher = build_teacher(args.student_model)
         print(f"[teacher] Loaded initial policy from {args.student_model} (frozen)", flush=True)
 
-    # -------------------------------------------------------------------------
-    # Loss function and top-K selection
-    # OPSD paper (Table 3) recommends forward KL: KL(p_T || p_S).
-    # For forward KL the teacher selects the top-K indices (the teacher-weighted
-    # sum means we need tokens where the teacher has non-negligible probability).
+
     loss_fn = ALGORITHMS[args.algorithm]
     select_topk_by: Literal["student", "teacher"] = topk_selector_for(args.algorithm)
     top_k = args.distill_top_k
 
-    # -------------------------------------------------------------------------
-    # vLLM weight-transfer setup (student ranks only)
     model_update_group = init_vllm_transfer(
         args.rollout_worker_url,
         rollout_worker_world_size=args.rollout_worker_world_size,
-        train_world_size=train_world_size,
-        master_process=master_process,
-        all_group=all_group,
+        train_world_size=ctx.train_world_size,
+        master_process=ctx.master_process,
+        all_group=ctx.all_group,
     )
 
     trainer = Trainer(
         args, ctx,
-        student if is_student else None, teacher if is_teacher else None,
+        student if ctx.is_student else None, teacher if ctx.is_teacher else None,
         model_update_group, use_wandb,
     )
 
-    # -------------------------------------------------------------------------
-    # Dataset (student ranks only)
-    if is_student:
+    if ctx.is_student:
         dataset     = OPSDMathEnv.load(split=args.dataset_split, dataset_id=args.dataset_id)
         loader      = distributed_opd_loader(
-            dataset, args.prompts_per_step, train_world_size, ddp_rank, seed=args.seed
+            dataset, args.prompts_per_step, ctx.train_world_size, ctx.ddp_rank, seed=args.seed
         )
         loader_iter = iter(loader)
 
-    # -------------------------------------------------------------------------
-    # Per-minibatch exchange + loss + backward. The teacher p_T(· | x, y*)
-    # conditions on both the problem and the reference solution. Gradients
-    # must NOT flow through the teacher — it acts as a fixed target
-    # distribution. 
+
     def do_minibatch(mb: MinibatchTensors, acc: StepAccumulator) -> None:
         # Per-token pointwise KL clipping (OPSD paper Section 3.2). Stylistic
         # tokens can exhibit much higher KL than math tokens, dominating the
@@ -268,7 +231,7 @@ if __name__ == "__main__":
         # for smaller models (Figure 4).
         self_distill_minibatch(
             mb, acc,
-            ctx=ctx, student=student if is_student else None, teacher=teacher if is_teacher else None,
+            ctx=ctx, student=student if ctx.is_student else None, teacher=teacher if ctx.is_teacher else None,
             select_topk_by=select_topk_by, top_k=top_k,
             student_chunk_size=args.student_chunk_size, teacher_chunk_size=args.teacher_chunk_size,
             loss_fn=loss_fn, is_pg=args.algorithm == "mopd_pg_loss",
@@ -283,7 +246,7 @@ if __name__ == "__main__":
 
         # -- Rollout generation (student ranks only) --
         rollouts = None
-        if is_student:
+        if ctx.is_student:
             examples, _ = next(loader_iter)   # list[OPSDMathEnv], state_dict
 
             # Student prompt: problem only — p_S(· | x)
@@ -332,4 +295,4 @@ if __name__ == "__main__":
         trainer.barrier()
 
     compute_cleanup()
-    finish_wandb(master_process, use_wandb)
+    finish_wandb(ctx.master_process, use_wandb)

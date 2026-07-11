@@ -26,7 +26,7 @@ def compute_cleanup():
         dist.destroy_process_group()
 
 
-@dataclass
+@dataclass(slots=True)
 class DistributedContext:
     ddp_rank: int
     ddp_local_rank: int

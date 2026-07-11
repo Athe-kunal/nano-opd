@@ -146,22 +146,13 @@ if __name__ == "__main__":
     #   ranks 0..train_world_size-1  →  student (FSDP)
     #   rank  train_world_size       →  teacher (plain nn.Module, same model)
     ctx = init_distributed(args.device_type, args.train_world_size)
-    ddp_rank            = ctx.ddp_rank
-    ddp_world_size      = ctx.ddp_world_size
-    device              = ctx.device
-    train_world_size    = ctx.train_world_size
-    is_student          = ctx.is_student
-    is_teacher          = ctx.is_teacher
-    master_process      = ctx.master_process
-    student_group       = ctx.student_group
-    all_group           = ctx.all_group
 
     print0(f"Model: {args.student_model}  (student = teacher, synced via {args.sync_method})")
     print0(f"Algorithm: {args.algorithm}  distill-top-k: {args.distill_top_k}")
-    print0(f"Device: {device}  Student ranks: {train_world_size}  Total world: {ddp_world_size}")
+    print0(f"Device: {ctx.device}  Student ranks: {ctx.train_world_size}  Total world: {ctx.ddp_world_size}")
 
     init_wandb(
-        args.run_name, master_process, use_wandb,
+        args.run_name, ctx.master_process, use_wandb,
         config={
             "student_model": args.student_model,
             "algorithm": args.algorithm,
@@ -182,11 +173,11 @@ if __name__ == "__main__":
         },
     )
 
-    assert_prompts_divisible(args.prompts_per_step, train_world_size)
+    assert_prompts_divisible(args.prompts_per_step, ctx.train_world_size)
 
     # -------------------------------------------------------------------------
     # Model setup
-    if is_student:
+    if ctx.is_student:
         student = build_student(
             args.student_model,
             lr=args.lr,
@@ -194,14 +185,14 @@ if __name__ == "__main__":
             max_grad_norm=args.max_grad_norm,
             gradient_checkpointing=args.gradient_checkpointing,
             sharding_strategy=args.sharding_strategy,
-            train_world_size=train_world_size,
-            student_group=student_group,
+            train_world_size=ctx.train_world_size,
+            student_group=ctx.student_group,
             total_steps=args.num_steps * args.epochs,
             scheduler_name=args.scheduler,
             warmup_ratio=args.warmup_ratio,
         )
 
-    if is_teacher:
+    if ctx.is_teacher:
         # Same checkpoint as the student; weights will be synced after each step.
         teacher = build_teacher(args.student_model)
 
@@ -212,7 +203,7 @@ if __name__ == "__main__":
     if args.sync_method == "ema":
         syncer_kwargs["alpha"] = args.ema_alpha
     elif args.sync_method == "trust_region":
-        if is_teacher:
+        if ctx.is_teacher:
             # Snapshot the initial weights as the regularization anchor.
             syncer_kwargs["initial_params"] = [
                 p.data.clone() for p in teacher.model.parameters()
@@ -237,23 +228,23 @@ if __name__ == "__main__":
     model_update_group = init_vllm_transfer(
         args.rollout_worker_url,
         rollout_worker_world_size=args.rollout_worker_world_size,
-        train_world_size=train_world_size,
-        master_process=master_process,
-        all_group=all_group,
+        train_world_size=ctx.train_world_size,
+        master_process=ctx.master_process,
+        all_group=ctx.all_group,
     )
 
     trainer = Trainer(
         args, ctx,
-        student if is_student else None, teacher if is_teacher else None,
+        student if ctx.is_student else None, teacher if ctx.is_teacher else None,
         model_update_group, use_wandb,
     )
 
     # -------------------------------------------------------------------------
     # Dataset (student ranks only)
-    if is_student:
+    if ctx.is_student:
         dataset = build_opd_dataset(args.dataset, eval_test_size=args.sciknoweval_test_size, seed=args.seed)
         loader = distributed_opd_loader(
-            dataset, args.prompts_per_step, train_world_size, ddp_rank, seed=args.seed
+            dataset, args.prompts_per_step, ctx.train_world_size, ctx.ddp_rank, seed=args.seed
         )
         loader_iter = iter(loader)
 
@@ -276,7 +267,7 @@ if __name__ == "__main__":
 
         self_distill_minibatch(
             mb, acc,
-            ctx=ctx, student=student if is_student else None, teacher=teacher if is_teacher else None,
+            ctx=ctx, student=student if ctx.is_student else None, teacher=teacher if ctx.is_teacher else None,
             select_topk_by=select_topk_by, top_k=top_k,
             student_chunk_size=args.student_chunk_size, teacher_chunk_size=args.teacher_chunk_size,
             loss_fn=loss_fn, is_pg=args.algorithm == "mopd_pg_loss",
@@ -291,7 +282,7 @@ if __name__ == "__main__":
 
         # -- Rollout generation (student ranks only) --
         rollouts = None
-        if is_student:
+        if ctx.is_student:
             examples, _ = next(loader_iter)
             prompts = [
                 student.tokenizer.apply_chat_template(
@@ -336,16 +327,16 @@ if __name__ == "__main__":
         # 1 for rollouts where the teacher received augmented context (solution or feedback),
         # 0 for rollouts where teacher == student context (distillation signal is meaningless).
         sd_mask = None
-        if is_student:
+        if ctx.is_student:
             sd_mask = torch.tensor(
-                [r["has_distillation"] for r in rollouts], dtype=torch.float, device=device
+                [r["has_distillation"] for r in rollouts], dtype=torch.float, device=ctx.device
             )  # [N]
 
         trainer.step(
             step, t0, batch, teacher_batch, do_minibatch,
             has_teacher_batch=True,
             accum_steps=args.grad_accum_steps,
-            extra_tensors={"sd_mask": sd_mask} if is_student else None,
+            extra_tensors={"sd_mask": sd_mask} if ctx.is_student else None,
             extra_specs={"sd_mask": torch.float},
             syncer=syncer,
             teacher_sync_scope="step",
@@ -354,7 +345,7 @@ if __name__ == "__main__":
         trainer.barrier()
 
         if args.eval_every > 0 and (step + 1) % args.eval_every == 0:
-            if master_process:
+            if ctx.master_process:
                 _ENV_CLS[args.dataset].evaluate(
                     rollout_worker_url=args.rollout_worker_url,
                     step=step + 1,
@@ -368,4 +359,4 @@ if __name__ == "__main__":
             trainer.barrier()
 
     compute_cleanup()
-    finish_wandb(master_process, use_wandb)
+    finish_wandb(ctx.master_process, use_wandb)

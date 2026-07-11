@@ -1,5 +1,3 @@
-"""On-Policy Distillation (OPD) training loop — student + separate frozen teacher."""
-
 import argparse
 import time
 from typing import Literal
@@ -92,26 +90,16 @@ if __name__ == "__main__":
 
     use_wandb = should_use_wandb()
 
-    # -----------------------------------------------------------------------------
-    # Distributed init
+
     ctx = init_distributed(args.device_type, args.train_world_size)
-    ddp_rank          = ctx.ddp_rank
-    ddp_world_size    = ctx.ddp_world_size
-    device            = ctx.device
-    train_world_size  = ctx.train_world_size
-    is_student        = ctx.is_student
-    is_teacher        = ctx.is_teacher
-    master_process    = ctx.master_process
-    student_group     = ctx.student_group
-    all_group         = ctx.all_group
 
     print0(f"Student: {args.student_model}")
     print0(f"Teacher: {args.teacher_model}")
     print0(f"Algorithm: {args.algorithm}  distill-top-k: {args.distill_top_k}")
-    print0(f"Device: {device}  Student ranks: {train_world_size}  Total world: {ddp_world_size}")
+    print0(f"Device: {ctx.device}  Student ranks: {ctx.train_world_size}  Total world: {ctx.ddp_world_size}")
 
     init_wandb(
-        args.run_name, master_process, use_wandb,
+        args.run_name, ctx.master_process, use_wandb,
         config={
             "student_model": args.student_model,
             "teacher_model": args.teacher_model,
@@ -133,11 +121,11 @@ if __name__ == "__main__":
         },
     )
 
-    assert_prompts_divisible(args.prompts_per_step, train_world_size)
+    assert_prompts_divisible(args.prompts_per_step, ctx.train_world_size)
 
     # -----------------------------------------------------------------------------
     # Model setup
-    if is_student:
+    if ctx.is_student:
         student = build_student(
             args.student_model,
             lr=args.lr,
@@ -145,12 +133,12 @@ if __name__ == "__main__":
             max_grad_norm=args.max_grad_norm,
             gradient_checkpointing=args.gradient_checkpointing,
             sharding_strategy=args.sharding_strategy,
-            train_world_size=train_world_size,
-            student_group=student_group,
+            train_world_size=ctx.train_world_size,
+            student_group=ctx.student_group,
             total_steps=args.num_steps * args.epochs,
         )
 
-    if is_teacher:
+    if ctx.is_teacher:
         teacher = build_teacher(args.teacher_model)
 
     # -----------------------------------------------------------------------------
@@ -158,56 +146,41 @@ if __name__ == "__main__":
     loss_fn = ALGORITHMS[args.algorithm]
     select_topk_by: Literal["student", "teacher"] = topk_selector_for(args.algorithm)
 
-    # -----------------------------------------------------------------------------
-    # vLLM weight-transfer setup (student ranks only; teacher is not involved)
+
     model_update_group = init_vllm_transfer(
         args.rollout_worker_url,
         rollout_worker_world_size=args.rollout_worker_world_size,
-        train_world_size=train_world_size,
-        master_process=master_process,
-        all_group=all_group,
+        train_world_size=ctx.train_world_size,
+        master_process=ctx.master_process,
+        all_group=ctx.all_group,
     )
 
     trainer = Trainer(
         args, ctx,
-        student if is_student else None, teacher if is_teacher else None,
+        student if ctx.is_student else None, teacher if ctx.is_teacher else None,
         model_update_group, use_wandb,
     )
 
-    # -----------------------------------------------------------------------------
-    # Dataset (student ranks only)
-    if is_student:
+    if ctx.is_student:
         dataset = build_opd_dataset(args.dataset)
         loader = distributed_opd_loader(
-            dataset, args.prompts_per_step, train_world_size, ddp_rank, seed=args.seed
+            dataset, args.prompts_per_step, ctx.train_world_size, ctx.ddp_rank, seed=args.seed
         )
         loader_iter = iter(loader)
 
-    # -----------------------------------------------------------------------------
-    # Per-minibatch exchange + loss + backward. OPD has no separate teacher
-    # batch — the teacher forward runs on the same broadcast mb_ids/mb_attn as
-    # the student (same-length sequences, no packing needed).
     def do_minibatch(mb: MinibatchTensors, acc: StepAccumulator) -> None:
         B, T = mb.mb_ids.shape[0], mb.mb_ids.shape[1] - 1
-
-        # -- Student forward (with grad) --
-        if is_student:
+        if ctx.is_student:
             student_logits = student.get_logits(mb.mb_ids, mb.mb_attn)[:, :-1]  # [B, T-1, V]
 
         # -- Teacher: compute top-K log-probs and broadcast --
         # Broadcasts only [B, T-1, K] instead of the full [B, T-1, V] logit
-        # tensor, reducing per-minibatch communication by ~vocab/K (>1000×).
-        if is_teacher:
+        if ctx.is_teacher:
             teacher_logits = teacher.get_logits(mb.mb_ids, mb.mb_attn)[:, :-1]
         else:
             teacher_logits = None
 
         if args.algorithm == "mopd_pg_loss":
-            # -- PG form: no top-K exchange needed for the loss
-            # itself, just the sampled token's log-prob under each policy.
-            # mb_ids is already on every rank (broadcast by the Trainer), so
-            # sampled_ids needs no extra communication — only the
-            # teacher's [B, T-1] logprob at those ids crosses the wire.
             sampled_ids = mb.mb_ids[:, 1:]                             # [B, T-1]
             t_logprob = exchange_sampled_teacher_logprob(
                 ctx=ctx,
@@ -219,7 +192,7 @@ if __name__ == "__main__":
             topk = exchange_topk(
                 ctx=ctx,
                 select_topk_by=select_topk_by,
-                student_logits=student_logits if is_student else None,
+                student_logits=student_logits if ctx.is_student else None,
                 teacher_logits=teacher_logits,
                 B=B, T=T,
                 top_k=args.distill_top_k,
@@ -227,7 +200,7 @@ if __name__ == "__main__":
                 teacher_chunk_size=args.teacher_chunk_size,
             )
 
-            if is_student:
+            if ctx.is_student:
                 s_logprob = student_logprobs_at_indices(
                     student_logits, sampled_ids.unsqueeze(-1), args.student_chunk_size
                 ).squeeze(-1)                                      # [B, T-1], grad-carrying
@@ -254,7 +227,7 @@ if __name__ == "__main__":
         topk = exchange_topk(
             ctx=ctx,
             select_topk_by=select_topk_by,
-            student_logits=student_logits if is_student else None,
+            student_logits=student_logits if ctx.is_student else None,
             teacher_logits=teacher_logits,
             B=B, T=T,
             top_k=args.distill_top_k,
@@ -262,12 +235,12 @@ if __name__ == "__main__":
             teacher_chunk_size=args.teacher_chunk_size,
         )
         # -- Student: compute TIS weights then loss and backward --
-        if is_student:
+        if ctx.is_student:
             s_logprobs = student_logprobs_at_indices(student_logits, topk.topk_idx, args.student_chunk_size)
             shift_mask = mb.mb_mask[:, 1:]                             # [B, T-1]
 
             # TIS weight: corrects for numerical gap between vLLM inference
-            # log-probs and training-time log-probs (SDPO paper, Eq. 12 / A.4).
+            # log-probs and training-time log-probs.
             # w_t = exp(log π_train(y_t) − log π_vllm(y_t)), clipped to C.
             if args.tis_clip > 0.0:
                 sampled_ids = mb.mb_ids[:, 1:]                         # [B, T-1]
@@ -288,15 +261,10 @@ if __name__ == "__main__":
                 )
                 acc.add_health_metrics(ratio, adv, ent_gap)
 
-    # -----------------------------------------------------------------------------
-    # Training loop — all ranks iterate together; students and teacher take
-    # different code paths but participate in the same NCCL collectives.
     for step in range(args.num_steps):
         t0 = time.time()
-
-        # ---- Rollout generation (student ranks only) ----
         rollouts = None
-        if is_student:
+        if ctx.is_student:
             examples, _ = next(loader_iter)
             prompts = [
                 student.tokenizer.apply_chat_template(
@@ -317,13 +285,10 @@ if __name__ == "__main__":
 
         trainer.step(step, t0, batch, teacher_batch, do_minibatch, has_teacher_batch=False)
 
-        # All ranks sync before eval so FSDP/NCCL state is settled.
-        # Eval only runs on rank 0 and can take minutes (vLLM generation);
-        # the barrier must fire first so other ranks don't time out waiting.
         trainer.barrier()
 
         if args.eval_every > 0 and (step + 1) % args.eval_every == 0:
-            if master_process:
+            if ctx.master_process:
                 _ENV_CLS[args.dataset].evaluate(
                     rollout_worker_url=args.rollout_worker_url,
                     step=step + 1,
@@ -333,4 +298,4 @@ if __name__ == "__main__":
                 )
 
     compute_cleanup()
-    finish_wandb(master_process, use_wandb)
+    finish_wandb(ctx.master_process, use_wandb)

@@ -389,7 +389,7 @@ def exchange_sampled_teacher_logprob(
     return t_logprob
 
 
-@dataclass
+@dataclass(slots=True)
 class MopdPGExchange:
     """Result of exchange_mopd_pg_packed: sampled-token log-probs for the MOPD-PG loss."""
     s_logprob: torch.Tensor | None       # [B, R_max], grad-carrying (student ranks only)
@@ -513,7 +513,7 @@ def mopd_pg_loss_and_backward(
 # ---------------------------------------------------------------------------
 
 
-@dataclass
+@dataclass(slots=True)
 class TopKExchange:
     """Result of exchange_topk: the top-K distributions used to compute the KL loss."""
     topk_idx: torch.Tensor
@@ -609,7 +609,7 @@ def exchange_topk(
 # ---------------------------------------------------------------------------
 
 
-@dataclass
+@dataclass(slots=True)
 class MinibatchExchangeResult:
     """Result of minibatch_exchange: exactly one of `topk`/`pg` is set, per `is_pg`.
 

@@ -45,7 +45,7 @@ from opd.trainer.setup_utils import (
 from opd.trainer.sync_teacher import TeacherSyncer
 
 
-@dataclass
+@dataclass(slots=True)
 class MinibatchTensors:
     """Bundle passed to each script's `minibatch_fn`.
 
@@ -65,7 +65,7 @@ class MinibatchTensors:
     extra: dict[str, torch.Tensor] = field(default_factory=dict)
 
 
-@dataclass
+@dataclass(slots=True)
 class StepAccumulator:
     """Loss/health-metric accumulator for one outer training step.
 

@@ -362,7 +362,7 @@ def broadcast_teacher_inputs(
 # ---------------------------------------------------------------------------
 
 
-def exchange_sampled_teacher_logprob(
+def fetch_teacher_sampled_logprob(
     *,
     ctx: DistributedContext,
     teacher_logits: torch.Tensor | None,   # [B, T, V], teacher rank only
@@ -374,7 +374,7 @@ def exchange_sampled_teacher_logprob(
     """Broadcasts log π_φd(y_t): teacher log-prob at the student's sampled token.
 
     Used for the MOPD policy-gradient advantage. Only a [B, T] tensor
-    crosses the wire here, versus [B, T, K] for exchange_topk — the PG form
+    crosses the wire here, versus [B, T, K] for fetch_teacher_topk — the PG form
     needs no top-K selection at all, just this one scalar per position.
     """
     if ctx.is_teacher:
@@ -415,7 +415,7 @@ def exchange_mopd_pg_packed(
     SDFT self-teacher training, where teacher prompts include extra feedback
     so student and teacher sequences differ in length).
 
-    Same principle as exchange_sampled_teacher_logprob: gather each policy's
+    Same principle as fetch_teacher_sampled_logprob: gather each policy's
     log-prob at its own sampled token in the cheap, unpacked [B, T-1] space —
     no top-K, no full-vocab packing — then pack to response-only positions
     [B, R_max] and broadcast only the teacher's small result.
@@ -514,7 +514,7 @@ def mopd_pg_loss_and_backward(
 
 @dataclass(slots=True)
 class TopKExchange:
-    """Result of exchange_topk: the top-K distributions used to compute the KL loss."""
+    """Result of fetch_teacher_topk: the top-K distributions used to compute the KL loss."""
     topk_idx: torch.Tensor
     t_logprobs: torch.Tensor
     t_compact_mask: torch.Tensor
@@ -524,7 +524,7 @@ class TopKExchange:
     teacher_own_logprobs: torch.Tensor
 
 
-def exchange_topk(
+def fetch_teacher_topk(
     *,
     ctx: DistributedContext,
     select_topk_by: Literal["student", "teacher"],
@@ -719,7 +719,7 @@ def minibatch_exchange(
             s_shift_mask=s_shift_mask, student_logits=student_logits,
         )
 
-    topk = exchange_topk(
+    topk = fetch_teacher_topk(
         ctx=ctx, select_topk_by=select_topk_by,
         student_logits=s_resp, teacher_logits=t_resp, t_compact_mask=t_compact_mask,
         B=mb_ids.shape[0], T=R_max, top_k=top_k,

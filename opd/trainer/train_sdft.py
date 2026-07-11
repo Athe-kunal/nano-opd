@@ -25,8 +25,10 @@ from opd.trainer.trainer_utils import MinibatchTensors, StepAccumulator, Trainer
 from opd.trainer.sync_teacher import SYNC_METHODS, build_syncer
 from opd.generator.rollout import generate_rollouts_remote
 from opd.envs.dataset import distributed_opd_loader
-from opd.envs.sdft_science import load_sdft_science, load_sdft_science_eval, grade_science_response
-from opd.envs.sdft_tooluse import load_sdft_tooluse, load_sdft_tooluse_eval, grade_tooluse_response
+from opd.envs.sdft_science import SdftScienceEnv, load_sdft_science, load_sdft_science_eval, grade_science_response
+from opd.envs.sdft_tooluse import SdftToolUseEnv, load_sdft_tooluse, load_sdft_tooluse_eval, grade_tooluse_response
+
+_ENV_CLS = {"science": SdftScienceEnv, "tooluse": SdftToolUseEnv}
 
 
 # ---------------------------------------------------------------------------
@@ -170,13 +172,16 @@ def build_sdft_grader(args):
     return lambda response, ex: False
 
 
-def build_sdft_dataset(args) -> list[dict]:
+def build_sdft_dataset(args) -> list[SdftScienceEnv | SdftToolUseEnv]:
     """Load the SDFT training dataset from a built-in source or a custom JSONL.
 
-    Returns a list of {"question": str, "demonstration": str} dicts consumed
-    by distributed_opd_loader. The --dataset-path flag takes precedence over
-    --dataset so users can drop in arbitrary JSONL files without changing code.
+    Returns a list of env instances consumed by distributed_opd_loader, each
+    exposing .question and get_privileged_information() (the demonstration).
+    The --dataset-path flag takes precedence over --dataset so users can drop
+    in arbitrary JSONL files without changing code; --dataset still selects
+    which env class (science vs. tooluse) wraps those records.
     """
+    env_cls = _ENV_CLS[args.dataset]
     if args.dataset_path:
         with open(args.dataset_path) as f:
             records = [json.loads(line) for line in f if line.strip()]
@@ -188,7 +193,7 @@ def build_sdft_dataset(args) -> list[dict]:
         raise ValueError(f"Unknown dataset: {args.dataset!r}")
     if args.dataset_limit > 0:
         records = records[: args.dataset_limit]
-    return records
+    return [env_cls(question=r["question"], demonstration=r["demonstration"]) for r in records]
 
 
 # ---------------------------------------------------------------------------
@@ -507,12 +512,12 @@ if __name__ == "__main__":
         # -- Rollout generation (student ranks only) --
         rollouts = None
         if ctx.is_student:
-            examples, _ = next(loader_iter)  # list of {question, demonstration}, state dict
+            examples, _ = next(loader_iter)  # list[SdftScienceEnv | SdftToolUseEnv], state dict
 
             # Student prompt: question only — π_θ(y|x)
             prompts = [
                 student.tokenizer.apply_chat_template(
-                    [{"role": "user", "content": ex["question"]}],
+                    [{"role": "user", "content": ex.question}],
                     tokenize=False,
                     add_generation_prompt=True,
                 )
@@ -533,9 +538,9 @@ if __name__ == "__main__":
             # than the student, which sees only the question.
             for i, ex in enumerate(examples):
                 r = rollouts[i]  # single rollout per prompt (num_samples=1)
-                student_msgs = [{"role": "user", "content": ex["question"]}]
+                student_msgs = [{"role": "user", "content": ex.question}]
                 teacher_msgs = _build_teacher_messages(
-                    student_msgs, ex["demonstration"]
+                    student_msgs, ex.get_privileged_information(r["response"])
                 )
                 r["teacher_prompt"] = student.tokenizer.apply_chat_template(
                     teacher_msgs, tokenize=False, add_generation_prompt=True

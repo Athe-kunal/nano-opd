@@ -99,7 +99,7 @@ class SciKnowEvalEnv(OPDEnvBase):
 
     Each instance wraps a single (prompt, answer_key) pair. The reward is 1.0
     if the model's <answer> tag matches the ground-truth letter, else 0.0.
-    get_feedback reveals the correct answer for SDPO self-distillation.
+    get_privileged_information reveals the correct answer for SDPO self-distillation.
     evaluate runs the held-out 10% test split via the rollout worker.
     """
 
@@ -117,7 +117,7 @@ class SciKnowEvalEnv(OPDEnvBase):
         pred = _extract_answer(action)
         return (1.0 if pred == self.answer_key else 0.0), True
 
-    def get_feedback(self, action: str) -> str:
+    def get_privileged_information(self, action: str) -> str:
         if _extract_answer(action) is None:
             return "Format error: response must contain an <answer>A/B/C/D</answer> tag with your final answer."
         pred = _extract_answer(action)

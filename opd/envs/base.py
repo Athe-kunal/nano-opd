@@ -64,7 +64,13 @@ class OPDEnvBase(BaseTextEnv):
     Subclasses must implement:
       - init:           build opening conversation from prompt (dataset-specific)
       - compute_reward: per-step correctness signal for the RL reward
-      - get_feedback:   SDPO feedback string injected into step metadata
+      - get_privileged_information: ground truth injected into step metadata,
+                        used to condition a richer teacher. For SDPO envs
+                        (Dapo/LiveCodeBench/SciKnowEval) this is feedback text
+                        derived from grading `action` (the student's own
+                        attempt). For OPSD/SDFT envs this is a fixed piece of
+                        ground truth — a reference solution or worked
+                        demonstration — that doesn't depend on `action` at all.
 
     Subclasses may override:
       - evaluate:       mid-training eval via the live rollout worker (online envs only).
@@ -84,13 +90,17 @@ class OPDEnvBase(BaseTextEnv):
 
     def step(self, action: str) -> BaseTextEnvStepOutput:
         reward, done = self.compute_reward(action)
-        feedback = self.get_feedback(action)
+        privileged_information = self.get_privileged_information(action)
         self.turns += 1
         return BaseTextEnvStepOutput(
             observations=[{"role": "assistant", "content": action}],
             reward=reward,
             done=done or self.turns >= self.max_turns,
-            metadata={"feedback": feedback, "kind": self.kind, "dataset": self.dataset},
+            metadata={
+                "privileged_information": privileged_information,
+                "kind": self.kind,
+                "dataset": self.dataset,
+            },
             postprocessed_action=None,
         )
 
@@ -100,11 +110,21 @@ class OPDEnvBase(BaseTextEnv):
         ...
 
     @abc.abstractmethod
-    def get_feedback(self, action: str) -> str:
-        """
-        Return a feedback string for self-policy distillation.
-        Injected into step metadata so the training loop can use it as an
-        additional signal when constructing the distillation target.
+    def get_privileged_information(self, action: str) -> str:
+        """Return ground truth used to condition a richer teacher.
+
+        SDPO envs grade `action` and return a feedback string (e.g. "your
+        answer was X, the correct answer is Y"). OPSD/SDFT envs ignore
+        `action` and return a fixed piece of ground truth (a reference
+        solution or worked demonstration) that doesn't depend on what the
+        student produced.
+
+        Args:
+            action: The student's completion. Ignored by envs whose
+              privileged information doesn't depend on it.
+
+        Returns:
+            The privileged-information string (empty if none applies).
         """
         ...
 

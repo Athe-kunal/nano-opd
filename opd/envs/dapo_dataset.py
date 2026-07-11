@@ -89,7 +89,7 @@ class DapoMathEnv(OPDEnvBase):
 
     Each instance wraps a single (prompt, answer) pair. The reward is 1.0 if
     the model's final \\boxed{} answer matches the ground truth, else 0.0.
-    get_feedback reveals the ground-truth answer for SDPO self-distillation.
+    get_privileged_information reveals the ground-truth answer for SDPO self-distillation.
     evaluate runs the AIME 2025 benchmark via the rollout worker.
     """
 
@@ -106,7 +106,7 @@ class DapoMathEnv(OPDEnvBase):
         correct = check_answer(pred, self.answer)
         return (1.0 if correct else 0.0), True
 
-    def get_feedback(self, action: str) -> str:
+    def get_privileged_information(self, action: str) -> str:
         if extract_last_boxed(action) is None:
             return "Format error: response must contain a \\boxed{...} expression with your final answer."
         pred = extract_last_boxed(action)

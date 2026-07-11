@@ -8,7 +8,7 @@ is "privileged information" each passes in explicitly: the loss divisor
 (an adaptive grad-accumulation window vs. a plain epoch-size divisor), and any
 extra masking (SDPO's self-distillation mask, SDFT's token-skip mask, OPSD's
 per-token KL clip). OPD is not part of this — it has no separate teacher
-batch and calls `exchange_topk`/`exchange_sampled_teacher_logprob` directly.
+batch and calls `fetch_teacher_topk`/`fetch_teacher_sampled_logprob` directly.
 """
 
 from typing import Any, Literal

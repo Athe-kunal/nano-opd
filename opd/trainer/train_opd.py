@@ -6,7 +6,7 @@ import torch
 
 from opd.loss import ALGORITHMS, compute_tis_weights
 from opd.fsdp.algorithms import student_logprobs_at_indices
-from opd.trainer.distillation_utils import exchange_topk, exchange_sampled_teacher_logprob
+from opd.trainer.distillation_utils import fetch_teacher_topk, fetch_teacher_sampled_logprob
 from opd.trainer.logging_utils import finish_wandb, init_wandb, should_use_wandb
 from opd.trainer.setup_utils import (
     assert_prompts_divisible,
@@ -178,14 +178,14 @@ if __name__ == "__main__":
 
         if args.algorithm == "mopd_pg_loss":
             sampled_ids = mb.mb_ids[:, 1:]                             # [B, T-1]
-            t_logprob = exchange_sampled_teacher_logprob(
+            t_logprob = fetch_teacher_sampled_logprob(
                 ctx=ctx,
                 teacher_logits=teacher_logits,
                 token_ids=sampled_ids,
                 B=B, T=T,
                 teacher_chunk_size=args.teacher_chunk_size,
             )
-            topk = exchange_topk(
+            topk = fetch_teacher_topk(
                 ctx=ctx,
                 select_topk_by=select_topk_by,
                 student_logits=student_logits if ctx.is_student else None,
@@ -217,7 +217,7 @@ if __name__ == "__main__":
                     acc.add_health_metrics(ratio, adv, ent_gap)
             return
 
-        topk = exchange_topk(
+        topk = fetch_teacher_topk(
             ctx=ctx,
             select_topk_by=select_topk_by,
             student_logits=student_logits if ctx.is_student else None,
@@ -232,9 +232,6 @@ if __name__ == "__main__":
             s_logprobs = student_logprobs_at_indices(student_logits, topk.topk_idx, args.student_chunk_size)
             shift_mask = mb.mb_mask[:, 1:]                             # [B, T-1]
 
-            # TIS weight: corrects for numerical gap between vLLM inference
-            # log-probs and training-time log-probs.
-            # w_t = exp(log π_train(y_t) − log π_vllm(y_t)), clipped to C.
             sampled_ids = mb.mb_ids[:, 1:]                             # [B, T-1]
             tis_weights = compute_tis_weights(
                 student_logits, sampled_ids, mb.mb_inf_lp[:, 1:], args.tis_clip

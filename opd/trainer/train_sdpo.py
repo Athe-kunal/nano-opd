@@ -312,7 +312,7 @@ if __name__ == "__main__":
                 if i == 0:
                     print0(f"[debug step={step}] rewards={rewards} has_success={successful_text is not None}", flush=True)
                 for j, r in enumerate(group):
-                    env_output   = env.get_feedback(r["response"]) if rewards[j] == 0 else ""
+                    env_output   = env.get_privileged_information(r["response"]) if rewards[j] == 0 else ""
                     # successful attempts pass their own response as the correct
                     # solution; failed attempts pass a different successful rollout (if any).
                     success_hint = r["response"] if rewards[j] > 0 else successful_text

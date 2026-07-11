@@ -269,7 +269,8 @@ if __name__ == "__main__":
                 r            = rollouts[i]    # one rollout per prompt (num_samples=1)
                 student_msgs = [{"role": "user", "content": ex.problem + _STUDENT_SUFFIX}]
                 teacher_msgs = _build_teacher_messages(
-                    [{"role": "user", "content": ex.problem}], ex.solution
+                    [{"role": "user", "content": ex.problem}],
+                    ex.get_privileged_information(r["response"]),
                 )
                 r["teacher_prompt"] = student.tokenizer.apply_chat_template(
                     teacher_msgs, tokenize=False, add_generation_prompt=True

@@ -253,7 +253,7 @@ if __name__ == "__main__":
     # weights as the student but sees a richer context: the question +
     # feedback + original response. stopgrad (no_grad, inside
     # minibatch_exchange) prevents gradients from flowing through the teacher
-    # back into the student's computation graph (SDPO Eq. 1).
+    # back into the student's computation graph.
     #
     # SDPO-specific: the loss divisor is the actual size of the current
     # grad-accumulation window (the last window may be smaller than G if
@@ -301,7 +301,7 @@ if __name__ == "__main__":
 
             # Build feedback-augmented teacher prompts for each rollout.
             # For each question, if any rollout succeeded, pass it as a correct
-            # reference for the failed ones (Table 2 of the SDPO paper).
+            # reference for the failed ones.
             for i, env in enumerate(examples):
                 group = rollouts[i * args.num_samples : (i + 1) * args.num_samples]
                 rewards = [env.compute_reward(r["response"])[0] for r in group]
@@ -313,7 +313,7 @@ if __name__ == "__main__":
                     print0(f"[debug step={step}] rewards={rewards} has_success={successful_text is not None}", flush=True)
                 for j, r in enumerate(group):
                     env_output   = env.get_feedback(r["response"]) if rewards[j] == 0 else ""
-                    # Paper Table 2: successful attempts pass their own response as the correct
+                    # successful attempts pass their own response as the correct
                     # solution; failed attempts pass a different successful rollout (if any).
                     success_hint = r["response"] if rewards[j] > 0 else successful_text
                     teacher_msgs, has_distillation = _build_teacher_messages(init_msgs, env_output, success_hint)

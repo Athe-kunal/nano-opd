@@ -22,8 +22,7 @@ from opd.generator.rollout import generate_rollouts_remote
 
 
 # The teacher sees the problem AND the ground-truth reference solution y*.
-# This follows Figure 2 of the paper exactly: after reading the reference
-# solution the teacher is asked to solve the problem in its own way — this
+# After reading the reference solution the teacher is asked to solve the problem in its own way — this
 # rationalization is done implicitly through a single forward pass (no
 # generation), so the teacher never actually produces new tokens here.
 _STUDENT_SUFFIX = "\n\nPlease reason step by step, and put your final answer within \\boxed{}."  # not passed through .format()
@@ -66,8 +65,6 @@ def _build_teacher_messages(
 
 if __name__ == "__main__":
 
-    # -------------------------------------------------------------------------
-    # CLI
     parser = argparse.ArgumentParser(
         description="On-Policy Self-Distillation (OPSD) — a single LLM acts as "
                     "both student (sees problem only) and teacher (sees problem + "
@@ -144,7 +141,6 @@ if __name__ == "__main__":
 
     use_wandb = should_use_wandb()
 
-    # -------------------------------------------------------------------------
     # Distributed init — same rank split as OPD/SDFT:
     #   ranks 0..train_world_size-1  →  student (FSDP, updated by optimizer)
     #   rank  train_world_size       →  teacher (plain nn.Module, frozen initial policy)
@@ -224,11 +220,10 @@ if __name__ == "__main__":
 
 
     def do_minibatch(mb: MinibatchTensors, acc: StepAccumulator) -> None:
-        # Per-token pointwise KL clipping (OPSD paper Section 3.2). Stylistic
+        # Per-token pointwise KL clipping. Stylistic
         # tokens can exhibit much higher KL than math tokens, dominating the
         # gradient signal. Clipping each token's divergence contribution to τ
-        # stabilises training and prevents performance collapse, especially
-        # for smaller models (Figure 4).
+        # stabilises training and prevents performance collapse, especially for smaller models.
         self_distill_minibatch(
             mb, acc,
             ctx=ctx, student=student if ctx.is_student else None, teacher=teacher if ctx.is_teacher else None,
@@ -239,7 +234,6 @@ if __name__ == "__main__":
             kl_clip=args.kl_clip if args.kl_clip > 0.0 else None,
         )
 
-    # -------------------------------------------------------------------------
     # Training loop — all ranks iterate together
     for step in range(args.num_steps):
         t0 = time.time()
@@ -270,7 +264,7 @@ if __name__ == "__main__":
 
             # Attach reference-conditioned teacher prompt to each rollout.
             # The teacher sees: problem + ground-truth solution y* → richer
-            # context than the student (problem only), following Figure 2.
+            # context than the student (problem only).
             for i, ex in enumerate(examples):
                 r            = rollouts[i]    # one rollout per prompt (num_samples=1)
                 student_msgs = [{"role": "user", "content": ex.problem + _STUDENT_SUFFIX}]

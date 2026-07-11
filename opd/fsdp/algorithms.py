@@ -115,7 +115,7 @@ def student_logprob_at_sampled_tokens(
     Used to compute per-token TIS weights:
         w_t = exp(log π_train(y_t) − log π_vllm(y_t))
     which correct for the numerical gap between vLLM inference log-probs and
-    the training-time forward pass (SDPO paper, Appendix A.4).
+    the training-time forward pass.
 
     Args:
         student_logits: Student logits, `[B, T, V]`.

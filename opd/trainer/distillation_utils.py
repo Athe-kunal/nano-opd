@@ -373,7 +373,7 @@ def exchange_sampled_teacher_logprob(
 ) -> torch.Tensor:
     """Broadcasts log π_φd(y_t): teacher log-prob at the student's sampled token.
 
-    Used for the MOPD policy-gradient advantage (Eq. 3). Only a [B, T] tensor
+    Used for the MOPD policy-gradient advantage. Only a [B, T] tensor
     crosses the wire here, versus [B, T, K] for exchange_topk — the PG form
     needs no top-K selection at all, just this one scalar per position.
     """

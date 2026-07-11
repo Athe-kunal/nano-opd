@@ -248,7 +248,7 @@ if __name__ == "__main__":
         type=str,
         default="reverse_kl",
         choices=list(ALGORITHMS.keys()),
-        help="Distillation loss. SDFT paper uses reverse_kl (Eq. 1).",
+        help="Distillation loss. SDFT paper uses reverse_kl.",
     )
     parser.add_argument(
         "--distill-top-k",
@@ -256,7 +256,7 @@ if __name__ == "__main__":
         default=100,
         help="Top-K vocab for KL distillation. Larger K is more faithful "
         "but uses more memory and bandwidth. NOTE: the SDFT paper's "
-        "analytic per-token KL estimator (Appendix A.1) sums over the FULL "
+        "analytic per-token KL estimator sums over the FULL "
         "vocabulary V; top-K is a nano-opd memory/bandwidth approximation, "
         "not part of the paper. Raise K toward V to reduce the truncation bias.",
     )
@@ -442,7 +442,7 @@ if __name__ == "__main__":
 
     # -------------------------------------------------------------------------
     # Loss function and top-K selection
-    # SDFT uses reverse KL by default (paper Eq. 1): KL(π_student || π_teacher).
+    # SDFT uses reverse KL by default: KL(π_student || π_teacher).
     # For reverse KL, the student selects the top-K indices (the student-weighted
     # sum means we only need tokens where the student has mass).
     loss_fn = ALGORITHMS[args.algorithm]

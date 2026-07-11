@@ -45,7 +45,7 @@ def compute_reverse_kl_loss(
     tis_weights: torch.Tensor | None = None,  # [B, T]
     kl_clip: float | None = None,
 ) -> torch.Tensor:
-    """KL(p_student || p_teacher), top-K truncated with tail term (Eq. 11, Appendix A.3).
+    """KL(p_student || p_teacher), top-K truncated with tail term.
 
     The tail term accounts for all probability mass outside the top-K support:
         tail = (1 - Σ_K p_s) · [log(1 - Σ_K p_s) - log(1 - Σ_K p_t)]
@@ -82,7 +82,7 @@ def compute_forward_kl_loss(
     tis_weights: torch.Tensor | None = None,  # [B, T]
     kl_clip: float | None = None,
 ) -> torch.Tensor:
-    """KL(p_teacher || p_student), top-K truncated with tail term (Eq. 11, Appendix A.3).
+    """KL(p_teacher || p_student), top-K truncated with tail term.
 
     Tail term:
         tail = (1 - Σ_K p_t) · [log(1 - Σ_K p_t) - log(1 - Σ_K p_s)]
@@ -118,7 +118,7 @@ def compute_jsd_loss(
     kl_clip: float | None = None,
     jsd_alpha: float = 0.5,
 ) -> torch.Tensor:
-    """JSD(student || teacher) with tail term (Eq. 11, Appendix A.3).
+    """JSD(student || teacher) with tail term.
 
     jsd_alpha=0.5 → symmetric JSD (SDPO default).
     jsd_alpha=0.0 → forward KL.  jsd_alpha=1.0 → reverse KL.
@@ -167,7 +167,7 @@ def compute_mopd_loss(
     tis_weights: torch.Tensor | None = None,  # [B, T]
     kl_clip: float | None = None,
 ) -> torch.Tensor:
-    """Top-K MOPD loss: generalized (unnormalized) reverse KL (Eq. 5).
+    """Top-K MOPD loss: generalized (unnormalized) reverse KL.
 
     Reference: https://arxiv.org/pdf/2606.30406
     MOPD: Multi-Teacher On-Policy Distillation for Capability Integration in LLM Post-Training
@@ -206,7 +206,7 @@ def compute_mopd_pg_loss(
     tis_weights: torch.Tensor | None = None,  # [B, T]
     adv_clip: float | None = 5.0,
 ) -> torch.Tensor:
-    """Policy-gradient MOPD loss on the sampled token only (Eq. 3-4).
+    """Policy-gradient MOPD loss on the sampled token only.
 
     No top-K exchange needed at all — only the sampled token's log-prob under
     each policy. The teacher–student log-diff is a stop-gradient advantage;

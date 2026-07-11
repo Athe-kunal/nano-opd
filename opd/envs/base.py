@@ -7,7 +7,7 @@ from skyrl_gym.envs.base_text_env import BaseTextEnv, BaseTextEnvStepOutput, Con
 
 
 def pass_at_k(n: int, c: int, k: int) -> float:
-    """Unbiased pass@k estimator (Chen et al., 2021, Eq. 1).
+    """Unbiased pass@k estimator.
 
     Args:
         n: Number of samples generated per problem.

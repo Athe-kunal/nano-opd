@@ -4,11 +4,8 @@ from typing import Literal
 
 import torch
 
-from opd.loss import ALGORITHMS
-from opd.fsdp.algorithms import (
-    student_logprobs_at_indices,
-    student_logprob_at_sampled_tokens,
-)
+from opd.loss import ALGORITHMS, compute_tis_weights
+from opd.fsdp.algorithms import student_logprobs_at_indices
 from opd.trainer.distillation_utils import exchange_topk, exchange_sampled_teacher_logprob
 from opd.trainer.logging_utils import finish_wandb, init_wandb, should_use_wandb
 from opd.trainer.setup_utils import (
@@ -171,12 +168,11 @@ if __name__ == "__main__":
     def do_minibatch(mb: MinibatchTensors, acc: StepAccumulator) -> None:
         B, T = mb.mb_ids.shape[0], mb.mb_ids.shape[1] - 1
         if ctx.is_student:
+            # last token logits are not required, hence indexed till -1
             student_logits = student.get_logits(mb.mb_ids, mb.mb_attn)[:, :-1]  # [B, T-1, V]
 
-        # -- Teacher: compute top-K log-probs and broadcast --
-        # Broadcasts only [B, T-1, K] instead of the full [B, T-1, V] logit
         if ctx.is_teacher:
-            teacher_logits = teacher.get_logits(mb.mb_ids, mb.mb_attn)[:, :-1]
+            teacher_logits = teacher.get_logits(mb.mb_ids, mb.mb_attn)[:, :-1] #[B, T-1, V]
         else:
             teacher_logits = None
 
@@ -206,12 +202,9 @@ if __name__ == "__main__":
                 ).squeeze(-1)                                      # [B, T-1], grad-carrying
                 shift_mask = mb.mb_mask[:, 1:]                     # [B, T-1]
 
-                if args.tis_clip > 0.0:
-                    s_lp_sampled = student_logprob_at_sampled_tokens(student_logits, sampled_ids)
-                    inf_lp_shifted = mb.mb_inf_lp[:, 1:].to(s_lp_sampled.dtype)
-                    tis_weights = (s_lp_sampled - inf_lp_shifted).exp().clamp(max=args.tis_clip)
-                else:
-                    tis_weights = None
+                tis_weights = compute_tis_weights(
+                    student_logits, sampled_ids, mb.mb_inf_lp[:, 1:], args.tis_clip
+                )
 
                 loss = loss_fn(s_logprob, t_logprob, shift_mask, tis_weights=tis_weights) / mb.n_mb
                 student._scale_loss(loss).backward()
@@ -242,13 +235,10 @@ if __name__ == "__main__":
             # TIS weight: corrects for numerical gap between vLLM inference
             # log-probs and training-time log-probs.
             # w_t = exp(log π_train(y_t) − log π_vllm(y_t)), clipped to C.
-            if args.tis_clip > 0.0:
-                sampled_ids = mb.mb_ids[:, 1:]                         # [B, T-1]
-                s_lp_sampled = student_logprob_at_sampled_tokens(student_logits, sampled_ids)
-                inf_lp_shifted = mb.mb_inf_lp[:, 1:].to(s_lp_sampled.dtype)  # [B, T-1]
-                tis_weights = (s_lp_sampled - inf_lp_shifted).exp().clamp(max=args.tis_clip)
-            else:
-                tis_weights = None
+            sampled_ids = mb.mb_ids[:, 1:]                             # [B, T-1]
+            tis_weights = compute_tis_weights(
+                student_logits, sampled_ids, mb.mb_inf_lp[:, 1:], args.tis_clip
+            )
 
             loss = loss_fn(s_logprobs, topk.t_logprobs, shift_mask, tis_weights=tis_weights) / mb.n_mb
             student._scale_loss(loss).backward()

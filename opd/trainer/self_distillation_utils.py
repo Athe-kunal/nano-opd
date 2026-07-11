@@ -16,8 +16,8 @@ from typing import Any, Literal
 import torch
 import torch.nn.functional as F
 
-from opd.fsdp.algorithms import student_logprob_at_sampled_tokens
 from opd.fsdp.model import StudentModel, TeacherModel
+from opd.loss import compute_tis_weights
 from opd.metrics import (
     compute_entropy_gap,
     compute_overlap_ratio,
@@ -136,11 +136,10 @@ def self_distill_minibatch(
             msg += f" extra_mask={extra_mask.sum().item():.0f}"
         print0(msg, flush=True)
 
-    if tis_clip > 0.0:
-        sampled_ids = mb.mb_ids[:, 1:]
-        s_lp_sampled = student_logprob_at_sampled_tokens(student_logits, sampled_ids)
-        inf_lp_shifted = mb.mb_inf_lp[:, 1:].to(s_lp_sampled.dtype)
-        tis_full = (s_lp_sampled - inf_lp_shifted).exp().clamp(max=tis_clip)
+    tis_full = compute_tis_weights(
+        student_logits, mb.mb_ids[:, 1:], mb.mb_inf_lp[:, 1:], tis_clip
+    )
+    if tis_full is not None:
         tis_resp, _ = pack_response_logits(
             tis_full.unsqueeze(-1).expand_as(student_logits), result.s_shift_mask
         )

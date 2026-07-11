@@ -31,13 +31,13 @@ import torch.distributed as dist
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from opd.fsdp.algorithms import (
-    student_logprob_at_sampled_tokens,
     student_logprobs_at_indices,
     student_topk_indices,
     teacher_logprobs_at_indices,
     teacher_topk_logprobs,
 )
 from opd.fsdp.model import StudentModel, TeacherModel
+from opd.loss import compute_tis_weights
 from opd.trainer.setup_utils import DistributedContext, print0
 from opd.trainer.sync_teacher import TeacherSyncer
 
@@ -495,9 +495,8 @@ def mopd_pg_loss_and_backward(
             f"s_mask={pg.s_compact_mask.sum().item():.0f} t_mask={pg.t_compact_mask.sum().item():.0f}",
         )
 
-    if tis_clip > 0.0:
-        s_lp_sampled = student_logprob_at_sampled_tokens(student_logits, sampled_ids)
-        tis_full = (s_lp_sampled - inf_lp_shifted.to(s_lp_sampled.dtype)).exp().clamp(max=tis_clip)
+    tis_full = compute_tis_weights(student_logits, sampled_ids, inf_lp_shifted, tis_clip)
+    if tis_full is not None:
         tis_resp, _ = pack_response_logits(tis_full.unsqueeze(-1), s_shift_mask)
         tis_weights = tis_resp[..., 0]
     else:

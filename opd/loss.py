@@ -1,5 +1,40 @@
 import torch
 
+from opd.fsdp.algorithms import student_logprob_at_sampled_tokens
+
+
+def compute_tis_weights(
+    student_logits: torch.Tensor,           # [B, T, V]
+    sampled_ids: torch.Tensor,              # [B, T]
+    inf_lp_shifted: torch.Tensor | None,    # [B, T], vLLM inference log-probs
+    tis_clip: float,
+) -> torch.Tensor | None:
+    """Per-token Truncated Importance Sampling (TIS) weight.
+
+        w_t = exp(log π_train(y_t) − log π_vllm(y_t)), clipped to `tis_clip`.
+
+    Corrects for the numerical gap between vLLM's inference-time log-probs
+    and the training-time forward pass — without this correction, that gap
+    silently biases the distillation gradient toward whichever direction the
+    two kernels happen to disagree.
+
+    Args:
+        student_logits: Student logits at each position, `[B, T, V]`.
+        sampled_ids: The sampled token id at each position, `[B, T]`.
+        inf_lp_shifted: vLLM inference log-probs of the sampled tokens,
+          `[B, T]`. Ignored (and may be `None`) when `tis_clip <= 0`.
+        tis_clip: Clip bound C for the importance weight. `<= 0` disables
+          TIS entirely (returns `None`).
+
+    Returns:
+        The per-token TIS weight, `[B, T]`, or `None` if `tis_clip <= 0`.
+    """
+    if tis_clip <= 0.0:
+        return None
+    s_lp_sampled = student_logprob_at_sampled_tokens(student_logits, sampled_ids)
+    inf_lp_shifted = inf_lp_shifted.to(s_lp_sampled.dtype)
+    return (s_lp_sampled - inf_lp_shifted).exp().clamp(max=tis_clip)
+
 
 def _masked_token_mean(
     values: torch.Tensor,

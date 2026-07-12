@@ -22,7 +22,6 @@ data at all (they're built only inside `if ctx.is_student:` blocks upstream).
 
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import torch
@@ -32,72 +31,13 @@ from opd.fsdp.model import StudentModel, TeacherModel
 from opd.generator.rollout import prepare_batch, sync_weights_to_vllm_inplace
 from opd.trainer.logging_utils import log_step_metrics
 from opd.trainer.distillation_utils import (
-    broadcast_minibatch,
-    broadcast_teacher_inputs,
+    RankBroadcaster,
     prepare_teacher_batch,
     sync_student_to_teacher,
 )
-from opd.trainer.setup_utils import (
-    DistributedContext,
-    broadcast_n_minibatches,
-    maybe_save_checkpoint,
-)
+from opd.trainer.models import DistributedContext, MinibatchTensors, StepAccumulator
+from opd.trainer.setup_utils import broadcast_n_minibatches, maybe_save_checkpoint
 from opd.trainer.sync_teacher import TeacherSyncer
-
-
-@dataclass(slots=True)
-class MinibatchTensors:
-    """Bundle passed to each script's `minibatch_fn`.
-
-    `mb_mask`/`mb_inf_lp` are student-only and are `None` on the teacher rank
-    — never touch them without a `ctx.is_student` guard. `t_mb_*` are `None`
-    when the script has no separate teacher batch (OPD).
-    """
-    mb_ids: torch.Tensor
-    mb_attn: torch.Tensor
-    mb_mask: torch.Tensor | None
-    mb_inf_lp: torch.Tensor | None
-    t_mb_ids: torch.Tensor | None
-    t_mb_attn: torch.Tensor | None
-    t_mb_mask: torch.Tensor | None
-    mb_idx: int
-    n_mb: int
-    extra: dict[str, torch.Tensor] = field(default_factory=dict)
-
-
-@dataclass(slots=True)
-class StepAccumulator:
-    """Loss/health-metric accumulator for one outer training step.
-
-    Create exactly one of these per step, before the epoch loop, and never
-    reset it per-epoch — this matches where `total_loss`/`n_batches`/etc. are
-    initialized in all four training scripts today.
-    """
-    total_loss: float = 0.0
-    n_batches: int = 0
-    overlap_ratio: float = 0.0
-    overlap_advantage: float = 0.0
-    entropy_gap: float = 0.0
-
-    def add_loss(self, loss: torch.Tensor) -> None:
-        self.total_loss += loss.item()
-        self.n_batches += 1
-
-    def add_health_metrics(self, ratio: float, advantage: float, entropy_gap: float) -> None:
-        self.overlap_ratio += ratio
-        self.overlap_advantage += advantage
-        self.entropy_gap += entropy_gap
-
-    def normalized(self) -> tuple[float, float, float, float]:
-        """Returns `(avg_loss, overlap_ratio, overlap_advantage, entropy_gap)`, each divided by `max(n_batches, 1)`."""
-        n = max(self.n_batches, 1)
-        return (
-            self.total_loss / n,
-            self.overlap_ratio / n,
-            self.overlap_advantage / n,
-            self.entropy_gap / n,
-        )
-
 
 MinibatchFn = Callable[[MinibatchTensors, StepAccumulator], None]
 
@@ -210,6 +150,7 @@ class Trainer:
               `{"sd_mask": torch.float}`; other scripts pass `None`).
         """
         ctx = self.ctx
+        rb = RankBroadcaster(ctx)
         num_sequences = batch["input_ids"].shape[0] if ctx.is_student else 0
         n_mb, perm = broadcast_n_minibatches(
             ctx.is_student, num_sequences, self.args.train_batch_size, ctx.device, ctx.all_group,
@@ -235,10 +176,10 @@ class Trainer:
                 mb_ids = mb_attn = mb_mask = mb_inf_lp = None
                 t_mb_ids = t_mb_attn = t_mb_mask = None
 
-            mb_ids, mb_attn = broadcast_minibatch(ctx, mb_ids, mb_attn)
+            mb_ids, mb_attn = rb.broadcast_minibatch(mb_ids, mb_attn)
             if has_teacher_batch:
-                t_mb_ids, t_mb_attn, t_mb_mask = broadcast_teacher_inputs(
-                    ctx, t_mb_ids, t_mb_attn, t_mb_mask
+                t_mb_ids, t_mb_attn, t_mb_mask = rb.broadcast_teacher_inputs(
+                    t_mb_ids, t_mb_attn, t_mb_mask
                 )
 
             extra: dict[str, torch.Tensor] = {}

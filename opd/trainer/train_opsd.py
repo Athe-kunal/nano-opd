@@ -15,7 +15,8 @@ from opd.trainer.setup_utils import (
     print0,
     topk_selector_for,
 )
-from opd.trainer.trainer_utils import MinibatchTensors, StepAccumulator, Trainer
+from opd.trainer.models import MinibatchTensors, StepAccumulator
+from opd.trainer.trainer_utils import Trainer
 from opd.envs.opsd_dataset import OPSDMathEnv
 from opd.envs.dataset import distributed_opd_loader
 from opd.generator.rollout import generate_rollouts_remote

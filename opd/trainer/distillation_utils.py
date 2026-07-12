@@ -12,18 +12,20 @@ Most functions here take a `ctx: DistributedContext` (the same object
 `is_student`/`is_teacher`/`teacher_global_rank`/`all_group`/`device` — that
 cluster of rank-topology facts is fixed for the whole run, so it travels as
 one named object rather than five independent arguments at every call site.
+The low-level broadcast primitives go one step further and wrap `ctx` in a
+`RankBroadcaster` instance, since those calls repeat `device`/`group` at
+nearly every line.
 
 Sections:
-  1. Low-level broadcast primitives
+  1. Low-level broadcast primitives (RankBroadcaster; includes minibatch
+     input broadcast, student -> all ranks)
   2. Batch preparation (packing, padding, alignment)
   3. Teacher weight sync (SDPO / SDFT self-teacher)
-  4. Minibatch input broadcast (student -> all ranks)
-  5. MOPD policy-gradient exchange
-  6. Top-K KL exchange
-  7. Minibatch orchestration (entry point used by the training loops)
+  4. MOPD policy-gradient exchange
+  5. Top-K KL exchange
+  6. Minibatch orchestration (entry point used by the training loops)
 """
 
-from dataclasses import dataclass
 from typing import Any, Literal
 
 import torch
@@ -38,7 +40,8 @@ from opd.fsdp.algorithms import (
 )
 from opd.fsdp.model import StudentModel, TeacherModel
 from opd.loss import compute_tis_weights
-from opd.trainer.setup_utils import DistributedContext, print0
+from opd.trainer.models import DistributedContext, MinibatchExchangeResult, MopdPGExchange, TopKExchange
+from opd.trainer.setup_utils import print0
 from opd.trainer.sync_teacher import TeacherSyncer
 
 # ---------------------------------------------------------------------------
@@ -46,102 +49,135 @@ from opd.trainer.sync_teacher import TeacherSyncer
 # ---------------------------------------------------------------------------
 
 
-def bcast_or_alloc_async(
-    *,
-    tensor: torch.Tensor | None,
-    is_owner: bool,
-    shape: tuple[int, ...],
-    dtype: torch.dtype,
-    src: int,
-    device: torch.device,
-    group: Any,
-) -> tuple[torch.Tensor, dist.Work]:
-    """If not the owning rank, allocate a placeholder; issue the broadcast without waiting for it.
+class RankBroadcaster:
+    """Broadcasts tensors between ranks within one run's process groups.
 
-    Args:
-        tensor: The tensor to broadcast, if this rank owns it; otherwise ignored.
-        is_owner: Whether this rank is `src` and holds the real data.
-        shape: Shape to allocate the placeholder with, on non-owning ranks.
-        dtype: Dtype to allocate the placeholder with, on non-owning ranks.
-        src: Source rank of the broadcast.
-        device: Device to allocate the placeholder on.
-        group: Process group to broadcast within.
-
-    Returns:
-        `(tensor, handle)`. Call `handle.wait()` before reading `tensor`. Lets
-        several independent broadcasts overlap on the wire instead of
-        completing one at a time.
+    Every broadcast in this module needs the same rank-topology facts
+    (`device`, `all_group`) — wrapping `ctx` here once removes that repeated
+    `device=ctx.device, group=ctx.all_group` boilerplate from every call site
+    below. `ctx` is fixed for the whole run, so one instance can be reused
+    across every exchange in a minibatch.
     """
-    if not is_owner:
-        tensor = torch.empty(shape, dtype=dtype, device=device)
-    handle = dist.broadcast(tensor, src=src, group=group, async_op=True)
-    return tensor, handle
 
+    def __init__(self, ctx: DistributedContext) -> None:
+        self.ctx = ctx
 
-def bcast_or_alloc_many(
-    *,
-    specs: list[tuple[torch.Tensor | None, tuple[int, ...], torch.dtype]],
-    is_owner: bool,
-    src: int,
-    device: torch.device,
-    group: Any,
-) -> list[torch.Tensor]:
-    """Issues `bcast_or_alloc_async` for each `(tensor, shape, dtype)` in `specs`, then waits on all.
+    def bcast_or_alloc_async(
+        self,
+        *,
+        tensor: torch.Tensor | None,
+        is_owner: bool,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        src: int,
+    ) -> tuple[torch.Tensor, dist.Work]:
+        """If not the owning rank, allocate a placeholder; issue the broadcast without waiting for it.
 
-    Broadcasting several independent tensors is a repeated pattern in this
-    module (a minibatch's ids + attention mask, a top-K exchange's four
-    result tensors, ...). Doing it through one call instead of a manual
-    `h1, h2, h3, ... = ...; h1.wait(); h2.wait(); ...` sequence removes that
-    per-call-site bookkeeping while keeping the same overlap-on-the-wire
-    behavior (all broadcasts are issued before any wait happens).
+        Args:
+            tensor: The tensor to broadcast, if this rank owns it; otherwise ignored.
+            is_owner: Whether this rank is `src` and holds the real data.
+            shape: Shape to allocate the placeholder with, on non-owning ranks.
+            dtype: Dtype to allocate the placeholder with, on non-owning ranks.
+            src: Source rank of the broadcast.
 
-    Args:
-        specs: `(tensor, shape, dtype)` triples, one per tensor to broadcast.
-          `tensor` is only read on the owning rank; non-owning ranks use
-          `shape`/`dtype` to allocate a placeholder.
-        is_owner: Whether this rank is `src` and holds the real data for
-          every tensor in `specs`.
-        src: Source rank of the broadcast.
-        device: Device to allocate placeholders on.
-        group: Process group to broadcast within.
+        Returns:
+            `(tensor, handle)`. Call `handle.wait()` before reading `tensor`. Lets
+            several independent broadcasts overlap on the wire instead of
+            completing one at a time.
+        """
+        if not is_owner:
+            tensor = torch.empty(shape, dtype=dtype, device=self.ctx.device)
+        handle = dist.broadcast(tensor, src=src, group=self.ctx.all_group, async_op=True)
+        return tensor, handle
 
-    Returns:
-        The broadcast tensors, in the same order as `specs`.
-    """
-    pending = [
-        bcast_or_alloc_async(tensor=tensor, is_owner=is_owner, shape=shape, dtype=dtype, src=src, device=device, group=group)
-        for tensor, shape, dtype in specs
-    ]
-    tensors, handles = zip(*pending)
-    for handle in handles:
+    def bcast_or_alloc_many(
+        self,
+        *,
+        specs: list[tuple[torch.Tensor | None, tuple[int, ...], torch.dtype]],
+        is_owner: bool,
+        src: int,
+    ) -> list[torch.Tensor]:
+        """Issues `bcast_or_alloc_async` for each `(tensor, shape, dtype)` in `specs`, then waits on all.
+
+        Broadcasting several independent tensors is a repeated pattern in this
+        module (a minibatch's ids + attention mask, a top-K exchange's four
+        result tensors, ...). Doing it through one call instead of a manual
+        `h1, h2, h3, ... = ...; h1.wait(); h2.wait(); ...` sequence removes that
+        per-call-site bookkeeping while keeping the same overlap-on-the-wire
+        behavior (all broadcasts are issued before any wait happens).
+
+        Args:
+            specs: `(tensor, shape, dtype)` triples, one per tensor to broadcast.
+              `tensor` is only read on the owning rank; non-owning ranks use
+              `shape`/`dtype` to allocate a placeholder.
+            is_owner: Whether this rank is `src` and holds the real data for
+              every tensor in `specs`.
+            src: Source rank of the broadcast.
+
+        Returns:
+            The broadcast tensors, in the same order as `specs`.
+        """
+        pending = [
+            self.bcast_or_alloc_async(tensor=tensor, is_owner=is_owner, shape=shape, dtype=dtype, src=src)
+            for tensor, shape, dtype in specs
+        ]
+        tensors, handles = zip(*pending)
+        for handle in handles:
+            handle.wait()
+        return list(tensors)
+
+    def broadcast_shape(self, local_shape: tuple[int, int] | None) -> tuple[int, int]:
+        """Broadcasts a 2D tensor's `(dim0, dim1)` shape from student rank 0 to all ranks.
+
+        Used by `broadcast_minibatch` and `broadcast_teacher_inputs`, which both
+        need to tell non-owning ranks how large a placeholder to allocate before
+        the actual payload broadcast.
+
+        Args:
+            local_shape: This rank's local `(dim0, dim1)` shape (student ranks only).
+
+        Returns:
+            The broadcast `(dim0, dim1)` shape.
+        """
+        shape_t = torch.tensor(local_shape, dtype=torch.long, device=self.ctx.device) if self.ctx.is_student else None
+        shape_t, handle = self.bcast_or_alloc_async(
+            tensor=shape_t, is_owner=self.ctx.is_student, shape=(2,), dtype=torch.long, src=0,
+        )
         handle.wait()
-    return list(tensors)
+        return int(shape_t[0].item()), int(shape_t[1].item())
 
+    def broadcast_minibatch(
+        self, mb_ids: torch.Tensor | None, mb_attn: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Broadcasts input_ids and attention_mask from student rank 0 to all ranks."""
+        B, T = self.broadcast_shape((mb_ids.shape[0], mb_ids.shape[1]) if self.ctx.is_student else None)
+        mb_ids, mb_attn = self.bcast_or_alloc_many(
+            specs=[(mb_ids, (B, T), torch.long), (mb_attn, (B, T), torch.long)],
+            is_owner=self.ctx.is_student, src=0,
+        )
+        return mb_ids, mb_attn
 
-def _broadcast_shape(
-    ctx: DistributedContext,
-    local_shape: tuple[int, int] | None,
-) -> tuple[int, int]:
-    """Broadcasts a 2D tensor's `(dim0, dim1)` shape from student rank 0 to all ranks.
+    def broadcast_teacher_inputs(
+        self,
+        t_mb_ids: torch.Tensor | None,
+        t_mb_attn: torch.Tensor | None,
+        t_mb_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Broadcasts teacher-specific tensors from student rank 0 to all ranks.
 
-    Shared by `broadcast_minibatch` and `broadcast_teacher_inputs`, which both
-    need to tell non-owning ranks how large a placeholder to allocate before
-    the actual payload broadcast.
-
-    Args:
-        ctx: Distributed rank/topology info for this run.
-        local_shape: This rank's local `(dim0, dim1)` shape (student ranks only).
-
-    Returns:
-        The broadcast `(dim0, dim1)` shape.
-    """
-    shape_t = torch.tensor(local_shape, dtype=torch.long, device=ctx.device) if ctx.is_student else None
-    shape_t, handle = bcast_or_alloc_async(
-        tensor=shape_t, is_owner=ctx.is_student, shape=(2,), dtype=torch.long,
-        src=0, device=ctx.device, group=ctx.all_group,
-    )
-    handle.wait()
-    return int(shape_t[0].item()), int(shape_t[1].item())
+        Used when teacher and student have different inputs (e.g. SDFT, where the
+        teacher prompt includes a worked demonstration).
+        """
+        B, T_t = self.broadcast_shape((t_mb_ids.shape[0], t_mb_ids.shape[1]) if self.ctx.is_student else None)
+        t_mb_ids, t_mb_attn, t_mb_mask = self.bcast_or_alloc_many(
+            specs=[
+                (t_mb_ids, (B, T_t), torch.long),
+                (t_mb_attn, (B, T_t), torch.long),
+                (t_mb_mask, (B, T_t), torch.float),
+            ],
+            is_owner=self.ctx.is_student, src=0,
+        )
+        return t_mb_ids, t_mb_attn, t_mb_mask
 
 
 # ---------------------------------------------------------------------------
@@ -308,55 +344,7 @@ def sync_student_to_teacher(
 
 
 # ---------------------------------------------------------------------------
-# 4. Minibatch input broadcast (student -> all ranks)
-# ---------------------------------------------------------------------------
-
-
-def broadcast_minibatch(
-    ctx: DistributedContext,
-    mb_ids: torch.Tensor | None,
-    mb_attn: torch.Tensor | None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Broadcasts input_ids and attention_mask from student rank 0 to all ranks."""
-    B, T = _broadcast_shape(
-        ctx, (mb_ids.shape[0], mb_ids.shape[1]) if ctx.is_student else None,
-    )
-
-    mb_ids, mb_attn = bcast_or_alloc_many(
-        specs=[(mb_ids, (B, T), torch.long), (mb_attn, (B, T), torch.long)],
-        is_owner=ctx.is_student, src=0, device=ctx.device, group=ctx.all_group,
-    )
-    return mb_ids, mb_attn
-
-
-def broadcast_teacher_inputs(
-    ctx: DistributedContext,
-    t_mb_ids: torch.Tensor | None,
-    t_mb_attn: torch.Tensor | None,
-    t_mb_mask: torch.Tensor | None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Broadcasts teacher-specific tensors from student rank 0 to all ranks.
-
-    Used when teacher and student have different inputs (e.g. SDFT, where the
-    teacher prompt includes a worked demonstration).
-    """
-    B, T_t = _broadcast_shape(
-        ctx, (t_mb_ids.shape[0], t_mb_ids.shape[1]) if ctx.is_student else None,
-    )
-
-    t_mb_ids, t_mb_attn, t_mb_mask = bcast_or_alloc_many(
-        specs=[
-            (t_mb_ids, (B, T_t), torch.long),
-            (t_mb_attn, (B, T_t), torch.long),
-            (t_mb_mask, (B, T_t), torch.float),
-        ],
-        is_owner=ctx.is_student, src=0, device=ctx.device, group=ctx.all_group,
-    )
-    return t_mb_ids, t_mb_attn, t_mb_mask
-
-
-# ---------------------------------------------------------------------------
-# 5. MOPD policy-gradient exchange
+# 4. MOPD policy-gradient exchange
 # ---------------------------------------------------------------------------
 
 
@@ -379,21 +367,12 @@ def fetch_teacher_sampled_logprob(
         t_logprob = teacher_logprobs_at_indices(teacher_logits, token_ids.unsqueeze(-1), teacher_chunk_size).squeeze(-1)
     else:
         t_logprob = None
-    t_logprob, h = bcast_or_alloc_async(
+    t_logprob, h = RankBroadcaster(ctx).bcast_or_alloc_async(
         tensor=t_logprob, is_owner=ctx.is_teacher, shape=(B, T), dtype=torch.bfloat16,
-        src=ctx.teacher_global_rank, device=ctx.device, group=ctx.all_group,
+        src=ctx.teacher_global_rank,
     )
     h.wait()
     return t_logprob
-
-
-@dataclass(slots=True)
-class MopdPGExchange:
-    """Result of exchange_mopd_pg_packed: sampled-token log-probs for the MOPD-PG loss."""
-    s_logprob: torch.Tensor | None       # [B, R_max], grad-carrying (student ranks only)
-    t_logprob: torch.Tensor | None       # [B, R_max], no-grad
-    s_compact_mask: torch.Tensor | None  # [B, R_max] (student ranks only)
-    t_compact_mask: torch.Tensor | None  # [B, R_max]
 
 
 def exchange_mopd_pg_packed(
@@ -444,12 +423,12 @@ def exchange_mopd_pg_packed(
     else:
         t_logprob_resp = t_compact_mask = None
 
-    t_logprob_resp, t_compact_mask = bcast_or_alloc_many(
+    t_logprob_resp, t_compact_mask = RankBroadcaster(ctx).bcast_or_alloc_many(
         specs=[
             (t_logprob_resp, (B, R_max), torch.bfloat16),
             (t_compact_mask, (B, R_max), torch.float32),
         ],
-        is_owner=ctx.is_teacher, src=ctx.teacher_global_rank, device=ctx.device, group=ctx.all_group,
+        is_owner=ctx.is_teacher, src=ctx.teacher_global_rank,
     )
 
     return MopdPGExchange(
@@ -501,20 +480,8 @@ def mopd_pg_loss_and_backward(
 
 
 # ---------------------------------------------------------------------------
-# 6. Top-K KL exchange
+# 5. Top-K KL exchange
 # ---------------------------------------------------------------------------
-
-
-@dataclass(slots=True)
-class TopKExchange:
-    """Result of fetch_teacher_topk: the top-K distributions used to compute the KL loss."""
-    topk_idx: torch.Tensor
-    t_logprobs: torch.Tensor
-    t_compact_mask: torch.Tensor
-    student_topk_idx: torch.Tensor
-    teacher_topk_idx: torch.Tensor
-    t_logprobs_at_student: torch.Tensor
-    teacher_own_logprobs: torch.Tensor
 
 
 def fetch_teacher_topk(
@@ -551,10 +518,10 @@ def fetch_teacher_topk(
     if ctx.is_teacher and t_compact_mask is None:
         t_compact_mask = torch.ones(B, T, dtype=torch.float32, device=ctx.device)
 
+    rb = RankBroadcaster(ctx)
     student_topk_idx = student_topk_indices(student_logits, top_k, student_chunk_size) if ctx.is_student else None
-    student_topk_idx, h = bcast_or_alloc_async(
-        tensor=student_topk_idx, is_owner=ctx.is_student, shape=(B, T, top_k), dtype=torch.long,
-        src=0, device=ctx.device, group=ctx.all_group,
+    student_topk_idx, h = rb.bcast_or_alloc_async(
+        tensor=student_topk_idx, is_owner=ctx.is_student, shape=(B, T, top_k), dtype=torch.long, src=0,
     )
     h.wait()
 
@@ -564,14 +531,14 @@ def fetch_teacher_topk(
     else:
         teacher_topk_idx = teacher_own_logprobs = t_logprobs_at_student = None
 
-    teacher_topk_idx, teacher_own_logprobs, t_logprobs_at_student, t_compact_mask = bcast_or_alloc_many(
+    teacher_topk_idx, teacher_own_logprobs, t_logprobs_at_student, t_compact_mask = rb.bcast_or_alloc_many(
         specs=[
             (teacher_topk_idx, (B, T, top_k), torch.long),
             (teacher_own_logprobs, (B, T, top_k), torch.bfloat16),
             (t_logprobs_at_student, (B, T, top_k), torch.bfloat16),
             (t_compact_mask, (B, T), torch.float32),
         ],
-        is_owner=ctx.is_teacher, src=ctx.teacher_global_rank, device=ctx.device, group=ctx.all_group,
+        is_owner=ctx.is_teacher, src=ctx.teacher_global_rank,
     )
 
     if select_topk_by == "student":
@@ -644,25 +611,8 @@ def topk_kl_loss_and_backward(
 
 
 # ---------------------------------------------------------------------------
-# 7. Minibatch orchestration (entry point used by the training loops)
+# 6. Minibatch orchestration (entry point used by the training loops)
 # ---------------------------------------------------------------------------
-
-
-@dataclass(slots=True)
-class MinibatchExchangeResult:
-    """Result of minibatch_exchange: exactly one of `topk`/`pg` is set, per `is_pg`.
-
-    Packed student tensors (`s_resp`, `s_compact_mask`) are only produced in
-    the top-K path (`is_pg=False`) — the PG path skips packing the full
-    logits and leaves them `None`.
-    """
-    is_pg: bool
-    topk: TopKExchange | None
-    pg: MopdPGExchange | None
-    s_resp: torch.Tensor | None
-    s_compact_mask: torch.Tensor | None
-    s_shift_mask: torch.Tensor | None
-    student_logits: torch.Tensor | None
 
 
 def minibatch_exchange(

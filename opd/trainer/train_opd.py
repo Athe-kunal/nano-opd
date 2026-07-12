@@ -7,12 +7,12 @@ import torch
 from opd.loss import ALGORITHMS, compute_tis_weights
 from opd.fsdp.algorithms import student_logprobs_at_indices
 from opd.trainer.distillation_utils import (
-    MopdPGExchange,
     fetch_teacher_sampled_logprob,
     fetch_teacher_topk,
     mopd_pg_loss_and_backward,
     topk_kl_loss_and_backward,
 )
+from opd.trainer.models import MopdPGExchange
 from opd.trainer.logging_utils import finish_wandb, init_wandb, should_use_wandb
 from opd.trainer.setup_utils import (
     assert_prompts_divisible,
@@ -24,7 +24,8 @@ from opd.trainer.setup_utils import (
     print0,
     topk_selector_for,
 )
-from opd.trainer.trainer_utils import MinibatchTensors, StepAccumulator, Trainer
+from opd.trainer.models import MinibatchTensors, StepAccumulator
+from opd.trainer.trainer_utils import Trainer
 from opd.metrics import compute_topk_health_metrics
 from opd.generator.rollout import generate_rollouts_remote
 from opd.envs.dataset import distributed_opd_loader, build_opd_dataset

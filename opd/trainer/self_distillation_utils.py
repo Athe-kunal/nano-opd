@@ -24,8 +24,7 @@ from opd.trainer.distillation_utils import (
     pack_response_logits,
     topk_kl_loss_and_backward,
 )
-from opd.trainer.setup_utils import DistributedContext
-from opd.trainer.trainer_utils import MinibatchTensors, StepAccumulator
+from opd.trainer.models import DistributedContext, MinibatchTensors, StepAccumulator
 
 
 def self_distill_minibatch(

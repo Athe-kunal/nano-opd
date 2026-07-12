@@ -113,6 +113,24 @@ class DapoMathEnv(OPDEnvBase):
         return f"Your answer \\boxed{{{pred}}} is incorrect. The correct answer is \\boxed{{{self.answer}}}."
 
     @classmethod
+    def evaluate(cls, rollout_worker_url: str, step: int, **kwargs: Any) -> dict[str, Any]:
+        # Local import: opd.eval.eval_math imports check_answer/extract_last_boxed
+        # from this module, so importing it at module level would be circular.
+        from opd.eval.eval_math import run_eval
+
+        kwargs.pop("tokenizer", None)
+        kwargs.pop("test_size", None)
+        return run_eval(
+            rollout_worker_url=rollout_worker_url,
+            eval_k=kwargs["eval_k"],
+            eval_max_tokens=kwargs["eval_max_tokens"],
+            step=step,
+            eval_datasets=kwargs.get("eval_datasets", "aime_2025,aime_2024,hmmt_2025"),
+            temperature=kwargs.get("temperature", 0.6),
+            top_k=kwargs.get("top_k", -1),
+        )
+
+    @classmethod
     def from_records(cls, records: list[dict[str, Any]]) -> list[DapoMathEnv]:
         return [cls(prompt=r["prompt"], answer=r["answer"]) for r in records]
 

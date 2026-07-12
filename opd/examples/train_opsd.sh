@@ -54,27 +54,20 @@ WARMUP_RATIO="${WARMUP_RATIO:-0.05}"
 
 SEED="${SEED:-0}"
 
-# Post-training math evaluation (eval_math.py)
+# Post-training math evaluation (opd.eval.eval_math.run_eval).
+# Reuses the already-running, weight-synced rollout worker — no separate
+# vLLM engine, checkpoint loading, or LoRA needed.
 # Set SKIP_EVAL=1 to bypass evaluation entirely.
 SKIP_EVAL="${SKIP_EVAL:-0}"
 RUN_EVAL="${RUN_EVAL:-1}"
-EVAL_DATASETS="${EVAL_DATASETS:-aime24 aime25 hmmt25}"
+EVAL_DATASETS="${EVAL_DATASETS:-aime_2025,aime_2024,hmmt_2025}"
 EVAL_MAX_NEW_TOKENS="${EVAL_MAX_NEW_TOKENS:-38912}"
-EVAL_ENABLE_THINKING="${EVAL_ENABLE_THINKING:-1}"
 EVAL_TEMPERATURE="${EVAL_TEMPERATURE:-1.0}"
-EVAL_TOP_P="${EVAL_TOP_P:-}"           # blank → auto (0.95 thinking / 0.8 non-thinking)
 EVAL_TOP_K="${EVAL_TOP_K:--1}"
-EVAL_MIN_P="${EVAL_MIN_P:-0.0}"
-EVAL_PRESENCE_PENALTY="${EVAL_PRESENCE_PENALTY:-0.0}"
-EVAL_NUM_SAMPLES="${EVAL_NUM_SAMPLES:-}"  # blank → use all problems in dataset
-EVAL_SMOKE_TEST="${EVAL_SMOKE_TEST:-0}"
-EVAL_GPU_MEM_UTIL="${EVAL_GPU_MEM_UTIL:-0.9}"
-EVAL_TENSOR_PARALLEL_SIZE="${EVAL_TENSOR_PARALLEL_SIZE:-1}"
-EVAL_MAX_MODEL_LEN="${EVAL_MAX_MODEL_LEN:-}"  # blank → auto (40960 thinking / 32768 non-thinking)
 EVAL_VAL_N="${EVAL_VAL_N:-6}"
 EVAL_WANDB_PROJECT="${EVAL_WANDB_PROJECT:-}"
 EVAL_WANDB_RUN_NAME="${EVAL_WANDB_RUN_NAME:-$TAG}"
-EVAL_STEP="${EVAL_STEP:-}"             # blank → omit --step (no x-axis pin in W&B)
+EVAL_STEP="${EVAL_STEP:-$NUM_STEPS}"
 
 # FSDP sharding strategy — choose one of:
 #   FULL_SHARD          params+grads+optimizer sharded; unshard around fwd/bwd
@@ -250,35 +243,30 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS,$TEACHER_GPUS" \
     2>&1 | tee "$TRAIN_LOG"
 
 # ---------------------------------------------------------------------------
-# Post-training evaluation with eval_math.py
+# Post-training evaluation with opd.eval.eval_math.run_eval — talks to the
+# still-running, weight-synced rollout worker over HTTP, so no separate vLLM
+# engine or checkpoint loading happens here.
 if [[ "$RUN_EVAL" == "1" && "$SKIP_EVAL" != "1" ]]; then
-  FINAL_CKPT="$SAVE_DIR/final"
-  CKPT_ARG=()
-  [[ -d "$FINAL_CKPT" ]] && CKPT_ARG=(--checkpoint_dir "$FINAL_CKPT")
-
-  EVAL_EXTRA_FLAGS=()
-  [[ "$EVAL_ENABLE_THINKING" == "0" ]] && EVAL_EXTRA_FLAGS+=(--no_thinking)
-  [[ "$EVAL_SMOKE_TEST" == "1" ]]      && EVAL_EXTRA_FLAGS+=(--smoke_test)
-  [[ -n "$EVAL_TOP_P" ]]               && EVAL_EXTRA_FLAGS+=(--top_p "$EVAL_TOP_P")
-  [[ -n "$EVAL_NUM_SAMPLES" ]]         && EVAL_EXTRA_FLAGS+=(--num_samples "$EVAL_NUM_SAMPLES")
-  [[ -n "$EVAL_MAX_MODEL_LEN" ]]       && EVAL_EXTRA_FLAGS+=(--max_model_len "$EVAL_MAX_MODEL_LEN")
-  [[ -n "$EVAL_WANDB_PROJECT" ]]       && EVAL_EXTRA_FLAGS+=(--wandb_project "$EVAL_WANDB_PROJECT" --wandb_run_name "$EVAL_WANDB_RUN_NAME")
-  [[ -n "$EVAL_STEP" ]]                && EVAL_EXTRA_FLAGS+=(--step "$EVAL_STEP")
-
   echo "[launcher] running post-training eval on: $EVAL_DATASETS"
-  CUDA_VISIBLE_DEVICES="${TRAIN_GPUS},${TEACHER_GPUS}" \
-    uv run --extra gpu --directory "$REPO_ROOT" python "$OPD_DIR/eval/eval_math.py" \
-      --base_model "$STUDENT_MODEL" \
-      "${CKPT_ARG[@]}" \
-      --datasets $EVAL_DATASETS \
-      --max_new_tokens "$EVAL_MAX_NEW_TOKENS" \
-      --temperature "$EVAL_TEMPERATURE" \
-      --top_k "$EVAL_TOP_K" \
-      --min_p "$EVAL_MIN_P" \
-      --presence_penalty "$EVAL_PRESENCE_PENALTY" \
-      --val_n "$EVAL_VAL_N" \
-      --gpu_memory_utilization "$EVAL_GPU_MEM_UTIL" \
-      --tensor_parallel_size "$EVAL_TENSOR_PARALLEL_SIZE" \
-      "${EVAL_EXTRA_FLAGS[@]}" \
-      2>&1 | tee "$RUN_DIR/eval.log"
+  uv run --extra gpu --directory "$REPO_ROOT" python - <<PYEOF 2>&1 | tee "$RUN_DIR/eval.log"
+import wandb
+
+from opd.eval.eval_math import run_eval
+
+if "$EVAL_WANDB_PROJECT":
+    wandb.init(project="$EVAL_WANDB_PROJECT", name="$EVAL_WANDB_RUN_NAME")
+
+run_eval(
+    rollout_worker_url="http://$ROLLOUT_HOST:$ROLLOUT_PORT",
+    eval_k=$EVAL_VAL_N,
+    eval_max_tokens=$EVAL_MAX_NEW_TOKENS,
+    step=$EVAL_STEP,
+    eval_datasets="$EVAL_DATASETS",
+    temperature=$EVAL_TEMPERATURE,
+    top_k=$EVAL_TOP_K,
+)
+
+if wandb.run is not None:
+    wandb.finish()
+PYEOF
 fi

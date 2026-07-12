@@ -1,6 +1,5 @@
 import math
 import os
-from dataclasses import dataclass
 from typing import Any, Literal
 
 import torch
@@ -10,6 +9,7 @@ from omegaconf import OmegaConf
 
 from opd.fsdp.model import StudentModel, TeacherModel
 from opd.generator.rollout import remote_vllm_init_weight_transfer, wait_for_rollout_worker
+from opd.trainer.models import DistributedContext
 from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
 
 
@@ -26,21 +26,6 @@ def compute_cleanup():
         dist.destroy_process_group()
 
 
-@dataclass(slots=True)
-class DistributedContext:
-    ddp_rank: int
-    ddp_local_rank: int
-    ddp_world_size: int
-    device: torch.device
-    train_world_size: int
-    teacher_global_rank: int
-    is_student: bool
-    is_teacher: bool
-    master_process: bool
-    student_group: Any   # dist.ProcessGroup
-    all_group: Any       # dist.ProcessGroup
-
-
 def init_distributed(device_type_arg: str, train_world_size: int) -> DistributedContext:
     """Init torch.distributed and partition ranks into student and teacher sets.
 
@@ -48,7 +33,6 @@ def init_distributed(device_type_arg: str, train_world_size: int) -> Distributed
     Rank train_world_size is the teacher rank.
     """
     if device_type_arg == "":
-        # Prefer CUDA if available, otherwise MPS, otherwise fall back to CPU.
         if torch.cuda.is_available():
             device_type = "cuda"
         elif torch.backends.mps.is_available():

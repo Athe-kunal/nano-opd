@@ -89,7 +89,7 @@ class DapoMathEnv(OPDEnvBase):
 
     Each instance wraps a single (prompt, answer) pair. The reward is 1.0 if
     the model's final \\boxed{} answer matches the ground truth, else 0.0.
-    get_feedback reveals the ground-truth answer for SDPO self-distillation.
+    get_privileged_information reveals the ground-truth answer for SDPO self-distillation.
     evaluate runs the AIME 2025 benchmark via the rollout worker.
     """
 
@@ -106,11 +106,29 @@ class DapoMathEnv(OPDEnvBase):
         correct = check_answer(pred, self.answer)
         return (1.0 if correct else 0.0), True
 
-    def get_feedback(self, action: str) -> str:
+    def get_privileged_information(self, action: str) -> str:
         if extract_last_boxed(action) is None:
             return "Format error: response must contain a \\boxed{...} expression with your final answer."
         pred = extract_last_boxed(action)
         return f"Your answer \\boxed{{{pred}}} is incorrect. The correct answer is \\boxed{{{self.answer}}}."
+
+    @classmethod
+    def evaluate(cls, rollout_worker_url: str, step: int, **kwargs: Any) -> dict[str, Any]:
+        # Local import: opd.eval.eval_math imports check_answer/extract_last_boxed
+        # from this module, so importing it at module level would be circular.
+        from opd.eval.eval_math import run_eval
+
+        kwargs.pop("tokenizer", None)
+        kwargs.pop("test_size", None)
+        return run_eval(
+            rollout_worker_url=rollout_worker_url,
+            eval_k=kwargs["eval_k"],
+            eval_max_tokens=kwargs["eval_max_tokens"],
+            step=step,
+            eval_datasets=kwargs.get("eval_datasets", "aime_2025,aime_2024,hmmt_2025"),
+            temperature=kwargs.get("temperature", 0.6),
+            top_k=kwargs.get("top_k", -1),
+        )
 
     @classmethod
     def from_records(cls, records: list[dict[str, Any]]) -> list[DapoMathEnv]:

@@ -15,7 +15,8 @@ from opd.trainer.setup_utils import (
     print0,
     topk_selector_for,
 )
-from opd.trainer.trainer_utils import MinibatchTensors, StepAccumulator, Trainer
+from opd.trainer.models import MinibatchTensors, StepAccumulator
+from opd.trainer.trainer_utils import Trainer
 from opd.envs.opsd_dataset import OPSDMathEnv
 from opd.envs.dataset import distributed_opd_loader
 from opd.generator.rollout import generate_rollouts_remote
@@ -59,7 +60,7 @@ def _build_teacher_messages(
         problem=problem_content,
         solution=solution,
     )
-    teacher_messages = list(student_messages[:-1])   # preserve system message if any
+    teacher_messages = list(student_messages[:-1])
     teacher_messages.append({"role": "user", "content": teacher_user})
     return teacher_messages
 
@@ -269,7 +270,8 @@ if __name__ == "__main__":
                 r            = rollouts[i]    # one rollout per prompt (num_samples=1)
                 student_msgs = [{"role": "user", "content": ex.problem + _STUDENT_SUFFIX}]
                 teacher_msgs = _build_teacher_messages(
-                    [{"role": "user", "content": ex.problem}], ex.solution
+                    [{"role": "user", "content": ex.problem}],
+                    ex.get_privileged_information(r["response"]),
                 )
                 r["teacher_prompt"] = student.tokenizer.apply_chat_template(
                     teacher_msgs, tokenize=False, add_generation_prompt=True

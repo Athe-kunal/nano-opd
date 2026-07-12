@@ -1,7 +1,7 @@
 import torch
 
 from opd.fsdp.algorithms import student_logprobs_at_indices
-from opd.trainer.distillation_utils import TopKExchange
+from opd.trainer.models import TopKExchange
 
 
 def _topk_intersection_mask(

@@ -24,9 +24,11 @@ class OPSDMathEnv(OPDEnvBase):
 
     Each instance wraps a single (problem, solution) pair.
     - problem: the math problem shown to both student and teacher
-    - solution: the reference reasoning chain, returned as feedback so the
-      training loop can build the teacher's privileged prompt (Figure 2 of
-      the OPSD paper).
+    - solution: the reference reasoning chain, returned via
+      get_privileged_information so the training loop can build the
+      teacher's privileged prompt (Figure 2 of the OPSD paper). Unlike SDPO
+      envs, this doesn't depend on the student's action — the teacher is
+      frozen and never conditioned on the student's own attempt.
 
     Reward: 1.0 if the model's \\boxed{} answer matches the reference, else 0.0.
     """
@@ -44,9 +46,7 @@ class OPSDMathEnv(OPDEnvBase):
         correct = check_answer(pred, extract_last_boxed(self.solution) or self.solution)
         return (1.0 if correct else 0.0), True
 
-    def get_feedback(self, action: str) -> str:
-        # The full reference solution — used by train_opsd.py to build the
-        # teacher's privileged prompt via _build_teacher_messages.
+    def get_privileged_information(self, action: str) -> str:
         return self.solution
 
     @classmethod

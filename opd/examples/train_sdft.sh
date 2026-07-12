@@ -10,7 +10,7 @@ set -euo pipefail
 #   - student sees only the question x        → π_θ(y|x)
 #   - teacher is an EMA copy of the student, conditioned in-context on a worked
 #     demonstration c                          → π(y|x,c)
-#   - loss is the reverse KL  D_KL(π_θ(·|x) ‖ π(·|x,c))   (paper Eq. 1)
+#   - loss is the reverse KL  D_KL(π_θ(·|x) ‖ π(·|x,c))
 #
 # Like SDPO there is only ONE checkpoint (teacher = EMA of student), so the
 # GPU-split / rollout-worker plumbing mirrors train_sdpo.sh.
@@ -67,7 +67,7 @@ WEIGHT_DECAY="${WEIGHT_DECAY:-0.0}"
 MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
 
 # SDFT: exactly one on-policy rollout per (question, demonstration) pair — there
-# is no num-samples multiplier (paper Appendix A.1 uses a single trajectory).
+# is no num-samples multiplier (paper uses a single trajectory).
 PROMPTS_PER_STEP="${PROMPTS_PER_STEP:-8}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1536}"
 MAX_PROMPT_LEN="${MAX_PROMPT_LEN:-4096}"
@@ -76,7 +76,7 @@ MAX_SEQ_LEN="${MAX_SEQ_LEN:-0}"   # 0 = MAX_PROMPT_LEN + MAX_RESPONSE_LEN
 TEMPERATURE="${TEMPERATURE:-1.0}"
 TOP_K="${TOP_K:-50}"
 
-# reverse_kl is the SDFT default (paper Eq. 1: KL(π_student ‖ π_teacher)).
+# reverse_kl is the SDFT default KL(π_student ‖ π_teacher).
 ALGORITHM="${ALGORITHM:-forward_kl}"
 DISTILL_TOP_K="${DISTILL_TOP_K:-100}"
 STUDENT_CHUNK_SIZE="${STUDENT_CHUNK_SIZE:--1}"

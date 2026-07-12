@@ -147,7 +147,6 @@ def format_test_feedback(results: list[dict], n_total: int, max_tests_to_show: i
 
     header = f"{n_pass}/{n_total} tests passed."
 
-    # Errors/timeouts take priority; drop wrong-answer cases if any exist
     priority = [r for r in failures if r["status"] in ("runtime_error", "timeout")]
     candidates = priority if priority else sorted(
         [r for r in failures if r["status"] == "wrong_answer"],
@@ -185,7 +184,7 @@ class LiveCodeBenchEnv(OPDEnvBase):
     skyrl_gym environment for LiveCodeBench problems.
 
     Each instance wraps a single (prompt, tests) pair. The reward is 1.0 if
-    all test cases pass, else 0.0. get_feedback returns per-test execution
+    all test cases pass, else 0.0. get_privileged_information returns per-test execution
     results for SDPO self-distillation. evaluate runs the LCB test split.
     """
 
@@ -210,7 +209,7 @@ class LiveCodeBenchEnv(OPDEnvBase):
             return 0.0, True
         return (1.0 if all(r["status"] == "pass" for r in results) else 0.0), True
 
-    def get_feedback(self, action: str) -> str:
+    def get_privileged_information(self, action: str) -> str:
         results = self._run_tests(action)
         if results is None:
             return "❌ No code block found in response"

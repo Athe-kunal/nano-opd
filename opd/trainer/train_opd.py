@@ -4,12 +4,15 @@ from typing import Literal
 
 import torch
 
-from opd.loss import ALGORITHMS
-from opd.fsdp.algorithms import (
-    student_logprobs_at_indices,
-    student_logprob_at_sampled_tokens,
+from opd.loss import ALGORITHMS, compute_tis_weights
+from opd.fsdp.algorithms import student_logprobs_at_indices
+from opd.trainer.distillation_utils import (
+    fetch_teacher_sampled_logprob,
+    fetch_teacher_topk,
+    mopd_pg_loss_and_backward,
+    topk_kl_loss_and_backward,
 )
-from opd.trainer.distillation_utils import exchange_topk, exchange_sampled_teacher_logprob
+from opd.trainer.models import MopdPGExchange
 from opd.trainer.logging_utils import finish_wandb, init_wandb, should_use_wandb
 from opd.trainer.setup_utils import (
     assert_prompts_divisible,
@@ -21,7 +24,8 @@ from opd.trainer.setup_utils import (
     print0,
     topk_selector_for,
 )
-from opd.trainer.trainer_utils import MinibatchTensors, StepAccumulator, Trainer
+from opd.trainer.models import MinibatchTensors, StepAccumulator
+from opd.trainer.trainer_utils import Trainer
 from opd.metrics import compute_topk_health_metrics
 from opd.generator.rollout import generate_rollouts_remote
 from opd.envs.dataset import distributed_opd_loader, build_opd_dataset
@@ -168,98 +172,122 @@ if __name__ == "__main__":
         )
         loader_iter = iter(loader)
 
-    def do_minibatch(mb: MinibatchTensors, acc: StepAccumulator) -> None:
-        B, T = mb.mb_ids.shape[0], mb.mb_ids.shape[1] - 1
-        if ctx.is_student:
-            student_logits = student.get_logits(mb.mb_ids, mb.mb_attn)[:, :-1]  # [B, T-1, V]
+    def _mopd_pg_minibatch(
+        mb: MinibatchTensors, acc: StepAccumulator,
+        student_logits: torch.Tensor | None, teacher_logits: torch.Tensor | None,
+        B: int, T: int,
+    ) -> None:
+        """MOPD policy-gradient step (mopd_pg_loss): sampled-token-only exchange.
 
-        # -- Teacher: compute top-K log-probs and broadcast --
-        # Broadcasts only [B, T-1, K] instead of the full [B, T-1, V] logit
-        if ctx.is_teacher:
-            teacher_logits = teacher.get_logits(mb.mb_ids, mb.mb_attn)[:, :-1]
-        else:
-            teacher_logits = None
-
-        if args.algorithm == "mopd_pg_loss":
-            sampled_ids = mb.mb_ids[:, 1:]                             # [B, T-1]
-            t_logprob = exchange_sampled_teacher_logprob(
-                ctx=ctx,
-                teacher_logits=teacher_logits,
-                token_ids=sampled_ids,
-                B=B, T=T,
-                teacher_chunk_size=args.teacher_chunk_size,
-            )
-            topk = exchange_topk(
-                ctx=ctx,
-                select_topk_by=select_topk_by,
-                student_logits=student_logits if ctx.is_student else None,
-                teacher_logits=teacher_logits,
-                B=B, T=T,
-                top_k=args.distill_top_k,
-                student_chunk_size=args.student_chunk_size,
-                teacher_chunk_size=args.teacher_chunk_size,
-            )
-
-            if ctx.is_student:
-                s_logprob = student_logprobs_at_indices(
-                    student_logits, sampled_ids.unsqueeze(-1), args.student_chunk_size
-                ).squeeze(-1)                                      # [B, T-1], grad-carrying
-                shift_mask = mb.mb_mask[:, 1:]                     # [B, T-1]
-
-                if args.tis_clip > 0.0:
-                    s_lp_sampled = student_logprob_at_sampled_tokens(student_logits, sampled_ids)
-                    inf_lp_shifted = mb.mb_inf_lp[:, 1:].to(s_lp_sampled.dtype)
-                    tis_weights = (s_lp_sampled - inf_lp_shifted).exp().clamp(max=args.tis_clip)
-                else:
-                    tis_weights = None
-
-                loss = loss_fn(s_logprob, t_logprob, shift_mask, tis_weights=tis_weights) / mb.n_mb
-                student._scale_loss(loss).backward()
-                acc.add_loss(loss)
-
-                with torch.no_grad():
-                    ratio, adv, ent_gap = compute_topk_health_metrics(
-                        student_logits, topk, args.student_chunk_size
-                    )
-                    acc.add_health_metrics(ratio, adv, ent_gap)
-            return
-
-        topk = exchange_topk(
+        Unlike `_topk_kl_minibatch`, the loss needs only the teacher's
+        log-prob at the student's own sampled token
+        (`fetch_teacher_sampled_logprob`) — no shared top-K support at all.
+        The `fetch_teacher_topk` call below exists purely to compute the
+        overlap/entropy-gap health-metric diagnostics; its output never
+        feeds the loss.
+        """
+        sampled_ids = mb.mb_ids[:, 1:]                             # [B, T-1]
+        t_logprob = fetch_teacher_sampled_logprob(
+            ctx=ctx,
+            teacher_logits=teacher_logits,
+            token_ids=sampled_ids,
+            B=B, T=T,
+            teacher_chunk_size=args.teacher_chunk_size,
+        )
+        topk_for_health_metrics = fetch_teacher_topk(
             ctx=ctx,
             select_topk_by=select_topk_by,
-            student_logits=student_logits if ctx.is_student else None,
+            student_logits=student_logits,
             teacher_logits=teacher_logits,
             B=B, T=T,
             top_k=args.distill_top_k,
             student_chunk_size=args.student_chunk_size,
             teacher_chunk_size=args.teacher_chunk_size,
         )
-        # -- Student: compute TIS weights then loss and backward --
-        if ctx.is_student:
-            s_logprobs = student_logprobs_at_indices(student_logits, topk.topk_idx, args.student_chunk_size)
-            shift_mask = mb.mb_mask[:, 1:]                             # [B, T-1]
 
-            # TIS weight: corrects for numerical gap between vLLM inference
-            # log-probs and training-time log-probs.
-            # w_t = exp(log π_train(y_t) − log π_vllm(y_t)), clipped to C.
-            if args.tis_clip > 0.0:
-                sampled_ids = mb.mb_ids[:, 1:]                         # [B, T-1]
-                s_lp_sampled = student_logprob_at_sampled_tokens(student_logits, sampled_ids)
-                inf_lp_shifted = mb.mb_inf_lp[:, 1:].to(s_lp_sampled.dtype)  # [B, T-1]
-                tis_weights = (s_lp_sampled - inf_lp_shifted).exp().clamp(max=args.tis_clip)
-            else:
-                tis_weights = None
+        if not ctx.is_student:
+            return
 
-            loss = loss_fn(s_logprobs, topk.t_logprobs, shift_mask, tis_weights=tis_weights) / mb.n_mb
-            student._scale_loss(loss).backward()
-            acc.add_loss(loss)
+        s_logprob = student_logprobs_at_indices(
+            student_logits, sampled_ids.unsqueeze(-1), args.student_chunk_size
+        ).squeeze(-1)                                          # [B, T-1], grad-carrying
+        shift_mask = mb.mb_mask[:, 1:]                         # [B, T-1]
 
-            # Compute distillation health metrics (no grad)
-            with torch.no_grad():
-                ratio, adv, ent_gap = compute_topk_health_metrics(
-                    student_logits, topk, args.student_chunk_size
-                )
-                acc.add_health_metrics(ratio, adv, ent_gap)
+        tis_weights = compute_tis_weights(
+            student_logits, sampled_ids, mb.mb_inf_lp[:, 1:], args.tis_clip
+        )
+
+        pg = MopdPGExchange(
+            s_logprob=s_logprob, t_logprob=t_logprob,
+            s_compact_mask=shift_mask, t_compact_mask=shift_mask,
+        )
+        loss = mopd_pg_loss_and_backward(
+            student=student, pg=pg, loss_fn=loss_fn,
+            tis_weights=tis_weights, divisor=mb.n_mb,
+        )
+        acc.add_loss(loss)
+
+        with torch.no_grad():
+            ratio, adv, ent_gap = compute_topk_health_metrics(
+                student_logits, topk_for_health_metrics, args.student_chunk_size
+            )
+            acc.add_health_metrics(ratio, adv, ent_gap)
+
+    def _topk_kl_minibatch(
+        mb: MinibatchTensors, acc: StepAccumulator,
+        student_logits: torch.Tensor | None, teacher_logits: torch.Tensor | None,
+        B: int, T: int,
+    ) -> None:
+        """Shared step for the top-K KL family: reverse_kl, forward_kl, jsd, mopd_loss.
+
+        All four share the same exchange -> loss -> backward -> health-metric
+        shape; only `loss_fn` and `select_topk_by` (picked once from
+        `args.algorithm`, see `topk_selector_for`) differ between them.
+        """
+        topk = fetch_teacher_topk(
+            ctx=ctx,
+            select_topk_by=select_topk_by,
+            student_logits=student_logits,
+            teacher_logits=teacher_logits,
+            B=B, T=T,
+            top_k=args.distill_top_k,
+            student_chunk_size=args.student_chunk_size,
+            teacher_chunk_size=args.teacher_chunk_size,
+        )
+
+        if not ctx.is_student:
+            return
+
+        shift_mask = mb.mb_mask[:, 1:]                             # [B, T-1]
+        sampled_ids = mb.mb_ids[:, 1:]                             # [B, T-1]
+
+        tis_weights = compute_tis_weights(
+            student_logits, sampled_ids, mb.mb_inf_lp[:, 1:], args.tis_clip
+        )
+
+        loss = topk_kl_loss_and_backward(
+            student=student, student_logits=student_logits, topk=topk, loss_fn=loss_fn,
+            response_mask=shift_mask, tis_weights=tis_weights, divisor=mb.n_mb,
+            student_chunk_size=args.student_chunk_size,
+        )
+        acc.add_loss(loss)
+
+        with torch.no_grad():
+            ratio, adv, ent_gap = compute_topk_health_metrics(
+                student_logits, topk, args.student_chunk_size
+            )
+            acc.add_health_metrics(ratio, adv, ent_gap)
+
+    def do_minibatch(mb: MinibatchTensors, acc: StepAccumulator) -> None:
+        B, T = mb.mb_ids.shape[0], mb.mb_ids.shape[1] - 1
+        # last token logits are not required, hence indexed till -1
+        student_logits = student.get_logits(mb.mb_ids, mb.mb_attn)[:, :-1] if ctx.is_student else None
+        teacher_logits = teacher.get_logits(mb.mb_ids, mb.mb_attn)[:, :-1] if ctx.is_teacher else None
+
+        if args.algorithm == "mopd_pg_loss":
+            _mopd_pg_minibatch(mb, acc, student_logits, teacher_logits, B, T)
+        else:
+            _topk_kl_minibatch(mb, acc, student_logits, teacher_logits, B, T)
 
     for step in range(args.num_steps):
         t0 = time.time()

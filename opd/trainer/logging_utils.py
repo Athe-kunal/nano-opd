@@ -1,11 +1,3 @@
-"""wandb plumbing shared by all four training scripts.
-
-Every wandb call in the codebase goes through this module — training scripts
-never `import wandb` or reference `wandb.` directly. This keeps the on/off
-(`USE_WANDB` env var) logic, the run-init boilerplate, and the per-step/per-eval
-logging calls in one place instead of duplicated four times.
-"""
-
 import os
 from typing import Any
 

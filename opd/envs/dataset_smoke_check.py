@@ -1,4 +1,4 @@
-"""Manual smoke checks for OPDEnvBase subclasses (init / step / compute_reward / get_feedback).
+"""Manual smoke checks for OPDEnvBase subclasses (init / step / compute_reward / get_privileged_information).
 
 Not a pytest suite: these call `.load()` against live HuggingFace datasets
 (and, with --vllm, a running vLLM server) and print traces for manual
@@ -55,12 +55,12 @@ def _show_step(env, action: str, label: str, **extra_rows):
             prompt=getattr(env, "prompt", ""),
             completion=action,
             reward=result["reward"],
-            feedback=result["metadata"]["feedback"] or "(empty)",
+            privileged_information=result["metadata"]["privileged_information"] or "(empty)",
             **extra_rows,
         )
     else:
         print(f"  [{label}]  reward={result['reward']}  done={result['done']}")
-        print(f"  feedback: {result['metadata']['feedback']}")
+        print(f"  privileged_information: {result['metadata']['privileged_information']}")
 
 
 def smoke_check_dapo_math():
@@ -109,7 +109,7 @@ def _render_trace(
     prompt: str,
     completion: str,
     reward: float,
-    feedback: str,
+    privileged_information: str,
     **extra_rows: str,
 ) -> None:
     """Pretty-print a single prompt→completion→reward trace with Rich."""
@@ -126,7 +126,7 @@ def _render_trace(
     table.add_column("value", overflow="fold", no_wrap=False)
     table.add_row("prompt", prompt)
     table.add_row("completion", completion)
-    table.add_row("feedback", feedback)
+    table.add_row("privileged_information", privileged_information)
     for key, val in extra_rows.items():
         table.add_row(key, str(val))
 
@@ -148,7 +148,7 @@ def run_vllm_smoke_check(
       2. Call env.init([]) to get the opening conversation.
       3. Send that conversation to the vLLM server via the OpenAI chat-completions API.
       4. Feed the completion back through env.step().
-      5. Print the full trace (prompt, completion, reward, feedback) with Rich.
+      5. Print the full trace (prompt, completion, reward, privileged_information) with Rich.
 
     Args:
         base_url:    Base URL of the vLLM server, e.g. "http://localhost:8000".
@@ -168,7 +168,6 @@ def run_vllm_smoke_check(
     console = _rich_console
     client = OpenAI(base_url=f"{base_url}/v1", api_key="EMPTY")
 
-    # Auto-detect model name from the server if not provided
     if model is None:
         models = client.models.list().data
         if not models:
@@ -197,7 +196,7 @@ def run_vllm_smoke_check(
             prompt=env.prompt,
             completion=completion,
             reward=result["reward"],
-            feedback=result["metadata"]["feedback"],
+            privileged_information=result["metadata"]["privileged_information"],
         )
 
     # ---- LiveCodeBenchEnv --------------------------------------------------
@@ -212,7 +211,7 @@ def run_vllm_smoke_check(
             prompt=env.prompt,
             completion=completion,
             reward=result["reward"],
-            feedback=result["metadata"]["feedback"],
+            privileged_information=result["metadata"]["privileged_information"],
         )
 
     # ---- SciKnowEvalEnv ----------------------------------------------------
@@ -227,7 +226,7 @@ def run_vllm_smoke_check(
             prompt=env.prompt,
             completion=completion,
             reward=result["reward"],
-            feedback=result["metadata"]["feedback"],
+            privileged_information=result["metadata"]["privileged_information"],
         )
 
     console.rule("[bold green]Done[/bold green]")

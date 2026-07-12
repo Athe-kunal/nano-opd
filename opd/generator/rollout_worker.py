@@ -165,7 +165,6 @@ class RolloutState:
             self._update_error = None
             self._is_generation_paused = False
             raise RuntimeError(f"in-place weight update failed: {err}") from err
-        # Clear out the KV cache in vLLM
         self.engine.reset_prefix_cache()
         with self._pause_lock:
             self._is_generation_paused = False

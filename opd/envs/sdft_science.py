@@ -66,9 +66,8 @@ class SdftScienceEnv(OPDEnvBase):
     """Environment wrapper for the Self-Distillation science dataset.
 
     SDFT trains via KL distillation, not reward maximization, so compute_reward
-    always returns 1.0 and get_feedback returns an empty string. The env class
-    exists to satisfy the OPDEnvBase interface and enable mid-training evaluation
-    if needed.
+    always returns 1.0. get_privileged_information returns the worked
+    demonstration (doesn't depend on the student's action, unlike SDPO envs).
     """
 
     def __init__(self, question: str, demonstration: str):
@@ -82,8 +81,8 @@ class SdftScienceEnv(OPDEnvBase):
     def compute_reward(self, response: str) -> tuple[float, bool]:
         return 1.0, True
 
-    def get_feedback(self, response: str) -> str:
-        return ""
+    def get_privileged_information(self, action: str) -> str:
+        return self.demonstration
 
     @classmethod
     def load(cls, split: str = "train") -> list["SdftScienceEnv"]:

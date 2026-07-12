@@ -57,7 +57,7 @@ Also a self-teacher setup (same checkpoint for student and teacher, same rank sp
 
 ### `train_sdft.py` — Self-Distillation Fine-Tuning (SDFT)
 
-Another self-teacher setup: the teacher is an EMA copy of the student (like SDPO), but instead of environment feedback, the teacher is conditioned on the question plus a **worked demonstration** pulled from a dataset (science Q&A or tool-use). The default loss is **reverse KL** (paper Eq. 1).
+Another self-teacher setup: the teacher is an EMA copy of the student (like SDPO), but instead of environment feedback, the teacher is conditioned on the question plus a **worked demonstration** pulled from a dataset (science Q&A or tool-use). The default loss is **reverse KL**.
 
 **Why is this interesting?** The demonstration-conditioned teacher tends to produce preamble artifacts (e.g. "Based on the text...") that the student would otherwise learn to mimic even without ever seeing the demonstration itself. SDFT introduces `--num-loss-tokens-to-skip` to mask the first few response tokens from the loss and suppress this ("Learned Artifacts", paper Section 5).
 

@@ -19,7 +19,8 @@ from opd.trainer.setup_utils import (
     print0,
     topk_selector_for,
 )
-from opd.trainer.trainer_utils import MinibatchTensors, StepAccumulator, Trainer
+from opd.trainer.models import MinibatchTensors, StepAccumulator
+from opd.trainer.trainer_utils import Trainer
 from opd.trainer.sync_teacher import SYNC_METHODS, build_syncer
 from opd.generator.rollout import generate_rollouts_remote
 from opd.envs.dataset import distributed_opd_loader, build_opd_dataset
@@ -312,7 +313,7 @@ if __name__ == "__main__":
                 if i == 0:
                     print0(f"[debug step={step}] rewards={rewards} has_success={successful_text is not None}", flush=True)
                 for j, r in enumerate(group):
-                    env_output   = env.get_feedback(r["response"]) if rewards[j] == 0 else ""
+                    env_output   = env.get_privileged_information(r["response"]) if rewards[j] == 0 else ""
                     # successful attempts pass their own response as the correct
                     # solution; failed attempts pass a different successful rollout (if any).
                     success_hint = r["response"] if rewards[j] > 0 else successful_text

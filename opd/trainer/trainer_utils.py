@@ -36,10 +36,33 @@ from opd.trainer.distillation_utils import (
     sync_student_to_teacher,
 )
 from opd.trainer.models import DistributedContext, MinibatchTensors, StepAccumulator
-from opd.trainer.setup_utils import broadcast_n_minibatches, maybe_save_checkpoint
+from opd.trainer.setup_utils import broadcast_n_minibatches, init_vllm_transfer, maybe_save_checkpoint
 from opd.trainer.sync_teacher import TeacherSyncer
 
 MinibatchFn = Callable[[MinibatchTensors, StepAccumulator], None]
+
+
+def build_trainer(
+    args: Any,
+    ctx: DistributedContext,
+    student: StudentModel | None,
+    teacher: TeacherModel | None,
+    use_wandb: bool,
+) -> "Trainer":
+    """Opens the vLLM NCCL weight-transfer channel and constructs the shared `Trainer`.
+
+    Identical across all four training scripts (OPD/SDPO/OPSD/SDFT); only
+    `student`/`teacher` differ per rank (the caller narrows the wrong one to
+    `None` before calling this).
+    """
+    model_update_group = init_vllm_transfer(
+        args.rollout_worker_url,
+        rollout_worker_world_size=args.rollout_worker_world_size,
+        train_world_size=ctx.train_world_size,
+        master_process=ctx.master_process,
+        all_group=ctx.all_group,
+    )
+    return Trainer(args, ctx, student, teacher, model_update_group, use_wandb)
 
 
 class Trainer:

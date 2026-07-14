@@ -43,8 +43,8 @@ def prepare_dp_model(
     model: nn.Module,
     dtype: str,
     sync_module_states: bool,
-    device_mesh: dist.DeviceMesh = None,
-    process_group=None,
+    device_mesh: dist.DeviceMesh | None = None,
+    process_group: dist.ProcessGroup | None = None,
     sharding_strategy: str = "HYBRID_SHARD",
 ) -> FSDP:
     """Wraps `model` in FSDP with the given mixed-precision and sharding config.

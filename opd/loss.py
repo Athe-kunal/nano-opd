@@ -73,6 +73,23 @@ def _tail_probs(probs: torch.Tensor) -> torch.Tensor:
     return (1.0 - torch.einsum("btk->bt", probs)).clamp(min=1e-8)  # [B, T]
 
 
+def _student_teacher_probs(
+    student_logprobs: torch.Tensor, teacher_logprobs: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Casts top-K log-probs to float and exponentiates them, for both policies.
+
+    Every top-K loss needs both the float log-probs (for the divergence's
+    log-ratio term) and the plain probabilities (for the weighting term and,
+    where applicable, `_tail_probs`).
+
+    Returns:
+        `(student_logprobs, teacher_logprobs, student_probs, teacher_probs)`.
+    """
+    student_logprobs = student_logprobs.float()
+    teacher_logprobs = teacher_logprobs.float()
+    return student_logprobs, teacher_logprobs, student_logprobs.exp(), teacher_logprobs.exp()
+
+
 def compute_reverse_kl_loss(
     student_logprobs: torch.Tensor,         # [B, T, K]
     teacher_logprobs: torch.Tensor,         # [B, T, K]
@@ -97,11 +114,9 @@ def compute_reverse_kl_loss(
     Returns:
         A scalar loss, averaged over response tokens.
     """
-    student_logprobs = student_logprobs.float()
-    teacher_logprobs = teacher_logprobs.float()
-    student_probs = student_logprobs.exp()
-    teacher_probs = teacher_logprobs.exp()
-
+    student_logprobs, teacher_logprobs, student_probs, teacher_probs = _student_teacher_probs(
+        student_logprobs, teacher_logprobs
+    )
     s_tail = _tail_probs(student_probs)
     t_tail = _tail_probs(teacher_probs)
 
@@ -132,11 +147,9 @@ def compute_forward_kl_loss(
     Returns:
         A scalar loss, averaged over response tokens.
     """
-    student_logprobs = student_logprobs.float()
-    teacher_logprobs = teacher_logprobs.float()
-    student_probs = student_logprobs.exp()
-    teacher_probs = teacher_logprobs.exp()
-
+    student_logprobs, teacher_logprobs, student_probs, teacher_probs = _student_teacher_probs(
+        student_logprobs, teacher_logprobs
+    )
     s_tail = _tail_probs(student_probs)
     t_tail = _tail_probs(teacher_probs)
 
@@ -172,11 +185,9 @@ def compute_jsd_loss(
     Returns:
         A scalar loss, averaged over response tokens.
     """
-    student_logprobs = student_logprobs.float()
-    teacher_logprobs = teacher_logprobs.float()
-    student_probs = student_logprobs.exp()
-    teacher_probs = teacher_logprobs.exp()
-
+    student_logprobs, teacher_logprobs, student_probs, teacher_probs = _student_teacher_probs(
+        student_logprobs, teacher_logprobs
+    )
     s_tail = _tail_probs(student_probs)                                   # [B, T]
     t_tail = _tail_probs(teacher_probs)
 
@@ -224,11 +235,9 @@ def compute_mopd_loss(
     Returns:
         A scalar loss, averaged over response tokens.
     """
-    student_logprobs = student_logprobs.float()
-    teacher_logprobs = teacher_logprobs.float()
-    student_probs = student_logprobs.exp()
-    teacher_probs = teacher_logprobs.exp()
-
+    student_logprobs, teacher_logprobs, student_probs, teacher_probs = _student_teacher_probs(
+        student_logprobs, teacher_logprobs
+    )
     per_token = torch.einsum("btk,btk->bt", student_probs, student_logprobs - teacher_logprobs)
     per_token = per_token - torch.einsum("btk->bt", student_probs) + torch.einsum("btk->bt", teacher_probs)
     return _masked_token_mean(per_token, response_mask, tis_weights, kl_clip)

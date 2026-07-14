@@ -8,16 +8,12 @@ not a standalone vLLM engine.
 from __future__ import annotations
 
 import asyncio
-import json
 from typing import Any
 
-import wandb
 from datasets import load_dataset
 
-from opd.envs.base import pass_at_k
+from opd.envs.base import run_pass_at_k_eval
 from opd.envs.dapo_dataset import check_answer, extract_last_boxed
-from opd.generator.rollout import generate_rollouts_remote
-from opd.trainer.setup_utils import print0
 
 # DAPO-style math benchmarks this evaluator supports. Not valid for
 # livecodebench, whose scoring requires running generated code against
@@ -75,35 +71,19 @@ async def _run_eval_one_dataset(
         await asyncio.to_thread(load_dataset, cfg["hf_path"], split=cfg["split"])
     )
     prompts = [p[cfg["problem_col"]] for p in problems]
+    problem_ids = [p.get(cfg["id_col"], i) for i, p in enumerate(problems)]
 
-    rollouts = await asyncio.to_thread(
-        generate_rollouts_remote, rollout_worker_url, prompts, eval_k, eval_max_tokens, temperature, top_k
+    def is_correct(i: int, r: dict) -> bool:
+        return check_answer(extract_last_boxed(r["response"]), problems[i][cfg["answer_col"]])
+
+    return await asyncio.to_thread(
+        run_pass_at_k_eval,
+        rollout_worker_url, prompts, problem_ids,
+        eval_k, eval_max_tokens, step, temperature, top_k,
+        is_correct=is_correct,
+        metrics_key=f"eval/{dataset_name}/pass@{eval_k}",
+        log_prefix=f"{dataset_name} eval",
     )
-
-    per_problem = []
-    for i, prob in enumerate(problems):
-        batch = rollouts[i * eval_k : (i + 1) * eval_k]
-        preds = [extract_last_boxed(r["response"]) for r in batch]
-        n_correct = sum(check_answer(p, prob[cfg["answer_col"]]) for p in preds)
-        per_problem.append(
-            {
-                "problem_idx": prob.get(cfg["id_col"], i),
-                "n_correct": n_correct,
-                "pass_at_k": pass_at_k(eval_k, n_correct, eval_k),
-            }
-        )
-
-    overall = sum(r["pass_at_k"] for r in per_problem) / len(per_problem)
-    metrics = {f"eval/{dataset_name}/pass@{eval_k}": overall}
-
-    print0(f"[eval step={step}] {dataset_name}: {json.dumps(metrics)}")
-    for r in per_problem:
-        print0(f"  problem {r['problem_idx']}: {r['n_correct']}/{eval_k}  pass@{eval_k}={r['pass_at_k']:.3f}")
-
-    if wandb.run is not None:
-        wandb.log(metrics, step=step)
-
-    return metrics
 
 
 def run_eval(

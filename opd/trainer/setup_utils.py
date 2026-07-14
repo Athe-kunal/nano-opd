@@ -1,3 +1,4 @@
+import argparse
 import math
 import os
 from typing import Any, Literal
@@ -8,7 +9,7 @@ from loguru import logger
 from omegaconf import OmegaConf
 
 from opd.fsdp.model import StudentModel, TeacherModel
-from opd.generator.rollout import remote_vllm_init_weight_transfer, wait_for_rollout_worker
+from opd.generator.rollout import generate_rollouts_remote, remote_vllm_init_weight_transfer, wait_for_rollout_worker
 from opd.trainer.models import DistributedContext
 from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
 
@@ -18,6 +19,50 @@ def print0(s="", **kwargs):
     ddp_rank = int(os.environ.get("RANK", 0))
     if ddp_rank == 0:
         logger.info(s, **kwargs)
+
+
+def print_run_banner(ctx: DistributedContext, args: Any) -> None:
+    """Prints the algorithm/device summary lines shared by all four training scripts.
+
+    Callers print their own model-description line (which differs per
+    algorithm) immediately before calling this.
+    """
+    print0(f"Algorithm: {args.algorithm}  distill-top-k: {args.distill_top_k}")
+    print0(f"Device: {ctx.device}  Student ranks: {ctx.train_world_size}  Total world: {ctx.ddp_world_size}")
+
+
+def add_runtime_args(parser: argparse.ArgumentParser, default_save_dir: str) -> None:
+    """Registers the runtime flags shared by all four training scripts.
+
+    Args:
+        parser: The script's argparse parser, already populated with its
+          algorithm-specific flags.
+        default_save_dir: Per-script default for `--save-dir` (the only one
+          of these flags whose default differs between scripts).
+    """
+    parser.add_argument("--device-type", type=str, default="")
+    parser.add_argument("--run-name", type=str, default="dummy")
+    parser.add_argument("--save-dir", type=str, default=default_save_dir)
+    parser.add_argument("--save-every", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=0)
+
+
+def generate_rollouts_for_prompts(args: Any, prompts: list[str], num_samples: int) -> list[dict[str, Any]]:
+    """Calls `generate_rollouts_remote` with the args-derived generation config shared by all four training scripts.
+
+    `prompts` and `num_samples` are the only two things that differ per
+    call site (prompt/message construction is algorithm-specific and stays
+    in each script); `max_new_tokens`/`temperature`/`top_k` always come
+    straight from `args`.
+    """
+    return generate_rollouts_remote(
+        args.rollout_worker_url,
+        prompts=prompts,
+        num_samples=num_samples,
+        max_new_tokens=args.max_new_tokens,
+        temperature=args.temperature,
+        top_k=args.top_k,
+    )
 
 
 def compute_cleanup():
@@ -123,6 +168,28 @@ def build_student(
     student = StudentModel(config, data_parallel_size=train_world_size, process_group=student_group)
     student.prepare_scheduler(total_steps=total_steps)
     return student
+
+
+def build_student_from_args(args: Any, ctx: DistributedContext) -> StudentModel:
+    """Calls `build_student` with the args/ctx-derived arguments shared by all four training scripts.
+
+    `scheduler`/`warmup_ratio` are only CLI flags on the two self-teacher
+    scripts (SDPO/OPSD); `getattr` falls back to `build_student`'s own
+    defaults on the other two, where the flags don't exist.
+    """
+    return build_student(
+        args.student_model,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        max_grad_norm=args.max_grad_norm,
+        gradient_checkpointing=args.gradient_checkpointing,
+        sharding_strategy=args.sharding_strategy,
+        train_world_size=ctx.train_world_size,
+        student_group=ctx.student_group,
+        total_steps=args.num_steps * args.epochs,
+        scheduler_name=getattr(args, "scheduler", "cosine"),
+        warmup_ratio=getattr(args, "warmup_ratio", 0.05),
+    )
 
 
 def build_teacher(model_name: str) -> TeacherModel:

@@ -12,24 +12,30 @@ from opd.loss import ALGORITHMS
 from opd.trainer.logging_utils import finish_wandb, init_wandb, log_eval_metrics, should_use_wandb
 from opd.trainer.self_distillation_utils import self_distill_minibatch
 from opd.trainer.setup_utils import (
+    add_runtime_args,
     assert_prompts_divisible,
-    build_student,
+    build_student_from_args,
     build_teacher,
     compute_cleanup,
+    generate_rollouts_for_prompts,
     init_distributed,
-    init_vllm_transfer,
     print0,
+    print_run_banner,
     topk_selector_for,
 )
 from opd.trainer.models import MinibatchTensors, StepAccumulator
-from opd.trainer.trainer_utils import Trainer
+from opd.trainer.trainer_utils import build_trainer
 from opd.trainer.sync_teacher import SYNC_METHODS, build_syncer
-from opd.generator.rollout import generate_rollouts_remote
 from opd.envs.dataset import distributed_opd_loader
 from opd.envs.sdft_science import SdftScienceEnv, load_sdft_science, load_sdft_science_eval, grade_science_response
 from opd.envs.sdft_tooluse import SdftToolUseEnv, load_sdft_tooluse, load_sdft_tooluse_eval, grade_tooluse_response
 
 _ENV_CLS = {"science": SdftScienceEnv, "tooluse": SdftToolUseEnv}
+_EVAL_LOADERS = {"science": load_sdft_science_eval, "tooluse": load_sdft_tooluse_eval}
+_GRADERS = {
+    "science": lambda response, ex: grade_science_response(response, ex["answer"]),
+    "tooluse": lambda response, ex: grade_tooluse_response(response, ex["golden_answer"]),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -128,10 +134,7 @@ def eval_pass_at_k(
         [{"role": "user", "content": ex["question"]}], tokenize=False, add_generation_prompt=True,
     ) for ex in examples]
 
-    rollouts = generate_rollouts_remote(
-        args.rollout_worker_url, prompts=prompts, num_samples=k,
-        max_new_tokens=args.max_new_tokens, temperature=args.temperature, top_k=args.top_k,
-    )
+    rollouts = generate_rollouts_for_prompts(args, prompts, num_samples=k)
 
     pass_count = 0
     total_correct = 0
@@ -148,29 +151,6 @@ def eval_pass_at_k(
 # ---------------------------------------------------------------------------
 # Dataset builder
 # ---------------------------------------------------------------------------
-
-
-def build_sdft_eval_dataset(args) -> list[dict]:
-    """Load the held-out eval split for pass@k evaluation.
-
-    Returns [] for custom JSONL datasets (no eval split available).
-    """
-    if args.dataset_path:
-        return []
-    if args.dataset == "science":
-        return load_sdft_science_eval()
-    if args.dataset == "tooluse":
-        return load_sdft_tooluse_eval()
-    return []
-
-
-def build_sdft_grader(args):
-    """Return a grader callable (response, example) -> bool for the dataset."""
-    if args.dataset == "science":
-        return lambda response, ex: grade_science_response(response, ex["answer"])
-    if args.dataset == "tooluse":
-        return lambda response, ex: grade_tooluse_response(response, ex["golden_answer"])
-    return lambda response, ex: False
 
 
 def build_sdft_dataset(args) -> list[SdftScienceEnv | SdftToolUseEnv]:
@@ -362,13 +342,9 @@ if __name__ == "__main__":
         help="[hard_sync] Full copy every N optimizer steps.",
     )
     # Runtime
-    parser.add_argument("--device-type", type=str, default="")
-    parser.add_argument("--run-name", type=str, default="dummy")
-    parser.add_argument("--save-dir", type=str, default="sdft_checkpoints")
-    parser.add_argument("--save-every", type=int, default=0)
+    add_runtime_args(parser, default_save_dir="sdft_checkpoints")
     parser.add_argument("--eval-every", type=int, default=0, help="Pass@k eval on held-out split every N steps (0 = disabled).")
     parser.add_argument("--eval-k", type=int, default=4, help="Number of rollouts per question for pass@k evaluation.")
-    parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
     use_wandb = should_use_wandb()
@@ -382,10 +358,7 @@ if __name__ == "__main__":
     print0(
         f"Model: {args.student_model}  (student = teacher, synced via {args.sync_method})"
     )
-    print0(f"Algorithm: {args.algorithm}  distill-top-k: {args.distill_top_k}")
-    print0(
-        f"Device: {ctx.device}  Student ranks: {ctx.train_world_size}  Total world: {ctx.ddp_world_size}"
-    )
+    print_run_banner(ctx, args)
     print0(f"Loss token skip: {args.num_loss_tokens_to_skip}")
 
     init_wandb(
@@ -412,17 +385,7 @@ if __name__ == "__main__":
     # -------------------------------------------------------------------------
     # Model setup
     if ctx.is_student:
-        student = build_student(
-            args.student_model,
-            lr=args.lr,
-            weight_decay=args.weight_decay,
-            max_grad_norm=args.max_grad_norm,
-            gradient_checkpointing=args.gradient_checkpointing,
-            sharding_strategy=args.sharding_strategy,
-            train_world_size=ctx.train_world_size,
-            student_group=ctx.student_group,
-            total_steps=args.num_steps * args.epochs,
-        )
+        student = build_student_from_args(args, ctx)
 
     if ctx.is_teacher:
         # Same checkpoint as the student; weights will be EMA-synced after each step.
@@ -456,19 +419,11 @@ if __name__ == "__main__":
     top_k = args.distill_top_k
 
     # -------------------------------------------------------------------------
-    # vLLM weight-transfer setup
-    model_update_group = init_vllm_transfer(
-        args.rollout_worker_url,
-        rollout_worker_world_size=args.rollout_worker_world_size,
-        train_world_size=ctx.train_world_size,
-        master_process=ctx.master_process,
-        all_group=ctx.all_group,
-    )
-
-    trainer = Trainer(
+    # vLLM weight-transfer setup + trainer construction
+    trainer = build_trainer(
         args, ctx,
         student if ctx.is_student else None, teacher if ctx.is_teacher else None,
-        model_update_group, use_wandb,
+        use_wandb,
     )
 
     # -------------------------------------------------------------------------
@@ -478,8 +433,9 @@ if __name__ == "__main__":
     if ctx.is_student:
         dataset = build_sdft_dataset(args)
         if args.eval_every > 0:
-            eval_dataset = build_sdft_eval_dataset(args)
-            grader = build_sdft_grader(args)
+            # Custom JSONL datasets (--dataset-path) have no held-out eval split.
+            eval_dataset = [] if args.dataset_path else _EVAL_LOADERS[args.dataset]()
+            grader = _GRADERS[args.dataset]
         loader = distributed_opd_loader(
             dataset, args.prompts_per_step, ctx.train_world_size, ctx.ddp_rank, seed=args.seed
         )
@@ -525,14 +481,8 @@ if __name__ == "__main__":
                 for ex in examples
             ]
 
-            rollouts = generate_rollouts_remote(
-                args.rollout_worker_url,
-                prompts=prompts,
-                num_samples=1,  # SDFT: single on-policy trajectory per prompt
-                max_new_tokens=args.max_new_tokens,
-                temperature=args.temperature,
-                top_k=args.top_k,
-            )
+            # SDFT: single on-policy trajectory per prompt
+            rollouts = generate_rollouts_for_prompts(args, prompts, num_samples=1)
 
             # Attach demonstration-conditioned teacher prompt to each rollout.
             # The teacher sees: question + worked demonstration → richer context

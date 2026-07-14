@@ -10,19 +10,20 @@ from opd.loss import ALGORITHMS
 from opd.trainer.logging_utils import finish_wandb, init_wandb, should_use_wandb
 from opd.trainer.self_distillation_utils import self_distill_minibatch
 from opd.trainer.setup_utils import (
+    add_runtime_args,
     assert_prompts_divisible,
-    build_student,
+    build_student_from_args,
     build_teacher,
     compute_cleanup,
+    generate_rollouts_for_prompts,
     init_distributed,
-    init_vllm_transfer,
     print0,
+    print_run_banner,
     topk_selector_for,
 )
 from opd.trainer.models import MinibatchTensors, StepAccumulator
-from opd.trainer.trainer_utils import Trainer
+from opd.trainer.trainer_utils import build_trainer
 from opd.trainer.sync_teacher import SYNC_METHODS, build_syncer
-from opd.generator.rollout import generate_rollouts_remote
 from opd.envs.dataset import distributed_opd_loader, build_opd_dataset
 from opd.envs.dapo_dataset import DapoMathEnv
 from opd.envs.livecodebench import LiveCodeBenchEnv
@@ -128,16 +129,12 @@ if __name__ == "__main__":
     parser.add_argument("--hard-sync-every-n", type=int, default=100,
                         help="[hard_sync] Full copy every N optimizer steps.")
     # Runtime
-    parser.add_argument("--device-type", type=str, default="")
-    parser.add_argument("--run-name", type=str, default="dummy")
-    parser.add_argument("--save-dir", type=str, default="opd_checkpoints")
-    parser.add_argument("--save-every", type=int, default=0)
+    add_runtime_args(parser, default_save_dir="opd_checkpoints")
     parser.add_argument("--eval-every", type=int, default=0)
     parser.add_argument("--eval-k", type=int, default=4)
     parser.add_argument("--eval-max-tokens", type=int, default=4096)
     parser.add_argument("--sciknoweval-test-size", type=float, default=0.1)
     parser.add_argument("--dataset", type=str, required=True, choices=list(_ENV_CLS.keys()))
-    parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
     use_wandb = should_use_wandb()
@@ -149,8 +146,7 @@ if __name__ == "__main__":
     ctx = init_distributed(args.device_type, args.train_world_size)
 
     print0(f"Model: {args.student_model}  (student = teacher, synced via {args.sync_method})")
-    print0(f"Algorithm: {args.algorithm}  distill-top-k: {args.distill_top_k}")
-    print0(f"Device: {ctx.device}  Student ranks: {ctx.train_world_size}  Total world: {ctx.ddp_world_size}")
+    print_run_banner(ctx, args)
 
     init_wandb(
         args.run_name, ctx.master_process, use_wandb,
@@ -179,19 +175,7 @@ if __name__ == "__main__":
     # -------------------------------------------------------------------------
     # Model setup
     if ctx.is_student:
-        student = build_student(
-            args.student_model,
-            lr=args.lr,
-            weight_decay=args.weight_decay,
-            max_grad_norm=args.max_grad_norm,
-            gradient_checkpointing=args.gradient_checkpointing,
-            sharding_strategy=args.sharding_strategy,
-            train_world_size=ctx.train_world_size,
-            student_group=ctx.student_group,
-            total_steps=args.num_steps * args.epochs,
-            scheduler_name=args.scheduler,
-            warmup_ratio=args.warmup_ratio,
-        )
+        student = build_student_from_args(args, ctx)
 
     if ctx.is_teacher:
         # Same checkpoint as the student; weights will be synced after each step.
@@ -225,19 +209,11 @@ if __name__ == "__main__":
     top_k = args.distill_top_k
 
     # -------------------------------------------------------------------------
-    # vLLM weight-transfer setup (student ranks only)
-    model_update_group = init_vllm_transfer(
-        args.rollout_worker_url,
-        rollout_worker_world_size=args.rollout_worker_world_size,
-        train_world_size=ctx.train_world_size,
-        master_process=ctx.master_process,
-        all_group=ctx.all_group,
-    )
-
-    trainer = Trainer(
+    # vLLM weight-transfer setup (student ranks only) + trainer construction
+    trainer = build_trainer(
         args, ctx,
         student if ctx.is_student else None, teacher if ctx.is_teacher else None,
-        model_update_group, use_wandb,
+        use_wandb,
     )
 
     # -------------------------------------------------------------------------
@@ -291,14 +267,7 @@ if __name__ == "__main__":
                 )
                 for env in examples
             ]
-            rollouts = generate_rollouts_remote(
-                args.rollout_worker_url,
-                prompts=prompts,
-                num_samples=args.num_samples,
-                max_new_tokens=args.max_new_tokens,
-                temperature=args.temperature,
-                top_k=args.top_k,
-            )
+            rollouts = generate_rollouts_for_prompts(args, prompts, args.num_samples)
 
             # Build feedback-augmented teacher prompts for each rollout.
             # For each question, if any rollout succeeded, pass it as a correct

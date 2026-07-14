@@ -439,6 +439,34 @@ def exchange_mopd_pg_packed(
     )
 
 
+def _effective_mask(
+    s_mask: torch.Tensor,
+    t_mask: torch.Tensor,
+    extra_mask: torch.Tensor | None,
+    mask_fn: Any,
+    warn: bool,
+) -> torch.Tensor:
+    """Combines student/teacher masks (+ optional extra mask / mask_fn), warning if empty.
+
+    Shared by `mopd_pg_loss_and_backward` and `topk_kl_loss_and_backward` — both
+    build their loss mask from the same student-mask * teacher-mask * extras
+    recipe before calling into `loss_fn`.
+    """
+    effective_mask = s_mask * t_mask
+    if extra_mask is not None:
+        effective_mask = effective_mask * extra_mask
+    if mask_fn is not None:
+        effective_mask = mask_fn(effective_mask)
+
+    if warn and effective_mask.sum() == 0:
+        msg = f"[warn mb] effective_mask is all-zero: s_mask={s_mask.sum().item():.0f} t_mask={t_mask.sum().item():.0f}"
+        if extra_mask is not None:
+            msg += f" extra_mask={extra_mask.sum().item():.0f}"
+        print0(msg, flush=True)
+
+    return effective_mask
+
+
 def mopd_pg_loss_and_backward(
     *,
     student: StudentModel,
@@ -462,17 +490,7 @@ def mopd_pg_loss_and_backward(
 
     Returns the (already backward()-ed) loss tensor for accounting.
     """
-    effective_mask = pg.s_compact_mask * pg.t_compact_mask
-    if extra_mask is not None:
-        effective_mask = effective_mask * extra_mask
-    if mask_fn is not None:
-        effective_mask = mask_fn(effective_mask)
-
-    if warn and effective_mask.sum() == 0:
-        print0(
-            f"[warn mb] effective_mask is all-zero: "
-            f"s_mask={pg.s_compact_mask.sum().item():.0f} t_mask={pg.t_compact_mask.sum().item():.0f}",
-        )
+    effective_mask = _effective_mask(pg.s_compact_mask, pg.t_compact_mask, extra_mask, mask_fn, warn)
 
     loss = loss_fn(pg.s_logprob, pg.t_logprob, effective_mask, tis_weights=tis_weights) / divisor
     student._scale_loss(loss).backward()
@@ -587,20 +605,7 @@ def topk_kl_loss_and_backward(
     """
     s_logprobs = student_logprobs_at_indices(student_logits, topk.topk_idx, student_chunk_size)
 
-    effective_mask = response_mask * topk.t_compact_mask
-    if extra_mask is not None:
-        effective_mask = effective_mask * extra_mask
-    if mask_fn is not None:
-        effective_mask = mask_fn(effective_mask)
-
-    if warn and effective_mask.sum() == 0:
-        msg = (
-            f"[warn mb] effective_mask is all-zero: "
-            f"s_mask={response_mask.sum().item():.0f} t_mask={topk.t_compact_mask.sum().item():.0f}"
-        )
-        if extra_mask is not None:
-            msg += f" extra_mask={extra_mask.sum().item():.0f}"
-        print0(msg, flush=True)
+    effective_mask = _effective_mask(response_mask, topk.t_compact_mask, extra_mask, mask_fn, warn)
 
     loss = loss_fn(
         s_logprobs, topk.t_logprobs, effective_mask,
@@ -677,8 +682,12 @@ def minibatch_exchange(
         R_max_local = 0
 
     # Broadcast R_max so the teacher can allocate matching tensors.
-    R_max_t = torch.tensor([R_max_local if ctx.is_student else 0], dtype=torch.long, device=ctx.device)
-    dist.broadcast(R_max_t, src=0, group=ctx.all_group)
+    rb = RankBroadcaster(ctx)
+    R_max_t, h = rb.bcast_or_alloc_async(
+        tensor=torch.tensor([R_max_local], dtype=torch.long, device=ctx.device) if ctx.is_student else None,
+        is_owner=ctx.is_student, shape=(1,), dtype=torch.long, src=0,
+    )
+    h.wait()
     R_max = int(R_max_t.item())
 
     if ctx.is_teacher:

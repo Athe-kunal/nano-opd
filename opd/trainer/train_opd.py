@@ -12,22 +12,23 @@ from opd.trainer.distillation_utils import (
     mopd_pg_loss_and_backward,
     topk_kl_loss_and_backward,
 )
-from opd.trainer.models import MopdPGExchange
+from opd.trainer.models import MopdPGExchange, TopKExchange
 from opd.trainer.logging_utils import finish_wandb, init_wandb, should_use_wandb
 from opd.trainer.setup_utils import (
+    add_runtime_args,
     assert_prompts_divisible,
-    build_student,
+    build_student_from_args,
     build_teacher,
     compute_cleanup,
+    generate_rollouts_for_prompts,
     init_distributed,
-    init_vllm_transfer,
     print0,
+    print_run_banner,
     topk_selector_for,
 )
 from opd.trainer.models import MinibatchTensors, StepAccumulator
-from opd.trainer.trainer_utils import Trainer
+from opd.trainer.trainer_utils import build_trainer
 from opd.metrics import compute_topk_health_metrics
-from opd.generator.rollout import generate_rollouts_remote
 from opd.envs.dataset import distributed_opd_loader, build_opd_dataset
 from opd.envs.dapo_dataset import DapoMathEnv
 from opd.envs.livecodebench import LiveCodeBenchEnv
@@ -80,16 +81,12 @@ if __name__ == "__main__":
     parser.add_argument("--sharding-strategy", type=str, default="FULL_SHARD")
     parser.add_argument("--gradient-checkpointing", action="store_true")
     # Runtime
-    parser.add_argument("--device-type", type=str, default="")
-    parser.add_argument("--run-name", type=str, default="dummy")
-    parser.add_argument("--save-dir", type=str, default="opd_checkpoints")
-    parser.add_argument("--save-every", type=int, default=0)
+    add_runtime_args(parser, default_save_dir="opd_checkpoints")
     parser.add_argument("--eval-every", type=int, default=0, help="Eval on AIME every N steps (0=disabled)")
     parser.add_argument("--eval-k", type=int, default=4, help="Number of samples per problem for pass@k eval")
     parser.add_argument("--eval-max-tokens", type=int, default=4096, help="Max tokens for eval generation")
     parser.add_argument("--dataset", type=str, required=True,
                         choices=["livecodebench", "sciknoweval", "dapo_math"])
-    parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
     use_wandb = should_use_wandb()
@@ -99,8 +96,7 @@ if __name__ == "__main__":
 
     print0(f"Student: {args.student_model}")
     print0(f"Teacher: {args.teacher_model}")
-    print0(f"Algorithm: {args.algorithm}  distill-top-k: {args.distill_top_k}")
-    print0(f"Device: {ctx.device}  Student ranks: {ctx.train_world_size}  Total world: {ctx.ddp_world_size}")
+    print_run_banner(ctx, args)
 
     init_wandb(
         args.run_name, ctx.master_process, use_wandb,
@@ -130,17 +126,7 @@ if __name__ == "__main__":
     # -----------------------------------------------------------------------------
     # Model setup
     if ctx.is_student:
-        student = build_student(
-            args.student_model,
-            lr=args.lr,
-            weight_decay=args.weight_decay,
-            max_grad_norm=args.max_grad_norm,
-            gradient_checkpointing=args.gradient_checkpointing,
-            sharding_strategy=args.sharding_strategy,
-            train_world_size=ctx.train_world_size,
-            student_group=ctx.student_group,
-            total_steps=args.num_steps * args.epochs,
-        )
+        student = build_student_from_args(args, ctx)
 
     if ctx.is_teacher:
         teacher = build_teacher(args.teacher_model)
@@ -151,18 +137,10 @@ if __name__ == "__main__":
     select_topk_by: Literal["student", "teacher"] = topk_selector_for(args.algorithm)
 
 
-    model_update_group = init_vllm_transfer(
-        args.rollout_worker_url,
-        rollout_worker_world_size=args.rollout_worker_world_size,
-        train_world_size=ctx.train_world_size,
-        master_process=ctx.master_process,
-        all_group=ctx.all_group,
-    )
-
-    trainer = Trainer(
+    trainer = build_trainer(
         args, ctx,
         student if ctx.is_student else None, teacher if ctx.is_teacher else None,
-        model_update_group, use_wandb,
+        use_wandb,
     )
 
     if ctx.is_student:
@@ -172,29 +150,20 @@ if __name__ == "__main__":
         )
         loader_iter = iter(loader)
 
-    def _mopd_pg_minibatch(
-        mb: MinibatchTensors, acc: StepAccumulator,
+    def _topk_and_tis(
+        mb: MinibatchTensors,
         student_logits: torch.Tensor | None, teacher_logits: torch.Tensor | None,
         B: int, T: int,
-    ) -> None:
-        """MOPD policy-gradient step (mopd_pg_loss): sampled-token-only exchange.
+    ) -> tuple[TopKExchange, torch.Tensor, torch.Tensor] | None:
+        """Shared top-K fetch + TIS-weight computation for both minibatch steps.
 
-        Unlike `_topk_kl_minibatch`, the loss needs only the teacher's
-        log-prob at the student's own sampled token
-        (`fetch_teacher_sampled_logprob`) — no shared top-K support at all.
-        The `fetch_teacher_topk` call below exists purely to compute the
-        overlap/entropy-gap health-metric diagnostics; its output never
-        feeds the loss.
+        `fetch_teacher_topk` is a collective — every rank must call it,
+        whether or not its output feeds the loss (for `mopd_pg_loss` it's a
+        diagnostic only; for the top-K KL family it's the loss's support).
+        Returns `None` on the teacher rank, which has nothing left to do
+        after the collective.
         """
-        sampled_ids = mb.mb_ids[:, 1:]                             # [B, T-1]
-        t_logprob = fetch_teacher_sampled_logprob(
-            ctx=ctx,
-            teacher_logits=teacher_logits,
-            token_ids=sampled_ids,
-            B=B, T=T,
-            teacher_chunk_size=args.teacher_chunk_size,
-        )
-        topk_for_health_metrics = fetch_teacher_topk(
+        topk = fetch_teacher_topk(
             ctx=ctx,
             select_topk_by=select_topk_by,
             student_logits=student_logits,
@@ -206,16 +175,44 @@ if __name__ == "__main__":
         )
 
         if not ctx.is_student:
+            return None
+
+        sampled_ids = mb.mb_ids[:, 1:]                             # [B, T-1]
+        tis_weights = compute_tis_weights(
+            student_logits, sampled_ids, mb.mb_inf_lp[:, 1:], args.tis_clip
+        )
+        return topk, sampled_ids, tis_weights
+
+    def _mopd_pg_minibatch(
+        mb: MinibatchTensors, acc: StepAccumulator,
+        student_logits: torch.Tensor | None, teacher_logits: torch.Tensor | None,
+        B: int, T: int,
+    ) -> None:
+        """MOPD policy-gradient step (mopd_pg_loss): sampled-token-only exchange.
+
+        Unlike `_topk_kl_minibatch`, the loss needs only the teacher's
+        log-prob at the student's own sampled token
+        (`fetch_teacher_sampled_logprob`) — no shared top-K support at all.
+        `_topk_and_tis`'s fetch exists purely to compute the
+        overlap/entropy-gap health-metric diagnostics; its output never
+        feeds the loss.
+        """
+        t_logprob = fetch_teacher_sampled_logprob(
+            ctx=ctx,
+            teacher_logits=teacher_logits,
+            token_ids=mb.mb_ids[:, 1:],
+            B=B, T=T,
+            teacher_chunk_size=args.teacher_chunk_size,
+        )
+        result = _topk_and_tis(mb, student_logits, teacher_logits, B, T)
+        if result is None:
             return
+        topk_for_health_metrics, sampled_ids, tis_weights = result
 
         s_logprob = student_logprobs_at_indices(
             student_logits, sampled_ids.unsqueeze(-1), args.student_chunk_size
         ).squeeze(-1)                                          # [B, T-1], grad-carrying
         shift_mask = mb.mb_mask[:, 1:]                         # [B, T-1]
-
-        tis_weights = compute_tis_weights(
-            student_logits, sampled_ids, mb.mb_inf_lp[:, 1:], args.tis_clip
-        )
 
         pg = MopdPGExchange(
             s_logprob=s_logprob, t_logprob=t_logprob,
@@ -244,26 +241,12 @@ if __name__ == "__main__":
         shape; only `loss_fn` and `select_topk_by` (picked once from
         `args.algorithm`, see `topk_selector_for`) differ between them.
         """
-        topk = fetch_teacher_topk(
-            ctx=ctx,
-            select_topk_by=select_topk_by,
-            student_logits=student_logits,
-            teacher_logits=teacher_logits,
-            B=B, T=T,
-            top_k=args.distill_top_k,
-            student_chunk_size=args.student_chunk_size,
-            teacher_chunk_size=args.teacher_chunk_size,
-        )
-
-        if not ctx.is_student:
+        result = _topk_and_tis(mb, student_logits, teacher_logits, B, T)
+        if result is None:
             return
+        topk, _sampled_ids, tis_weights = result
 
         shift_mask = mb.mb_mask[:, 1:]                             # [B, T-1]
-        sampled_ids = mb.mb_ids[:, 1:]                             # [B, T-1]
-
-        tis_weights = compute_tis_weights(
-            student_logits, sampled_ids, mb.mb_inf_lp[:, 1:], args.tis_clip
-        )
 
         loss = topk_kl_loss_and_backward(
             student=student, student_logits=student_logits, topk=topk, loss_fn=loss_fn,
@@ -300,14 +283,7 @@ if __name__ == "__main__":
                 )
                 for env in examples
             ]
-            rollouts = generate_rollouts_remote(
-                args.rollout_worker_url,
-                prompts=prompts,
-                num_samples=args.num_samples,
-                max_new_tokens=args.max_new_tokens,
-                temperature=args.temperature,
-                top_k=args.top_k,
-            )
+            rollouts = generate_rollouts_for_prompts(args, prompts, args.num_samples)
 
         batch, teacher_batch = trainer.prepare_batches(rollouts, has_teacher_batch=False)
 

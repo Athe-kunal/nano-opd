@@ -6,20 +6,21 @@ from opd.loss import ALGORITHMS
 from opd.trainer.logging_utils import finish_wandb, init_wandb, should_use_wandb
 from opd.trainer.self_distillation_utils import self_distill_minibatch
 from opd.trainer.setup_utils import (
+    add_runtime_args,
     assert_prompts_divisible,
-    build_student,
+    build_student_from_args,
     build_teacher,
     compute_cleanup,
+    generate_rollouts_for_prompts,
     init_distributed,
-    init_vllm_transfer,
     print0,
+    print_run_banner,
     topk_selector_for,
 )
 from opd.trainer.models import MinibatchTensors, StepAccumulator
-from opd.trainer.trainer_utils import Trainer
+from opd.trainer.trainer_utils import build_trainer
 from opd.envs.opsd_dataset import OPSDMathEnv
 from opd.envs.dataset import distributed_opd_loader
-from opd.generator.rollout import generate_rollouts_remote
 
 
 # The teacher sees the problem AND the ground-truth reference solution y*.
@@ -133,11 +134,7 @@ if __name__ == "__main__":
     parser.add_argument("--warmup-ratio", type=float, default=0.05,
                         help="Fraction of total steps used for LR warmup.")
     # Runtime
-    parser.add_argument("--device-type", type=str, default="")
-    parser.add_argument("--run-name", type=str, default="dummy")
-    parser.add_argument("--save-dir", type=str, default="opsd_checkpoints")
-    parser.add_argument("--save-every", type=int, default=0)
-    parser.add_argument("--seed", type=int, default=0)
+    add_runtime_args(parser, default_save_dir="opsd_checkpoints")
     args = parser.parse_args()
 
     use_wandb = should_use_wandb()
@@ -148,8 +145,7 @@ if __name__ == "__main__":
     ctx = init_distributed(args.device_type, args.train_world_size)
 
     print0(f"Model: {args.student_model}  (teacher = frozen initial policy)")
-    print0(f"Algorithm: {args.algorithm}  distill-top-k: {args.distill_top_k}")
-    print0(f"Device: {ctx.device}  Student ranks: {ctx.train_world_size}  Total world: {ctx.ddp_world_size}")
+    print_run_banner(ctx, args)
     if args.kl_clip > 0.0:
         print0(f"Per-token KL clip: {args.kl_clip}")
 
@@ -175,19 +171,7 @@ if __name__ == "__main__":
     # -------------------------------------------------------------------------
     # Model setup
     if ctx.is_student:
-        student = build_student(
-            args.student_model,
-            lr=args.lr,
-            weight_decay=args.weight_decay,
-            max_grad_norm=args.max_grad_norm,
-            gradient_checkpointing=args.gradient_checkpointing,
-            sharding_strategy=args.sharding_strategy,
-            train_world_size=ctx.train_world_size,
-            student_group=ctx.student_group,
-            total_steps=args.num_steps * args.epochs,
-            scheduler_name=args.scheduler,
-            warmup_ratio=args.warmup_ratio,
-        )
+        student = build_student_from_args(args, ctx)
 
     if ctx.is_teacher:
         teacher = build_teacher(args.student_model)
@@ -198,18 +182,10 @@ if __name__ == "__main__":
     select_topk_by: Literal["student", "teacher"] = topk_selector_for(args.algorithm)
     top_k = args.distill_top_k
 
-    model_update_group = init_vllm_transfer(
-        args.rollout_worker_url,
-        rollout_worker_world_size=args.rollout_worker_world_size,
-        train_world_size=ctx.train_world_size,
-        master_process=ctx.master_process,
-        all_group=ctx.all_group,
-    )
-
-    trainer = Trainer(
+    trainer = build_trainer(
         args, ctx,
         student if ctx.is_student else None, teacher if ctx.is_teacher else None,
-        model_update_group, use_wandb,
+        use_wandb,
     )
 
     if ctx.is_student:
@@ -254,14 +230,8 @@ if __name__ == "__main__":
                 for ex in examples
             ]
 
-            rollouts = generate_rollouts_remote(
-                args.rollout_worker_url,
-                prompts=prompts,
-                num_samples=1,        # OPSD: single on-policy trajectory per prompt
-                max_new_tokens=args.max_new_tokens,
-                temperature=args.temperature,
-                top_k=args.top_k,
-            )
+            # OPSD: single on-policy trajectory per prompt
+            rollouts = generate_rollouts_for_prompts(args, prompts, num_samples=1)
 
             # Attach reference-conditioned teacher prompt to each rollout.
             # The teacher sees: problem + ground-truth solution y* → richer

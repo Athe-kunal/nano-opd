@@ -53,11 +53,12 @@ ROLLOUT_GPUS=2 TRAIN_GPUS=3 TEACHER_GPUS=2 bash opd/examples/train_opd.sh
 - **`TRAIN_GPUS`** — GPUs for FSDP student training (`torchrun` ranks for the student).
 - **`TEACHER_GPUS`** — GPUs for the teacher forward passes (can match `ROLLOUT_GPUS` to colocate with vLLM).
 
-### Rollout worker
+### Rollout worker (in the YAML)
 
-- **`ROLLOUT_HOST`** / **`ROLLOUT_PORT`** — Where the trainer talks to the vLLM HTTP server.
-- **`ROLLOUT_GPU_MEM_UTIL`** — vLLM GPU memory fraction.
-- **`WEIGHT_TRANSFER_BACKEND`** — Backend for weight sync to the worker (e.g. `nccl`).
+- **`rollout_host`** / **`rollout_port`** — Where the trainer talks to the vLLM HTTP server.
+- **`rollout_gpu_mem_util`** — vLLM GPU memory fraction.
+- **`weight_transfer_backend`** — Backend for weight sync to the worker (e.g. `nccl`).
+- **`use_wandb`** — Whether to log the run to Weights & Biases.
 
 ### Training loop, batching, and objective (in the YAML)
 
@@ -85,6 +86,18 @@ Three token-level metrics are logged under `metrics/` each step:
 
 - **`save_every`** — Checkpoint frequency.
 - **`eval_every`** / **`eval_k`** / **`eval_max_tokens`** — How often to run eval and generation limits for eval.
+
+### Post-training math eval (in the YAML; `opd`/`sdpo`/`opsd` only)
+
+After training finishes, these launchers run a one-off AIME/HMMT eval (`opd.eval.eval_math.run_eval`) against the still-running, weight-synced rollout worker — no separate vLLM engine or checkpoint loading needed.
+
+- **`skip_eval`** — Set `true` to bypass this step entirely.
+- **`run_eval`** — Whether to run it (only meaningful for math datasets).
+- **`posttrain_eval_datasets`** — Comma-separated eval sets, e.g. `aime_2025,aime_2024,hmmt_2025`.
+- **`posttrain_eval_max_new_tokens`** / **`posttrain_eval_temperature`** / **`posttrain_eval_top_k`** — Generation settings for eval rollouts.
+- **`posttrain_eval_val_n`** — Samples per problem for pass@k.
+- **`posttrain_eval_wandb_project`** / **`posttrain_eval_wandb_run_name`** — Optional separate W&B project/run for the eval; `posttrain_eval_wandb_run_name` defaults to `${run_name}` via OmegaConf interpolation.
+- **`posttrain_eval_step`** — Step number logged alongside eval results; defaults to `${num_steps}`.
 
 ### FSDP (in the YAML)
 

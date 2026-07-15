@@ -30,7 +30,7 @@ num_samples: 4  # Completions per prompt (group size G in Algorithm 1)
 max_new_tokens: 256
 temperature: 1.0
 top_k: 50
-rollout_worker_url: http://127.0.0.1:8047
+rollout_worker_url: http://${rollout_host}:${rollout_port}
 rollout_worker_world_size: 1
 
 # -----------------------------------------------------------------------
@@ -77,3 +77,35 @@ eval_max_tokens: 4096
 sciknoweval_test_size: 0.1
 # One of: dapo_math, livecodebench, sciknoweval
 dataset: sciknoweval
+
+# -----------------------------------------------------------------------
+# GPU assignment (comma-separated physical GPU IDs; consumed by the
+# launcher script to build CUDA_VISIBLE_DEVICES and process counts).
+#   train_gpus must not overlap rollout_gpus or teacher_gpus (enforced by the launcher).
+#   rollout_gpus and teacher_gpus may be the same list to colocate vLLM + teacher.
+train_gpus: "1"        # student FSDP training ranks
+rollout_gpus: "0"      # vLLM rollout worker
+teacher_gpus: "0"      # teacher model rank (exactly one GPU)
+
+# -----------------------------------------------------------------------
+# Rollout worker (vLLM HTTP server the launcher script starts)
+rollout_host: 127.0.0.1
+rollout_port: 8048
+rollout_gpu_mem_util: 0.5  # vLLM GPU memory fraction
+weight_transfer_backend: nccl
+use_wandb: true
+
+# -----------------------------------------------------------------------
+# Post-training math evaluation (opd.eval.eval_math.run_eval), run once
+# after training finishes. Reuses the already-running, weight-synced
+# rollout worker — no separate vLLM engine or checkpoint loading needed.
+skip_eval: false
+run_eval: false  # only meaningful for math datasets (dapo_math, opsd_math)
+posttrain_eval_datasets: aime_2025,aime_2024,hmmt_2025
+posttrain_eval_max_new_tokens: 38912
+posttrain_eval_temperature: 1.0
+posttrain_eval_top_k: -1
+posttrain_eval_val_n: 6  # samples per problem for pass@k
+posttrain_eval_wandb_project: ""
+posttrain_eval_wandb_run_name: ${run_name}
+posttrain_eval_step: ${num_steps}

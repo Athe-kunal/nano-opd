@@ -24,32 +24,20 @@ BASE_DIR="${opd_BASE_DIR:-$REPO_ROOT/.opd}"
 
 CONFIG_YAML="${CONFIG_YAML:-$OPD_DIR/examples/sdft.yaml}"
 
-# Reads a single key out of $CONFIG_YAML.
-read_cfg() {
-  uv run --extra gpu --directory "$REPO_ROOT" python -c "
+# Resolve the values this script needs before the trainer starts (model
+# name, dataset path, rollout worker settings) straight out of $CONFIG_YAML.
+eval "$(uv run --extra gpu --directory "$REPO_ROOT" python -c "
+import shlex
 from omegaconf import OmegaConf
-print(OmegaConf.load('$CONFIG_YAML')['$1'])
-"
-}
-# In SDFT the teacher IS the student (EMA copy) — only one model checkpoint needed.
-STUDENT_MODEL="$(read_cfg student_model)"
-DATASET_PATH="$(read_cfg dataset_path)"
-
-# GPU assignment (comma-separated physical GPU IDs)
-#   TRAIN_GPUS    – student FSDP training ranks (0..N-1)
-#   TEACHER_GPUS  – dedicated teacher rank (exactly 1 GPU, rank N in torchrun world)
-#   ROLLOUT_GPUS  – vLLM rollout worker (may share with TEACHER_GPUS)
-#   TRAIN_GPUS must not overlap ROLLOUT_GPUS or TEACHER_GPUS.
-ROLLOUT_GPUS="${ROLLOUT_GPUS:-0}"
-TRAIN_GPUS="${TRAIN_GPUS:-1}"
-TEACHER_GPUS="${TEACHER_GPUS:-0}"
-
-ROLLOUT_HOST="${ROLLOUT_HOST:-127.0.0.1}"
-ROLLOUT_PORT="${ROLLOUT_PORT:-8047}"
-ROLLOUT_GPU_MEM_UTIL="${ROLLOUT_GPU_MEM_UTIL:-0.5}"
-WEIGHT_TRANSFER_BACKEND="${WEIGHT_TRANSFER_BACKEND:-nccl}"
-
-USE_WANDB="${USE_WANDB:-1}"
+cfg = OmegaConf.load('$CONFIG_YAML')
+for key in (
+    'student_model', 'dataset_path',
+    'train_gpus', 'rollout_gpus', 'teacher_gpus',
+    'rollout_host', 'rollout_port', 'rollout_gpu_mem_util', 'weight_transfer_backend',
+    'use_wandb',
+):
+    print(f'{key.upper()}={shlex.quote(str(cfg[key]))}')
+")"
 
 RUN_DIR="$BASE_DIR/sdft/$TAG"
 SAVE_DIR="$RUN_DIR/checkpoints"
@@ -184,7 +172,6 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS,$TEACHER_GPUS" \
   uv run --extra gpu --directory "$REPO_ROOT" torchrun --standalone --nproc_per_node="$TOTAL_NPROC" \
     "$OPD_DIR/trainer/train_sdft.py" "$CONFIG_YAML" \
     train_world_size="$TRAIN_NPROC" \
-    rollout_worker_url="http://$ROLLOUT_HOST:$ROLLOUT_PORT" \
     rollout_worker_world_size="$ROLLOUT_TP" \
     save_dir="$SAVE_DIR" \
     run_name="$TAG" \

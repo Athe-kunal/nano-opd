@@ -57,7 +57,7 @@ num_loss_tokens_to_skip: 5
 max_new_tokens: 1024
 temperature: 1.0
 top_k: 50
-rollout_worker_url: http://127.0.0.1:8047
+rollout_worker_url: http://${rollout_host}:${rollout_port}
 rollout_worker_world_size: 1
 
 # -----------------------------------------------------------------------
@@ -109,3 +109,20 @@ save_every: 0
 seed: 0
 eval_every: 0  # Pass@k eval on held-out split every N steps (0 = disabled).
 eval_k: 4  # Number of rollouts per question for pass@k evaluation.
+
+# -----------------------------------------------------------------------
+# GPU assignment (comma-separated physical GPU IDs; consumed by the
+# launcher script to build CUDA_VISIBLE_DEVICES and process counts).
+#   train_gpus must not overlap rollout_gpus or teacher_gpus (enforced by the launcher).
+#   rollout_gpus and teacher_gpus may be the same list to colocate vLLM + teacher.
+train_gpus: "1"        # student FSDP training ranks
+rollout_gpus: "0"      # vLLM rollout worker
+teacher_gpus: "0"      # teacher model rank (exactly one GPU)
+
+# -----------------------------------------------------------------------
+# Rollout worker (vLLM HTTP server the launcher script starts)
+rollout_host: 127.0.0.1
+rollout_port: 8047
+rollout_gpu_mem_util: 0.5  # vLLM GPU memory fraction
+weight_transfer_backend: nccl
+use_wandb: true

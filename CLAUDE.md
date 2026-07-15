@@ -1,23 +1,6 @@
 # nano-opd — CLAUDE.md
 
-## What this library is
-
-**nano-opd** is a **pedagogical and hackable** library for on-policy distillation (OPD) of language models. Every design choice is meant to be readable, modifiable, and understandable. There is no magic framework hiding the training loop — the loop is right there in `train_opd.py`, `train_sdpo.py`, `train_opsd.py`, and `train_sdft.py`, readable top-to-bottom.
-
-If you are here to learn how on-policy distillation works, you are in the right place. If you are here to swap in a new loss function, a different teacher schedule, or a new dataset, you can do that in a few lines.
-
-## How Claude should interact with the user
-
-This project is **pedagogical first**. When the user asks about any part of the code:
-
-1. **Quiz before explaining.** Ask the user what they think first. For example, if they ask "what does `distill-top-k` do?", ask them to guess before explaining. This is not gatekeeping — it builds genuine understanding.
-2. **Explain the WHY behind every parameter and design choice**, not just the what. Parameters exist for algorithmic reasons; those reasons should be surfaced.
-3. **Explain the math** behind every loss function and algorithm in plain language, then connect it to the code.
-4. **Flag misconceptions** gently but directly if the user's framing suggests a wrong mental model.
-5. **Suggest experiments.** After explaining a concept, offer a concrete thing the user can change in the code to see the effect.
-6. **Act as a typing partner, not an autonomous agent.** When making code changes, do a few lines or one function at a time. Explain each change in detail before or as you make it. Never rewrite large blocks in one shot. The user should feel like they are coding alongside you, not watching you work.
-
----
+**nano-opd** is a library for on-policy distillation (OPD) of language models. The training loop is directly readable in `train_opd.py`, `train_sdpo.py`, `train_opsd.py`, and `train_sdft.py` — no framework hides it.
 
 ## Architecture overview
 
@@ -31,133 +14,53 @@ trainer (FSDP, train_opd.py / train_sdpo.py / train_opsd.py / train_sdft.py)
               └── generates completions under current student policy
 ```
 
-The trainer and rollout worker are **separate processes** communicating over HTTP. After each training step, the trainer pushes updated student weights into the vLLM worker via NCCL (no checkpoint files involved).
-
----
+The trainer and rollout worker are separate processes communicating over HTTP. After each training step, the trainer pushes updated student weights into the vLLM worker via NCCL (no checkpoint files involved).
 
 ## The four training scripts
 
 ### `train_opd.py` — On-Policy Distillation with a separate teacher
 
-The student and a frozen external teacher run in the **same torchrun job** but on different ranks. Ranks `0..train_world_size-1` are student ranks (FSDP); rank `train_world_size` is the teacher rank. They communicate via `dist.broadcast`.
+The student and a frozen external teacher run in the same torchrun job but on different ranks. Ranks `0..train_world_size-1` are student ranks (FSDP); rank `train_world_size` is the teacher rank. They communicate via `dist.broadcast`.
 
-**Why separate ranks instead of separate processes?** It lets NCCL broadcast the tiny `[B, T, K]` teacher log-prob tensor directly from the teacher GPU to all student GPUs in one collective, avoiding serialization overhead. The key insight: instead of broadcasting the full `[B, T, V]` logit tensor (V ≈ 128,000 for a large vocab), we only broadcast the top-K slice — a ~1000× reduction.
+Rather than broadcasting the full `[B, T, V]` logit tensor (V ≈ 128,000 for a large vocab), only the top-K slice is broadcast — a ~1000× reduction, and it lets NCCL broadcast the teacher log-probs directly GPU-to-GPU in one collective.
 
 ### `train_sdpo.py` — Self-Policy Distillation (SDPO)
 
-There is **no separate teacher model**. The teacher is an EMA copy of the student, living as a plain `nn.Module` on every rank. Every rank runs both student and teacher forward passes locally — no cross-rank broadcast of teacher outputs needed.
-
-**Why is this interesting?** The teacher is always chasing the student, so the distillation target is never too far ahead. This is analogous to how target networks work in deep RL (DQN-style).
+No separate teacher model — the teacher is an EMA copy of the student, living as a plain `nn.Module` on every rank. Every rank runs both student and teacher forward passes locally, so there's no cross-rank broadcast of teacher outputs needed. The teacher is always chasing the student (analogous to target networks in DQN-style deep RL), so the distillation target is never too far ahead.
 
 ### `train_opsd.py` — On-Policy Self-Distillation (OPSD)
 
-Also a self-teacher setup (same checkpoint for student and teacher, same rank split as SDPO), but the teacher is **not** an EMA of the student — it is the **frozen initial policy**, conditioned on the problem **plus the ground-truth reference solution**. The student only ever sees the problem. The teacher is never updated during training.
+Also a self-teacher setup (same checkpoint for student and teacher, same rank split as SDPO), but the teacher is the **frozen initial policy**, conditioned on the problem plus the ground-truth reference solution. The student only ever sees the problem, and the teacher is never updated during training — it acts as a fixed regularizer anchoring the student to the pretrained distribution.
 
-**Why is this interesting?** Because the teacher is frozen, it acts as a fixed regularizer anchoring the student to the pretrained distribution — there's no EMA drift to tune. The paper (Table 3) finds **forward KL** — `KL(p_teacher || p_student)` — consistently outperforms reverse KL and JSD here, so it's the default algorithm. OPSD also introduces `--kl-clip`: per-token pointwise KL clipping, which stops stylistic tokens (which can have much higher KL than content tokens) from dominating the gradient signal — the paper shows this prevents performance collapse on small models.
+The paper (Table 3) finds forward KL — `KL(p_teacher || p_student)` — consistently outperforms reverse KL and JSD here, so it's the default. `--kl-clip` does per-token pointwise KL clipping, which stops stylistic tokens (which can have much higher KL than content tokens) from dominating the gradient signal — the paper shows this prevents performance collapse on small models.
 
 ### `train_sdft.py` — Self-Distillation Fine-Tuning (SDFT)
 
-Another self-teacher setup: the teacher is an EMA copy of the student (like SDPO), but instead of environment feedback, the teacher is conditioned on the question plus a **worked demonstration** pulled from a dataset (science Q&A or tool-use). The default loss is **reverse KL**.
+Another self-teacher setup: the teacher is an EMA copy of the student (like SDPO), but instead of environment feedback, the teacher is conditioned on the question plus a worked demonstration pulled from a dataset (science Q&A or tool-use). Default loss is reverse KL.
 
-**Why is this interesting?** The demonstration-conditioned teacher tends to produce preamble artifacts (e.g. "Based on the text...") that the student would otherwise learn to mimic even without ever seeing the demonstration itself. SDFT introduces `--num-loss-tokens-to-skip` to mask the first few response tokens from the loss and suppress this ("Learned Artifacts", paper Section 5).
-
----
+The demonstration-conditioned teacher tends to produce preamble artifacts (e.g. "Based on the text...") that the student would otherwise learn to mimic even without ever seeing the demonstration itself. `--num-loss-tokens-to-skip` masks the first few response tokens from the loss to suppress this ("Learned Artifacts", paper Section 5).
 
 ## Loss functions (`opd/loss.py`)
 
-All losses operate on **top-K truncated distributions**, not the full vocabulary. The tensors have shape `[B, T, K]` where K = `distill-top-k`.
+All losses operate on top-K truncated distributions, `[B, T, K]` where K = `distill-top-k`.
 
-### Reverse KL — `KL(p_student || p_teacher)`
+- **Reverse KL** — `KL(p_student || p_teacher)`. Student is in the first argument: mode-seeking, penalizes the student for spreading mass where the teacher doesn't. The student selects the top-K indices (only tokens with student mass matter).
+- **Forward KL** — `KL(p_teacher || p_student)`. Teacher is in the first argument: mean-seeking, penalizes the student for missing mass the teacher assigns. The teacher selects the top-K indices.
+- **JSD** — `α·KL(p_student || M) + (1−α)·KL(p_teacher || M)` where `M = α·p_student + (1−α)·p_teacher`. Bounded in `[0, log 2]` regardless of distribution support, so more numerically stable than either pure KL. `jsd_alpha=0` = forward KL, `jsd_alpha=1` = reverse KL. SDPO's default.
+- **`renormalize=True`** (default) — after `exp()` of top-K log-probs, renormalize to sum to 1 over K, since top-K truncation makes the raw sum < 1. Without it the KL formula compares a proper distribution against a sub-distribution.
 
-```
-loss = Σ_k p_student(k) · [log p_student(k) − log p_teacher(k)]
-```
+## Key parameters
 
-**The student is in the first argument.** It asks: "where does the student put probability mass that the teacher does not?" This is **mode-seeking** — the student is penalized for being spread out in places where the teacher is concentrated. In practice, reverse KL tends to produce sharper, more confident outputs.
-
-**Top-K selection:** the student selects the K indices (tokens) used. This is natural for reverse KL because the student-weighted sum means we only need tokens where the student has non-negligible probability.
-
-### Forward KL — `KL(p_teacher || p_student)`
-
-```
-loss = Σ_k p_teacher(k) · [log p_teacher(k) − log p_student(k)]
-```
-
-**The teacher is in the first argument.** It asks: "where does the teacher put probability mass that the student misses?" This is **mean-seeking** — the student is penalized for assigning low probability to tokens the teacher likes. It tends to produce more diverse, coverage-seeking behavior.
-
-**Top-K selection:** the teacher selects the K indices. This is correct because the teacher-weighted sum means we need tokens where the teacher has non-negligible probability.
-
-### JSD — Jensen-Shannon Divergence (SDPO default)
-
-```
-M = α · p_student + (1−α) · p_teacher
-JSD = α · KL(p_student || M) + (1−α) · KL(p_teacher || M)
-```
-
-With `jsd_alpha=0.5` (default), this is the symmetric JSD — it penalizes both the student for deviating from the mixture and the teacher for deviating from the mixture. JSD is always bounded in [0, log 2] regardless of distribution support, making training more numerically stable than either KL variant alone.
-
-**Key insight:** JSD interpolates smoothly between forward KL (`jsd_alpha=0.0`) and reverse KL (`jsd_alpha=1.0`). The SDPO paper uses symmetric JSD as its default because it avoids the mode-seeking / coverage problems of the pure KL variants.
-
-### `renormalize=True` (default)
-
-After taking `exp()` of top-K log-probs, the probabilities are renormalized to sum to 1 over the K tokens. Why? Because the top-K truncation makes the sum < 1. Without renormalization, the KL formula would be comparing a proper distribution against a sub-distribution, introducing a systematic bias. With renormalization, we are computing the KL between two conditional distributions restricted to the top-K support.
-
----
-
-## Key parameters explained
-
-### `distill-top-k` (default: 100)
-
-Instead of computing KL over the full vocabulary V (e.g., 128,000 tokens), we only use the top-K tokens. This is both a **memory optimization** (broadcast tensor is `[B, T, K]` not `[B, T, V]`) and a **signal quality improvement** (the tail of the distribution contributes negligible KL mass but adds noise).
-
-Setting K too low loses coverage of valid alternatives. Setting K too high wastes memory and communication bandwidth. 100 is a practical sweet spot for most models.
-
-### `num-samples` (default: 4)
-
-How many completions to generate per prompt at each step. More samples give a better estimate of the student's current distribution and reduce variance in the distillation signal. But each sample adds rollout cost. In GRPO/DAPO-style RL this parameter controls the group size for advantage estimation — here it controls the diversity of sequences the distillation loss is computed over.
-
-### `prompts-per-step` (default: 8)
-
-How many distinct prompts to sample from the dataset per training step. Combined with `num-samples`, the total rollouts per step = `prompts-per-step × num-samples`. This must be divisible by `train-world-size` so each student rank gets an equal slice.
-
-### `epochs` (default: 1)
-
-How many optimizer steps to take on a single rollout batch before collecting new rollouts. Setting `epochs > 1` is the on-policy equivalent of PPO's multiple epochs — it reuses rollout data but risks off-policy drift because the rollouts were generated by an earlier checkpoint of the student.
-
-### `temperature` (default: 1.0)
-
-Sampling temperature for rollout generation. Temperature=1.0 means sampling from the true model distribution. Lower temperatures make the model greedier (less diverse rollouts). Higher temperatures increase diversity but may produce lower-quality completions. For distillation, it is important to not use temperature=0 (greedy) because we need diversity in the student's on-policy distribution.
-
-### `ema-alpha` (SDPO only, default: 0.05)
-
-The rate at which the EMA teacher tracks the student:
-```
-teacher ← α · student + (1−α) · teacher
-```
-A small α (e.g. 0.05) means the teacher changes slowly — more stable distillation target, but the teacher lags behind the student significantly. A large α means the teacher tracks the student closely — less lag, but potentially unstable if the student changes quickly.
-
-### `ema-sync-method` (SDPO only)
-
-- **`ema`**: standard exponential moving average, as above. The teacher drifts toward the student over time.
-- **`trust_region`**: instead of blending with the previous teacher, blend with the **initial weights** ϕ₀:
-  ```
-  teacher ← α · student + (1−α) · ϕ₀
-  ```
-  This prevents the teacher from drifting too far from the initialization, acting as a regularizer that keeps both student and teacher anchored to the pretrained distribution.
-
-### `max-grad-norm` (default: 1.0)
-
-Gradient clipping threshold. Clips the global L2 norm of all gradients to this value before the optimizer step. This prevents catastrophic gradient spikes during distillation, which can happen when the student and teacher distributions diverge suddenly.
-
-### `student-chunk-size` / `teacher-chunk-size` (default: -1, no chunking)
-
-When processing long sequences, the `[B, T, V]` logit tensor can be too large to hold in GPU memory for top-K selection. Chunking along the T dimension processes the sequence in slices, reducing peak memory at the cost of more kernel launches. `-1` means process the full T at once. Start with chunking only if you hit OOM errors.
-
-### `sharding-strategy` (default: `FULL_SHARD`)
-
-FSDP (Fully Sharded Data Parallel) sharding mode. `FULL_SHARD` shards both parameters and gradients across all student ranks — maximum memory efficiency but highest communication cost. `SHARD_GRAD_OP` only shards gradients and optimizer states. Choose based on your GPU memory budget.
-
----
+- **`distill-top-k`** (default 100) — top-K vocab truncation for the KL computation. Memory optimization (`[B, T, K]` not `[B, T, V]`) and signal-quality improvement (tail of the distribution is mostly noise).
+- **`num-samples`** (default 4) — completions generated per prompt at each step. More samples reduce variance in the distillation signal at the cost of rollout compute.
+- **`prompts-per-step`** (default 8) — distinct prompts sampled per step. `prompts-per-step × num-samples` = total rollouts per step; must be divisible by `train-world-size`.
+- **`epochs`** (default 1) — optimizer steps on one rollout batch before collecting new rollouts. `>1` is PPO-style reuse and risks off-policy drift.
+- **`temperature`** (default 1.0) — rollout sampling temperature. Don't use 0 (greedy) — distillation needs diversity in the student's on-policy distribution.
+- **`ema-alpha`** (SDPO only, default 0.05) — `teacher ← α·student + (1−α)·teacher`. Small α = stable but lagging teacher.
+- **`ema-sync-method`** (SDPO only) — `ema` (standard) or `trust_region` (`teacher ← α·student + (1−α)·ϕ₀`, blends with initial weights instead of the previous teacher — regularizes toward the pretrained distribution).
+- **`max-grad-norm`** (default 1.0) — global L2 gradient-norm clip.
+- **`student-chunk-size` / `teacher-chunk-size`** (default -1, no chunking) — process the `[B, T, V]` top-K selection in T-slices to reduce peak memory; only needed on OOM.
+- **`sharding-strategy`** (default `FULL_SHARD`) — FSDP mode. `FULL_SHARD` shards params+grads+optimizer (max memory efficiency, most comms); `SHARD_GRAD_OP` shards only grads+optimizer state.
 
 ## Data flow for one training step
 
@@ -176,30 +79,17 @@ FSDP (Fully Sharded Data Parallel) sharding mode. `FULL_SHARD` shards both param
 7. Sync updated student weights → vLLM worker via NCCL
 ```
 
-The `response_mask` is critical: it is 1 for response tokens and 0 for prompt tokens. The loss is only computed over response tokens because the prompt is given (not generated by the student), and distilling the prompt region would just train the student to match the teacher on the fixed input context — not useful.
+`response_mask` is 1 for response tokens, 0 for prompt tokens — loss is only computed over response tokens since the prompt is given, not generated by the student. The shift by 1 (`[:, 1:]` on mask, `[:, :-1]` on logits) aligns token t's logits (which predict token t+1) with token t+1's mask entry.
 
-The shift by 1 (`[:, 1:]` on mask, `[:, :-1]` on logits) aligns token t's logits (which predict token t+1) with token t+1's mask entry.
+## Config
 
----
+Hyperparameters for each training script live in `opd/examples/{opd,sdpo,opsd,sdft}.yaml` (OmegaConf), not argparse. Edit the YAML directly to change a run; `opd/examples/train_*.sh` are thin launcher scripts that read the YAML and handle process orchestration (vLLM worker startup, GPU placement). See each YAML's header comment for CLI override syntax.
 
 ## Code style
 
 @CODE.md
 
-- Follow the **Google Python Style Guide** (see `CODE.md`) **strictly** for
-  every code change: docstrings in Google format (`Args:`, `Returns:`,
-  `Raises:`), 4-space indentation, `snake_case` for functions/variables,
-  `CapWords` for classes, module-level constants in `ALL_CAPS`. Avoid overly
-  clever one-liners; prefer readable, explicit code — this is a teaching
-  codebase, clarity beats brevity.
-- Type hints on public function signatures.
-- No unnecessary abstractions — this codebase favors directly readable code
-  over generic frameworks, since the point is for the user to be able to
-  trace execution end to end.
-- Prefer fewer lines of code, but never at the expense of readability —
-  collapse boilerplate, don't collapse clarity.
-
----
+Follow the Google Python Style Guide (`CODE.md`) for every code change: docstrings in Google format, 4-space indentation, `snake_case`/`CapWords`/`ALL_CAPS` conventions, type hints on public signatures. No unnecessary abstractions — this codebase favors directly readable code over generic frameworks. Prefer fewer lines, but never at the expense of readability.
 
 ## Files at a glance
 
@@ -210,9 +100,9 @@ The shift by 1 (`[:, 1:]` on mask, `[:, :-1]` on logits) aligns token t's logits
 | `opd/trainer/train_sdpo.py` | SDPO training loop (EMA self-teacher, feedback conditioned) |
 | `opd/trainer/train_opsd.py` | OPSD training loop (frozen initial-policy teacher, reference-solution conditioned) |
 | `opd/trainer/train_sdft.py` | SDFT training loop (EMA self-teacher, demonstration conditioned) |
-| `opd/trainer/setup_utils.py` | Distributed init, device/seed setup, model construction, vLLM weight-transfer setup — shared by all four training scripts |
-| `opd/trainer/distillation_utils.py` | Shared minibatch-exchange helpers (top-K exchange, PG exchange, response packing, broadcast utilities) used by OPD/SDPO/OPSD/SDFT |
-| `opd/trainer/sync_teacher.py` | Self-teacher sync strategies (EMA, trust-region, hard-sync, on-policy) used by SDPO and SDFT |
+| `opd/trainer/setup_utils.py` | Distributed init, device/seed setup, model construction, vLLM weight-transfer setup, `load_config` |
+| `opd/trainer/distillation_utils.py` | Shared minibatch-exchange helpers (top-K exchange, PG exchange, response packing, broadcast utilities) |
+| `opd/trainer/sync_teacher.py` | Self-teacher sync strategies (EMA, trust-region, hard-sync, on-policy) |
 | `opd/generator/rollout.py` | vLLM HTTP client, batch preparation, weight sync |
 | `opd/generator/rollout_worker.py` | The vLLM HTTP server that runs in a separate process |
 | `opd/fsdp/algorithms.py` | Top-K log-prob selection (chunked, distributed) |
@@ -221,9 +111,9 @@ The shift by 1 (`[:, 1:]` on mask, `[:, :-1]` on logits) aligns token t's logits
 | `opd/envs/dapo_dataset.py` | DAPO math dataset exporter |
 | `opd/eval/eval_math.py` | AIME 2024/2025 and HMMT 2025 evaluation (pass@k) |
 
-## Good entry points for hacking
+## Entry points for hacking
 
-- **New loss function**: add a function to `loss.py`, register it in `ALGORITHMS`, add a choice to the `--algorithm` argparse argument in the training scripts.
-- **New dataset**: add a file in `opd/envs/`, make it produce environment objects (see `dataset.py`), wire it into `build_opd_dataset()`.
-- **Different EMA schedule**: `EMASyncer` in `opd/trainer/sync_teacher.py` is self-contained — swap in a warmup, a cyclical schedule, or a per-layer alpha. Used by both `train_sdpo.py` and `train_sdft.py` via `build_syncer("ema", ...)`.
-- **Different top-K selection**: `fsdp/algorithms.py` contains the top-K helpers in isolation — easy to swap for top-p, nucleus sampling-style selection, or importance-weighted sampling.
+- **New loss function**: add to `loss.py`, register in `ALGORITHMS`, add a choice to `--algorithm` in the training scripts.
+- **New dataset**: add a file in `opd/envs/`, wire it into `build_opd_dataset()`.
+- **Different EMA schedule**: `EMASyncer` in `opd/trainer/sync_teacher.py` is self-contained.
+- **Different top-K selection**: `fsdp/algorithms.py` has the top-K helpers in isolation.

@@ -9,47 +9,26 @@ BASE_DIR="${opd_BASE_DIR:-$REPO_ROOT/.opd}"
 
 CONFIG_YAML="${CONFIG_YAML:-$OPD_DIR/examples/opsd.yaml}"
 
-# Reads a single key out of $CONFIG_YAML.
-read_cfg() {
-  uv run --extra gpu --directory "$REPO_ROOT" python -c "
+# Resolve the values this script needs before the trainer starts (model
+# name, rollout worker settings, post-training eval settings) straight out
+# of $CONFIG_YAML. `run_name` is set to $TAG first so any `${run_name}`
+# interpolations in the YAML (e.g. posttrain_eval_wandb_run_name) resolve to it.
+eval "$(uv run --extra gpu --directory "$REPO_ROOT" python -c "
+import shlex
 from omegaconf import OmegaConf
-print(OmegaConf.load('$CONFIG_YAML')['$1'])
-"
-}
-# In OPSD the teacher is the FROZEN initial policy — same checkpoint as student.
-STUDENT_MODEL="$(read_cfg student_model)"
-NUM_STEPS="$(read_cfg num_steps)"
-
-# GPU assignment (comma-separated physical GPU IDs)
-#   TRAIN_GPUS    – student FSDP training ranks (0..N-1)
-#   TEACHER_GPUS  – dedicated teacher rank (exactly 1 GPU, rank N in torchrun world)
-#   ROLLOUT_GPUS  – vLLM rollout worker (may share with TEACHER_GPUS)
-#   TRAIN_GPUS must not overlap ROLLOUT_GPUS or TEACHER_GPUS.
-ROLLOUT_GPUS="${ROLLOUT_GPUS:-0}"
-TRAIN_GPUS="${TRAIN_GPUS:-1}"
-TEACHER_GPUS="${TEACHER_GPUS:-0}"
-
-ROLLOUT_HOST="${ROLLOUT_HOST:-127.0.0.1}"
-ROLLOUT_PORT="${ROLLOUT_PORT:-8047}"
-ROLLOUT_GPU_MEM_UTIL="${ROLLOUT_GPU_MEM_UTIL:-0.5}"
-WEIGHT_TRANSFER_BACKEND="${WEIGHT_TRANSFER_BACKEND:-nccl}"
-
-USE_WANDB="${USE_WANDB:-1}"
-
-# Post-training math evaluation (opd.eval.eval_math.run_eval).
-# Reuses the already-running, weight-synced rollout worker — no separate
-# vLLM engine, checkpoint loading, or LoRA needed.
-# Set SKIP_EVAL=1 to bypass evaluation entirely.
-SKIP_EVAL="${SKIP_EVAL:-0}"
-RUN_EVAL="${RUN_EVAL:-1}"
-EVAL_DATASETS="${EVAL_DATASETS:-aime_2025,aime_2024,hmmt_2025}"
-EVAL_MAX_NEW_TOKENS="${EVAL_MAX_NEW_TOKENS:-38912}"
-EVAL_TEMPERATURE="${EVAL_TEMPERATURE:-1.0}"
-EVAL_TOP_K="${EVAL_TOP_K:--1}"
-EVAL_VAL_N="${EVAL_VAL_N:-6}"
-EVAL_WANDB_PROJECT="${EVAL_WANDB_PROJECT:-}"
-EVAL_WANDB_RUN_NAME="${EVAL_WANDB_RUN_NAME:-$TAG}"
-EVAL_STEP="${EVAL_STEP:-$NUM_STEPS}"
+cfg = OmegaConf.load('$CONFIG_YAML')
+cfg.run_name = '$TAG'
+for key in (
+    'student_model',
+    'train_gpus', 'rollout_gpus', 'teacher_gpus',
+    'rollout_host', 'rollout_port', 'rollout_gpu_mem_util', 'weight_transfer_backend',
+    'use_wandb', 'skip_eval', 'run_eval',
+    'posttrain_eval_datasets', 'posttrain_eval_max_new_tokens', 'posttrain_eval_temperature',
+    'posttrain_eval_top_k', 'posttrain_eval_val_n', 'posttrain_eval_wandb_project',
+    'posttrain_eval_wandb_run_name', 'posttrain_eval_step',
+):
+    print(f'{key.upper()}={shlex.quote(str(cfg[key]))}')
+")"
 
 RUN_DIR="$BASE_DIR/opsd/$TAG"
 SAVE_DIR="$RUN_DIR/checkpoints"
@@ -171,7 +150,6 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS,$TEACHER_GPUS" \
   uv run --extra gpu --directory "$REPO_ROOT" torchrun --standalone --nproc_per_node="$TOTAL_NPROC" \
     "$OPD_DIR/trainer/train_opsd.py" "$CONFIG_YAML" \
     train_world_size="$TRAIN_NPROC" \
-    rollout_worker_url="http://$ROLLOUT_HOST:$ROLLOUT_PORT" \
     rollout_worker_world_size="$ROLLOUT_TP" \
     save_dir="$SAVE_DIR" \
     run_name="$TAG" \
@@ -179,7 +157,7 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS,$TEACHER_GPUS" \
 
 # ---------------------------------------------------------------------------
 # Post-training evaluation with opd.eval.eval_math.run_eval.
-if [[ "$RUN_EVAL" == "1" && "$SKIP_EVAL" != "1" ]]; then
+if [[ "$RUN_EVAL" == "True" && "$SKIP_EVAL" != "True" ]]; then
   echo "[launcher] running post-training eval on: $EVAL_DATASETS"
   uv run --extra gpu --directory "$REPO_ROOT" python - <<PYEOF 2>&1 | tee "$RUN_DIR/eval.log"
 import wandb

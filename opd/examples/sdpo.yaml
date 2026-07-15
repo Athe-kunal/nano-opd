@@ -14,7 +14,7 @@ student_model: Qwen/Qwen2.5-1.5B-Instruct
 # Number of student (FSDP) ranks. The teacher occupies rank
 # train_world_size in the torchrun world. Hardware-dependent; supplied by
 # the launcher script.
-train_world_size: ???
+train_world_size: 1
 
 # -----------------------------------------------------------------------
 # Algorithm

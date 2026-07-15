@@ -29,7 +29,7 @@ tis_clip: 0.0  # TIS importance-weight clip C (0 disables)
 # -----------------------------------------------------------------------
 # Generation
 num_samples: 4  # Completions per prompt
-max_new_tokens: 256
+max_new_tokens: 8192
 temperature: 1.0
 top_k: 50  # vLLM sampling top-k
 rollout_worker_url: http://${rollout_host}:${rollout_port}
@@ -47,7 +47,7 @@ prompts_per_step: 8
 train_batch_size: 4
 epochs: 1  # Optimizer steps per rollout batch
 max_prompt_len: 512
-max_response_len: 1536
+max_response_len: 8192
 sharding_strategy: FULL_SHARD
 gradient_checkpointing: false
 
@@ -60,7 +60,7 @@ save_every: 0
 seed: 0
 eval_every: 0  # Eval on AIME every N steps (0=disabled)
 eval_k: 4  # Number of samples per problem for pass@k eval
-eval_max_tokens: 4096
+eval_max_tokens: 8192
 # One of: livecodebench, sciknoweval, dapo_math
 dataset: dapo_math
 

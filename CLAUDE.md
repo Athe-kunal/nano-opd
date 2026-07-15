@@ -85,12 +85,6 @@ All losses operate on top-K truncated distributions, `[B, T, K]` where K = `dist
 
 Hyperparameters for each training script live in `opd/examples/{opd,sdpo,opsd,sdft}.yaml` (OmegaConf), not argparse. Edit the YAML directly to change a run; `opd/examples/train_*.sh` are thin launcher scripts that read the YAML and handle process orchestration (vLLM worker startup, GPU placement). See each YAML's header comment for CLI override syntax.
 
-## Code style
-
-@CODE.md
-
-Follow the Google Python Style Guide (`CODE.md`) for every code change: docstrings in Google format, 4-space indentation, `snake_case`/`CapWords`/`ALL_CAPS` conventions, type hints on public signatures. No unnecessary abstractions — this codebase favors directly readable code over generic frameworks. Prefer fewer lines, but never at the expense of readability.
-
 ## Files at a glance
 
 | File | Purpose |

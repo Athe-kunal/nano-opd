@@ -16,7 +16,7 @@ student_model: Qwen/Qwen3-1.7B
 # Number of student (FSDP) ranks. The teacher occupies rank
 # train_world_size in the torchrun world. Hardware-dependent; supplied by
 # the launcher script.
-train_world_size: ???
+train_world_size: 1
 
 # -----------------------------------------------------------------------
 # Dataset — HuggingFace dataset ID/split for OPSD training.

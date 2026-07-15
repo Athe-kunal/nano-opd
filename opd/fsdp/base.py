@@ -31,23 +31,22 @@ class FSDPWorker:
         train: Whether this worker's model is being trained (builds an
           optimizer and scheduler) or only used for inference.
         tokenizer: Tokenizer matching `config.model_name`.
-        model_device_mesh: 3D mesh (ddp, fsdp, tp) used to construct the
-          model under FSDP.
-        device_mesh: 2D mesh (dp, tp) used for loss scaling and future
-          tensor-parallel work.
+        model_device_mesh: 2D mesh (ddp, fsdp) used to construct the model
+          under FSDP.
+        device_mesh: 1D mesh (dp) used for loss scaling.
     """
 
     def __init__(self, config: DictConfig, train: bool):
         """Initializes device meshes and loads the tokenizer.
 
         Args:
-            config: Model config with `model_name`, `ddp_size`, `tp_size`,
-              and related fields.
+            config: Model config with `model_name`, `ddp_size`, and related
+              fields.
             train: Whether to prepare this worker for training.
 
         Raises:
             AssertionError: If the distributed world size does not divide
-              evenly into `ddp_size * tp_size`.
+              evenly into `ddp_size`.
         """
         self.config = config
         self.train = train
@@ -56,24 +55,17 @@ class FSDPWorker:
             config.model_name, trust_remote_code=True
         )
         world_size = dist.get_world_size()
-        assert world_size % (config.ddp_size * config.tp_size) == 0, \
-            f"World_size {world_size} must be divisible by ddp_size {config.ddp_size} * tp_size {config.tp_size}."
+        assert world_size % config.ddp_size == 0, \
+            f"World_size {world_size} must be divisible by ddp_size {config.ddp_size}."
         self.model_device_mesh = dist.device_mesh.init_device_mesh(
             "cuda",
-            mesh_dim_names=("ddp", "fsdp", "tp"),
-            mesh_shape=(
-                config.ddp_size,
-                world_size // (config.ddp_size * config.tp_size),
-                config.tp_size
-            )
+            mesh_dim_names=("ddp", "fsdp"),
+            mesh_shape=(config.ddp_size, world_size // config.ddp_size)
         )
         self.device_mesh = dist.device_mesh.init_device_mesh(
             "cuda",
-            mesh_dim_names=("dp", "tp"),
-            mesh_shape=(
-                world_size // config.tp_size,
-                config.tp_size
-            )
+            mesh_dim_names=("dp",),
+            mesh_shape=(world_size,)
         )
 
     def _init_weight_context(self, use_meta_tensor: bool = True) -> ContextManager:
@@ -94,7 +86,6 @@ class FSDPWorker:
         # TODO: why offloading is incompatible with initialization on meta device?
         if any([
             dist.get_rank() == 0,
-            self.device_mesh["tp"].size() > 1 and self.device_mesh["tp"].get_local_rank() == 0,
             getattr(self.config, "offload_model", False),
             not use_meta_tensor
         ]):
@@ -102,28 +93,14 @@ class FSDPWorker:
         return init_empty_weights()
 
     def _prepare_model_optimizer(self) -> None:
-        """Wraps `self.model` in FSDP and builds the optimizer, if training.
-
-        Raises:
-            NotImplementedError: If `config.tp_size > 1` (tensor parallelism
-              is not implemented in this codebase).
-        """
+        """Wraps `self.model` in FSDP and builds the optimizer, if training."""
         if self.train and self.config.enable_gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
-
-        if self.config.tp_size > 1:
-            # Tensor parallelism is not implemented: the device mesh above
-            # reserves a "tp" dimension, but no code shards layers across
-            # it. Fail loudly here instead of only at `--tp-size 1` time.
-            raise NotImplementedError(
-                "tp_size > 1 requires tensor-parallel model sharding, which "
-                "this codebase does not implement. Set --tp-size 1."
-            )
 
         self.model = prepare_dp_model(
             self.model,
             self.config.dtype,
-            self.config.tp_size == 1,
+            True,
             self.model_device_mesh["ddp", "fsdp"]
         )
 

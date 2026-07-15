@@ -22,18 +22,18 @@ OPD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO_ROOT="$(cd "$OPD_DIR/.." && pwd)"
 BASE_DIR="${opd_BASE_DIR:-$REPO_ROOT/.opd}"
 
-# In SDFT the teacher IS the student (EMA copy) — only one model checkpoint needed.
-STUDENT_MODEL="${STUDENT_MODEL:-Qwen/Qwen2.5-1.5B-Instruct}"
+CONFIG_YAML="${CONFIG_YAML:-$OPD_DIR/examples/sdft.yaml}"
 
-# Dataset. Built-in options pulled from the Self-Distillation GitHub repo:
-#   science   – science Q&A with worked demonstrations (paper's Science Q&A task)
-#   tooluse   – tool-use tasks with golden Action/Action_Input sequences
-# Set DATASET_PATH to a JSONL on disk to override (one {"question","demonstration"} per line).
-DATASET="${DATASET:-tooluse}"  # science|tooluse
-DATASET_LIMIT="${DATASET_LIMIT:-0}"          # 0 = use all rows
-# Custom data (optional): point DATASET_PATH at your own {question, demonstration}
-# JSONL to override the built-in dataset.
-DATASET_PATH="${DATASET_PATH:-}"
+# Reads a single key out of $CONFIG_YAML.
+read_cfg() {
+  uv run --extra gpu --directory "$REPO_ROOT" python -c "
+from omegaconf import OmegaConf
+print(OmegaConf.load('$CONFIG_YAML')['$1'])
+"
+}
+# In SDFT the teacher IS the student (EMA copy) — only one model checkpoint needed.
+STUDENT_MODEL="$(read_cfg student_model)"
+DATASET_PATH="$(read_cfg dataset_path)"
 
 # GPU assignment (comma-separated physical GPU IDs)
 #   TRAIN_GPUS    – student FSDP training ranks (0..N-1)
@@ -51,68 +51,6 @@ WEIGHT_TRANSFER_BACKEND="${WEIGHT_TRANSFER_BACKEND:-nccl}"
 
 USE_WANDB="${USE_WANDB:-1}"
 
-NUM_STEPS="${NUM_STEPS:-30}"
-SAVE_EVERY="${SAVE_EVERY:-100}"
-TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-4}"
-GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-4}"
-
-# NOTE: --epochs here is PPO-style reuse of the SAME rollout batch, NOT the
-# paper's dataset-pass epochs (which re-roll fresh on-policy trajectories).
-# To replicate the paper's "2 epochs Skill / 4 epochs Knowledge", raise
-# NUM_STEPS instead and keep EPOCHS=1. See the --epochs help in train_sdft.py.
-EPOCHS="${EPOCHS:-1}"
-
-LR="${LR:-1e-5}"
-WEIGHT_DECAY="${WEIGHT_DECAY:-0.0}"
-MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
-
-# SDFT: exactly one on-policy rollout per (question, demonstration) pair — there
-# is no num-samples multiplier (paper uses a single trajectory).
-PROMPTS_PER_STEP="${PROMPTS_PER_STEP:-8}"
-MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1536}"
-MAX_PROMPT_LEN="${MAX_PROMPT_LEN:-4096}"
-MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-1536}"
-MAX_SEQ_LEN="${MAX_SEQ_LEN:-0}"   # 0 = MAX_PROMPT_LEN + MAX_RESPONSE_LEN
-TEMPERATURE="${TEMPERATURE:-1.0}"
-TOP_K="${TOP_K:-50}"
-
-# reverse_kl is the SDFT default KL(π_student ‖ π_teacher).
-ALGORITHM="${ALGORITHM:-forward_kl}"
-DISTILL_TOP_K="${DISTILL_TOP_K:-100}"
-STUDENT_CHUNK_SIZE="${STUDENT_CHUNK_SIZE:--1}"
-TEACHER_CHUNK_SIZE="${TEACHER_CHUNK_SIZE:--1}"
-TIS_CLIP="${TIS_CLIP:-0.0}"
-
-# Mask the first N response tokens to suppress "Based on the text..." preamble
-# artifacts the student inherits from the demonstration-conditioned teacher
-# (paper Section 5, "Learned Artifacts" — paper says "first few tokens").
-NUM_LOSS_TOKENS_TO_SKIP="${NUM_LOSS_TOKENS_TO_SKIP:-5}"
-
-# Teacher sync — how the EMA self-teacher tracks the student after each step.
-#   ema          : teacher ← α·student + (1−α)·teacher  (paper default)
-#   trust_region : teacher ← β·student + (1−β)·initial_weights  (anchored to init)
-#   hard_sync    : full copy every N steps (DQN-style, less smooth)
-SYNC_METHOD="${SYNC_METHOD:-ema}"
-EMA_ALPHA="${EMA_ALPHA:-0.02}"          # paper sweeps {0.01, 0.02, 0.05} (Tables 3/4)
-TRUST_REGION_BETA="${TRUST_REGION_BETA:-0.05}"
-HARD_SYNC_EVERY_N="${HARD_SYNC_EVERY_N:-100}"
-
-SEED="${SEED:-0}"
-
-# Held-out evaluation on the dataset's eval split (science/tooluse only; ignored for custom JSONL).
-# Set EVAL_EVERY=0 to disable.
-EVAL_EVERY="${EVAL_EVERY:-10}"
-EVAL_K="${EVAL_K:-4}"
-
-# FSDP sharding strategy — choose one of:
-#   FULL_SHARD          params+grads+optimizer sharded; unshard around fwd/bwd
-#   SHARD_GRAD_OP       params sharded; keep unsharded after fwd until bwd done
-#   NO_SHARD            replicate everything (like DDP)
-#   HYBRID_SHARD        FULL_SHARD within a node, replicate across nodes
-#   _HYBRID_SHARD_ZERO2 SHARD_GRAD_OP within a node, replicate across nodes
-SHARDING_STRATEGY="${SHARDING_STRATEGY:-NO_SHARD}"
-GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-0}"
-
 RUN_DIR="$BASE_DIR/sdft/$TAG"
 SAVE_DIR="$RUN_DIR/checkpoints"
 WORKER_LOG="$RUN_DIR/rollout_worker.log"
@@ -125,12 +63,13 @@ export ROLLOUT_PORT
 export USE_WANDB
 
 # ---------------------------------------------------------------------------
-# Sanity: if DATASET_PATH is set it must exist; otherwise a built-in dataset is used.
+# Sanity: if dataset_path is set in the YAML it must exist; otherwise a
+# built-in dataset (the YAML's `dataset` key) is used.
 if [[ -n "$DATASET_PATH" && ! -f "$DATASET_PATH" ]]; then
-  echo "DATASET_PATH does not exist: $DATASET_PATH" >&2
+  echo "dataset_path does not exist: $DATASET_PATH" >&2
   echo "Provide a JSONL file, one record per line:" >&2
   echo '  {"question": "...", "demonstration": "...worked example..."}' >&2
-  echo "and re-run, e.g.  DATASET_PATH=/path/to/data.jsonl bash $0 $TAG" >&2
+  echo "and re-run, e.g.  dataset_path=/path/to/data.jsonl in $CONFIG_YAML" >&2
   exit 1
 fi
 
@@ -204,15 +143,11 @@ mkdir -p "$RUN_DIR" "$SAVE_DIR"
 
 echo "[launcher] run tag         : $TAG"
 echo "[launcher] run dir         : $RUN_DIR"
+echo "[launcher] config          : $CONFIG_YAML"
 echo "[launcher] student model   : $STUDENT_MODEL  (teacher = EMA of student, demonstration-conditioned)"
-echo "[launcher] dataset         : $DATASET_PATH"
 echo "[launcher] train GPUs      : $TRAIN_GPUS  ($TRAIN_NPROC student ranks)"
 echo "[launcher] teacher GPUs    : $TEACHER_GPUS  ($TEACHER_NPROC teacher rank)"
 echo "[launcher] rollout GPUs    : $ROLLOUT_GPUS  (tp=$ROLLOUT_TP)"
-echo "[launcher] algorithm       : $ALGORITHM  (top-k=$DISTILL_TOP_K)"
-echo "[launcher] sync method     : $SYNC_METHOD  (ema_alpha=$EMA_ALPHA  tr_beta=$TRUST_REGION_BETA  hard_n=$HARD_SYNC_EVERY_N)"
-echo "[launcher] token skip      : $NUM_LOSS_TOKENS_TO_SKIP"
-echo "[launcher] sharding        : $SHARDING_STRATEGY"
 
 # ---------------------------------------------------------------------------
 # Start vLLM rollout worker (initialized with the student checkpoint)
@@ -241,57 +176,16 @@ curl -sf "$HEALTH_URL" | grep -q '"ok": *true' \
   || { echo "[launcher] rollout worker did not become healthy" >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
-# Build optional flags
-EXTRA_FLAGS=()
-if [[ "$GRADIENT_CHECKPOINTING" == "1" ]]; then
-  EXTRA_FLAGS+=(--gradient-checkpointing)
-fi
-
-# ---------------------------------------------------------------------------
 # Start student trainer + teacher
 # torchrun world: ranks 0..(TRAIN_NPROC-1) = student FSDP, rank TRAIN_NPROC = teacher.
 # CUDA_VISIBLE_DEVICES maps logical indices to physical GPUs in order.
 echo "[launcher] starting SDFT trainer -> $TRAIN_LOG"
 CUDA_VISIBLE_DEVICES="$TRAIN_GPUS,$TEACHER_GPUS" \
   uv run --extra gpu --directory "$REPO_ROOT" torchrun --standalone --nproc_per_node="$TOTAL_NPROC" \
-    "$OPD_DIR/trainer/train_sdft.py" \
-    --student-model "$STUDENT_MODEL" \
-    --train-world-size "$TRAIN_NPROC" \
-    --dataset "$DATASET" \
-    --dataset-path "$DATASET_PATH" \
-    --dataset-limit "$DATASET_LIMIT" \
-    --algorithm "$ALGORITHM" \
-    --distill-top-k "$DISTILL_TOP_K" \
-    --student-chunk-size "$STUDENT_CHUNK_SIZE" \
-    --teacher-chunk-size "$TEACHER_CHUNK_SIZE" \
-    --tis-clip "$TIS_CLIP" \
-    --num-loss-tokens-to-skip "$NUM_LOSS_TOKENS_TO_SKIP" \
-    --rollout-worker-url "http://$ROLLOUT_HOST:$ROLLOUT_PORT" \
-    --rollout-worker-world-size "$ROLLOUT_TP" \
-    --num-steps "$NUM_STEPS" \
-    --prompts-per-step "$PROMPTS_PER_STEP" \
-    --train-batch-size "$TRAIN_BATCH_SIZE" \
-    --grad-accum-steps "$GRAD_ACCUM_STEPS" \
-    --epochs "$EPOCHS" \
-    --max-new-tokens "$MAX_NEW_TOKENS" \
-    --max-prompt-len "$MAX_PROMPT_LEN" \
-    --max-response-len "$MAX_RESPONSE_LEN" \
-    --max-seq-len "$MAX_SEQ_LEN" \
-    --temperature "$TEMPERATURE" \
-    --top-k "$TOP_K" \
-    --lr "$LR" \
-    --weight-decay "$WEIGHT_DECAY" \
-    --max-grad-norm "$MAX_GRAD_NORM" \
-    --sync-method "$SYNC_METHOD" \
-    --ema-alpha "$EMA_ALPHA" \
-    --trust-region-beta "$TRUST_REGION_BETA" \
-    --hard-sync-every-n "$HARD_SYNC_EVERY_N" \
-    --sharding-strategy "$SHARDING_STRATEGY" \
-    --save-dir "$SAVE_DIR" \
-    --save-every "$SAVE_EVERY" \
-    --eval-every "$EVAL_EVERY" \
-    --eval-k "$EVAL_K" \
-    --seed "$SEED" \
-    --run-name "$TAG" \
-    "${EXTRA_FLAGS[@]}" \
+    "$OPD_DIR/trainer/train_sdft.py" "$CONFIG_YAML" \
+    train_world_size="$TRAIN_NPROC" \
+    rollout_worker_url="http://$ROLLOUT_HOST:$ROLLOUT_PORT" \
+    rollout_worker_world_size="$ROLLOUT_TP" \
+    save_dir="$SAVE_DIR" \
+    run_name="$TAG" \
     2>&1 | tee "$TRAIN_LOG"

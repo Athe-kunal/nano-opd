@@ -184,50 +184,24 @@ def run_vllm_smoke_check(
         )
         return resp.choices[0].message.content or ""
 
-    # ---- DapoMathEnv -------------------------------------------------------
-    console.rule("[bold yellow]DapoMathEnv — live vLLM traces[/bold yellow]")
-    math_envs = DapoMathEnv.load()[:n_prompts]
-    for i, env in enumerate(math_envs):
-        messages, _ = env.init([])
-        completion = _generate(messages)
-        result = env.step(completion)
-        _render_trace(
-            console, "DapoMathEnv", i,
-            prompt=env.prompt,
-            completion=completion,
-            reward=result["reward"],
-            privileged_information=result["metadata"]["privileged_information"],
-        )
-
-    # ---- LiveCodeBenchEnv --------------------------------------------------
-    console.rule("[bold yellow]LiveCodeBenchEnv — live vLLM traces[/bold yellow]")
-    code_envs = LiveCodeBenchEnv.load(dataset_split="train")[:n_prompts]
-    for i, env in enumerate(code_envs):
-        messages, _ = env.init([])
-        completion = _generate(messages)
-        result = env.step(completion)
-        _render_trace(
-            console, "LiveCodeBenchEnv", i,
-            prompt=env.prompt,
-            completion=completion,
-            reward=result["reward"],
-            privileged_information=result["metadata"]["privileged_information"],
-        )
-
-    # ---- SciKnowEvalEnv ----------------------------------------------------
-    console.rule("[bold yellow]SciKnowEvalEnv — live vLLM traces[/bold yellow]")
-    sci_envs = SciKnowEvalEnv.load(test_size=0.1, seed=42)[:n_prompts]
-    for i, env in enumerate(sci_envs):
-        messages, _ = env.init([])
-        completion = _generate(messages)
-        result = env.step(completion)
-        _render_trace(
-            console, "SciKnowEvalEnv", i,
-            prompt=env.prompt,
-            completion=completion,
-            reward=result["reward"],
-            privileged_information=result["metadata"]["privileged_information"],
-        )
+    dataset_specs = [
+        ("DapoMathEnv", lambda: DapoMathEnv.load()),
+        ("LiveCodeBenchEnv", lambda: LiveCodeBenchEnv.load(dataset_split="train")),
+        ("SciKnowEvalEnv", lambda: SciKnowEvalEnv.load(test_size=0.1, seed=42)),
+    ]
+    for label, load_fn in dataset_specs:
+        console.rule(f"[bold yellow]{label} — live vLLM traces[/bold yellow]")
+        for i, env in enumerate(load_fn()[:n_prompts]):
+            messages, _ = env.init([])
+            completion = _generate(messages)
+            result = env.step(completion)
+            _render_trace(
+                console, label, i,
+                prompt=env.prompt,
+                completion=completion,
+                reward=result["reward"],
+                privileged_information=result["metadata"]["privileged_information"],
+            )
 
     console.rule("[bold green]Done[/bold green]")
 

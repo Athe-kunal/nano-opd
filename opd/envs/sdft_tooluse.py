@@ -31,6 +31,17 @@ def _format_demonstration(golden_answer: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _build_question(row: dict) -> str:
+    """Combines a row's `prompt` and `instruction` fields into one question string.
+
+    `instruction` is folded in (on its own paragraph) only when present —
+    some rows carry no instruction beyond the prompt itself.
+    """
+    prompt = (row.get("prompt") or "").strip()
+    instruction = (row.get("instruction") or "").strip()
+    return f"{prompt}\n\n{instruction}".strip() if instruction else prompt
+
+
 def load_sdft_tooluse(split: str = "train") -> list[dict]:
     """Load tooluse_data from the Self-Distillation GitHub repo.
 
@@ -48,11 +59,8 @@ def load_sdft_tooluse(split: str = "train") -> list[dict]:
 
     records = []
     for row in ds:
-        prompt = (row.get("prompt") or "").strip()
-        instruction = (row.get("instruction") or "").strip()
-        question = f"{prompt}\n\n{instruction}".strip() if instruction else prompt
         demonstration = _format_demonstration(row.get("golden_answer") or [])
-        records.append({"question": question, "demonstration": demonstration})
+        records.append({"question": _build_question(row), "demonstration": demonstration})
     return records
 
 
@@ -65,10 +73,7 @@ def load_sdft_tooluse_eval() -> list[dict]:
     ds = load_arrow_split(_BASE_URL, "eval")
     records: list[dict] = []
     for row in ds:
-        prompt = (row.get("prompt") or "").strip()
-        instruction = (row.get("instruction") or "").strip()
-        question = f"{prompt}\n\n{instruction}".strip() if instruction else prompt
-        records.append({"question": question, "golden_answer": row.get("golden_answer") or []})
+        records.append({"question": _build_question(row), "golden_answer": row.get("golden_answer") or []})
     return records
 
 

@@ -247,10 +247,6 @@ def prepare_batch(
         "inference_logprobs": torch.tensor(padded_inf_lp, dtype=torch.float32, device=device),
     }
 
-def _dtype_name(dtype: torch.dtype) -> str:
-    return str(dtype).split(".")[-1]
-
-
 def _iter_fsdp_full_params(model: torch.nn.Module):
     """Yields `(name, param)` for each parameter, gathering FSDP shards first."""
     # summon_full_params temporarily gathers shards and exposes parameters
@@ -285,7 +281,7 @@ def collect_weight_metadata(model: torch.nn.Module, fsdp: bool = False) -> dict[
     # for the duration of metadata collection.
     for name, param in list(_iter_model_parameters(model, fsdp=fsdp)):
         names.append(name)
-        dtype_names.append(_dtype_name(param.dtype))
+        dtype_names.append(str(param.dtype).split(".")[-1])
         shapes.append(list(param.shape))
     return {
         "names": names,

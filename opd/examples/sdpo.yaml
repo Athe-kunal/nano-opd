@@ -1,0 +1,79 @@
+# Config for opd/trainer/train_sdpo.py — Self-Distillation Policy
+# Optimization (SDPO), EMA self-teacher conditioned on environment feedback.
+#
+# Usage:
+#   python opd/trainer/train_sdpo.py opd/examples/sdpo.yaml
+#   python opd/trainer/train_sdpo.py opd/examples/sdpo.yaml lr=1e-5 num_steps=50
+#
+# `???` = must be overridden (here or via `key=value` CLI override).
+
+# -----------------------------------------------------------------------
+# Model — student and teacher share the same checkpoint; teacher is synced
+# to the student after every optimizer step via the chosen sync method.
+student_model: Qwen/Qwen2.5-1.5B-Instruct
+# Number of student (FSDP) ranks. The teacher occupies rank
+# train_world_size in the torchrun world. Hardware-dependent; supplied by
+# the launcher script.
+train_world_size: ???
+
+# -----------------------------------------------------------------------
+# Algorithm
+algorithm: jsd
+distill_top_k: 100  # Top-K vocab for KL distillation
+student_chunk_size: -1
+teacher_chunk_size: -1
+tis_clip: 0.0  # TIS importance-weight clip C (0 disables)
+
+# -----------------------------------------------------------------------
+# Generation
+num_samples: 4  # Completions per prompt (group size G in Algorithm 1)
+max_new_tokens: 256
+temperature: 1.0
+top_k: 50
+rollout_worker_url: http://127.0.0.1:8047
+rollout_worker_world_size: 1
+
+# -----------------------------------------------------------------------
+# Training
+lr: 1e-6
+weight_decay: 0.0
+max_grad_norm: 1.0
+num_steps: 200
+prompts_per_step: 8
+train_batch_size: 4
+# Optimizer step every N minibatches. Effective batch size =
+# train_batch_size * grad_accum_steps.
+grad_accum_steps: 1
+epochs: 1
+max_prompt_len: 512  # Hard cap on prompt tokens. Raises if exceeded.
+max_response_len: 1536  # Cap on response tokens. Truncates silently if exceeded.
+sharding_strategy: FULL_SHARD
+gradient_checkpointing: false
+scheduler: cosine  # One of: cosine, linear, constant
+warmup_ratio: 0.05
+
+# -----------------------------------------------------------------------
+# Teacher sync — controls how the self-teacher tracks the student.
+# One of: ema, trust_region, hard_sync, on_policy (see SYNC_METHODS).
+sync_method: ema
+# [ema] teacher <- alpha*student + (1-alpha)*teacher.
+# Small alpha -> stable but lagging teacher.
+ema_alpha: 0.05
+# [trust_region] teacher <- beta*student + (1-beta)*initial_weights.
+# Anchors the teacher to the pre-trained distribution.
+trust_region_beta: 0.05
+hard_sync_every_n: 100  # [hard_sync] Full copy every N optimizer steps.
+
+# -----------------------------------------------------------------------
+# Runtime
+device_type: ""
+run_name: dummy
+save_dir: opd_checkpoints
+save_every: 0
+seed: 0
+eval_every: 0
+eval_k: 4
+eval_max_tokens: 4096
+sciknoweval_test_size: 0.1
+# One of: dapo_math, livecodebench, sciknoweval
+dataset: sciknoweval

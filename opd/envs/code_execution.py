@@ -15,6 +15,38 @@ import textwrap
 from typing import Any
 
 
+def _run_subprocess(program: str, stdin_text: str, time_limit: float) -> tuple[str, str]:
+    """Runs `program` as a subprocess, feeding `stdin_text` on stdin.
+
+    Shared by `run_one_stdio` and `run_one_functional` — both spawn a
+    `python -c <program>` subprocess with the same timeout/error handling;
+    only what the program is and how its output is compared differ.
+
+    Args:
+        program: Python source to run via `python -c`.
+        stdin_text: Text piped to the subprocess's stdin.
+        time_limit: Seconds to allow before killing the subprocess.
+
+    Returns:
+        `("ok", stdout)` on a clean exit, `("timeout", str(time_limit))` if
+        it ran past `time_limit`, or `("runtime_error", stderr_or_message)`
+        on a nonzero exit or any other exception.
+    """
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", program],
+            input=stdin_text,
+            capture_output=True, text=True, timeout=time_limit,
+        )
+        if proc.returncode != 0:
+            return "runtime_error", proc.stderr.strip()
+        return "ok", proc.stdout.strip()
+    except subprocess.TimeoutExpired:
+        return "timeout", str(time_limit)
+    except Exception as e:
+        return "runtime_error", str(e)
+
+
 def run_one_stdio(
     code: str, inp: Any, expected: Any, time_limit: float
 ) -> dict[str, Any]:
@@ -32,23 +64,15 @@ def run_one_stdio(
     """
     stdin_text = inp if isinstance(inp, str) else "\n".join(str(x) for x in inp)
     expected_text = expected if isinstance(expected, str) else str(expected)
-    try:
-        proc = subprocess.run(
-            [sys.executable, "-c", code],
-            input=stdin_text,
-            capture_output=True, text=True, timeout=time_limit,
-        )
-        if proc.returncode != 0:
-            return {"status": "runtime_error", "input": stdin_text, "stderr": proc.stderr.strip()}
-        got = proc.stdout.strip()
-        if got == expected_text.strip():
-            return {"status": "pass"}
-        return {"status": "wrong_answer", "input": stdin_text,
-                "expected": expected_text, "actual": got}
-    except subprocess.TimeoutExpired:
+    status, result = _run_subprocess(code, stdin_text, time_limit)
+    if status == "runtime_error":
+        return {"status": "runtime_error", "input": stdin_text, "stderr": result}
+    if status == "timeout":
         return {"status": "timeout", "input": stdin_text, "time_limit": time_limit}
-    except Exception as e:
-        return {"status": "runtime_error", "input": stdin_text, "stderr": str(e)}
+    if result == expected_text.strip():
+        return {"status": "pass"}
+    return {"status": "wrong_answer", "input": stdin_text,
+            "expected": expected_text, "actual": result}
 
 
 def run_one_functional(
@@ -76,23 +100,16 @@ def run_one_functional(
         print(json.dumps(_result))
     """).lstrip()
     inp_str = json.dumps(inp)
-    try:
-        proc = subprocess.run(
-            [sys.executable, "-c", driver],
-            input=inp_str,
-            capture_output=True, text=True, timeout=time_limit,
-        )
-        if proc.returncode != 0:
-            return {"status": "runtime_error", "input": inp_str, "stderr": proc.stderr.strip()}
-        got = json.loads(proc.stdout.strip())
-        if got == expected:
-            return {"status": "pass"}
-        return {"status": "wrong_answer", "input": inp_str,
-                "expected": json.dumps(expected), "actual": json.dumps(got)}
-    except subprocess.TimeoutExpired:
+    status, result = _run_subprocess(driver, inp_str, time_limit)
+    if status == "runtime_error":
+        return {"status": "runtime_error", "input": inp_str, "stderr": result}
+    if status == "timeout":
         return {"status": "timeout", "input": inp_str, "time_limit": time_limit}
-    except Exception as e:
-        return {"status": "runtime_error", "input": inp_str, "stderr": str(e)}
+    got = json.loads(result)
+    if got == expected:
+        return {"status": "pass"}
+    return {"status": "wrong_answer", "input": inp_str,
+            "expected": json.dumps(expected), "actual": json.dumps(got)}
 
 
 def execute_all(code: str, tests: dict[str, Any]) -> list[dict[str, Any]]:

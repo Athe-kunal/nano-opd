@@ -1,5 +1,4 @@
 import torch
-from typing import Literal
 from einops import rearrange
 
 
@@ -153,83 +152,3 @@ def student_logprobs_at_indices(
         lse = torch.logsumexp(sl, dim=-1)
         parts.append(_logprobs_at(sl, topk_idx[:, t0:t1], lse))
     return torch.cat(parts, dim=1)
-
-
-# ---------------------------------------------------------------------------
-# Combined helper (non-distributed / single-process use)
-# ---------------------------------------------------------------------------
-
-def _topk_logprobs_slice(
-    student_logits_slice: torch.Tensor,   # [B, C, V]
-    teacher_logits_slice: torch.Tensor,   # [B, C, V]
-    top_k: int,
-    select_topk_by: Literal["student", "teacher"],
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Core top-K log-prob computation for one [B, C, V] slice.
-
-    Args:
-        student_logits_slice: Student logits for this T-chunk, `[B, C, V]`.
-        teacher_logits_slice: Teacher logits for this T-chunk, `[B, C, V]`.
-        top_k: Number of vocab indices to keep per position.
-        select_topk_by: Whether the student or the teacher picks the top-K
-          indices used by both.
-
-    Returns:
-        `(student_logprobs, teacher_logprobs, topk_idx)`, each `[B, C, K]`
-        (`student_logprobs` is the only one with a gradient graph).
-    """
-    s_lse = torch.logsumexp(student_logits_slice, dim=-1)              # [B, C]
-    with torch.no_grad():
-        t_lse = torch.logsumexp(teacher_logits_slice, dim=-1)          # [B, C]
-
-    if select_topk_by == "student":
-        _, topk_idx = student_logits_slice.topk(top_k, dim=-1)         # [B, C, K]
-    else:
-        with torch.no_grad():
-            _, topk_idx = teacher_logits_slice.topk(top_k, dim=-1)
-
-    s_lp = _logprobs_at(student_logits_slice, topk_idx, s_lse)
-    with torch.no_grad():
-        t_lp = _logprobs_at(teacher_logits_slice, topk_idx, t_lse)
-
-    return s_lp, t_lp, topk_idx
-
-
-def compute_topk_logprobs_for_distillation(
-    student_logits: torch.Tensor,   # [B, T, V]
-    teacher_logits: torch.Tensor,   # [B, T, V]
-    top_k: int = 100,
-    select_topk_by: Literal["student", "teacher"] = "student",
-    student_chunk_size: int = -1,
-    teacher_chunk_size: int = -1,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Computes top-K log-probabilities for distillation (non-distributed).
-
-    Args:
-        student_logits: Student logits, `[B, T, V]`.
-        teacher_logits: Teacher logits, `[B, T, V]`.
-        top_k: Number of vocab indices to keep per position.
-        select_topk_by: Whether the student or the teacher picks the top-K
-          indices used by both.
-        student_chunk_size: Chunk size along T for the student (-1 = no
-          chunking).
-        teacher_chunk_size: Chunk size along T for the teacher (-1 = no
-          chunking).
-
-    Returns:
-        A tuple `(student_topk_logprobs, teacher_topk_logprobs, topk_idx)`,
-        each `[B, T, K]`.
-    """
-    T = student_logits.shape[1]
-    chunk = _effective_chunk(T, student_chunk_size, teacher_chunk_size)
-    s_parts, t_parts, idx_parts = [], [], []
-    for t0, t1 in _chunk_range(T, chunk):
-        s_lp, t_lp, idx = _topk_logprobs_slice(
-            student_logits[:, t0:t1],
-            teacher_logits[:, t0:t1],
-            top_k, select_topk_by,
-        )
-        s_parts.append(s_lp)
-        t_parts.append(t_lp)
-        idx_parts.append(idx)
-    return torch.cat(s_parts, dim=1), torch.cat(t_parts, dim=1), torch.cat(idx_parts, dim=1)

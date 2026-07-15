@@ -1,0 +1,111 @@
+# Config for opd/trainer/train_sdft.py — Self-Distillation Fine-Tuning
+# (SDFT), on-policy distillation from a demonstration-conditioned self-teacher.
+#
+# Usage:
+#   python opd/trainer/train_sdft.py opd/examples/sdft.yaml
+#   python opd/trainer/train_sdft.py opd/examples/sdft.yaml lr=1e-5 num_steps=50
+#
+# `???` = must be overridden (here or via `key=value` CLI override).
+
+# -----------------------------------------------------------------------
+# Model
+# HuggingFace model ID or path. Used for both student and (EMA) teacher.
+student_model: Qwen/Qwen2.5-1.5B-Instruct
+# Number of student (FSDP) ranks. The teacher occupies rank
+# train_world_size in the torchrun world. Hardware-dependent; supplied by
+# the launcher script.
+train_world_size: ???
+
+# -----------------------------------------------------------------------
+# Dataset — built-in sources pulled from the Self-Distillation GitHub repo,
+# or a custom JSONL on disk.
+# Built-in dataset to pull from the Self-Distillation GitHub repo.
+# 'science': science Q&A with worked demonstrations.
+# 'tooluse': tool-use tasks with golden Action/Action_Input sequences.
+dataset: science  # One of: science, tooluse
+# Optional override: path to a custom JSONL, one record per line
+# {"question": ..., "demonstration": ...}. Takes precedence over `dataset`
+# when set.
+dataset_path: ""
+dataset_limit: 0  # Cap the number of training examples (0 = use all).
+
+# -----------------------------------------------------------------------
+# Algorithm
+algorithm: reverse_kl  # Distillation loss. SDFT paper uses reverse_kl.
+# Top-K vocab for KL distillation. Larger K is more faithful but uses more
+# memory and bandwidth. NOTE: the SDFT paper's analytic per-token KL
+# estimator sums over the FULL vocabulary V; top-K is a nano-opd
+# memory/bandwidth approximation, not part of the paper. Raise K toward V
+# to reduce the truncation bias.
+distill_top_k: 100
+student_chunk_size: -1
+teacher_chunk_size: -1
+# TIS importance-weight clip C (0 disables). Corrects for log-prob gap
+# between vLLM inference and training forward pass.
+tis_clip: 0.0
+
+# Loss masking — suppress 'Based on the text...' preamble artifacts.
+# Mask the first N response tokens from the distillation loss. SDFT paper
+# (Section 5, 'Learned Artifacts') masks 'the first few tokens' to
+# suppress preamble artifacts (e.g. 'Based on the text...') the student
+# mimics from the demonstration-conditioned teacher; the paper does not
+# give an exact count, so N=5 is a nano-opd default.
+num_loss_tokens_to_skip: 5
+
+# -----------------------------------------------------------------------
+# Generation
+max_new_tokens: 1024
+temperature: 1.0
+top_k: 50
+rollout_worker_url: http://127.0.0.1:8047
+rollout_worker_world_size: 1
+
+# -----------------------------------------------------------------------
+# Training
+lr: 1e-5
+weight_decay: 0.0
+max_grad_norm: 1.0
+num_steps: 200
+# Number of distinct (question, demonstration) pairs per step. Unlike
+# SDPO, there is no num-samples multiplier: each pair produces exactly one
+# on-policy rollout.
+prompts_per_step: 8
+train_batch_size: 4
+# Gradient accumulation steps. Each minibatch is split into this many
+# micro batches; gradients accumulate before a single optimizer step.
+# Effective batch size = train_batch_size * grad_accum_steps.
+grad_accum_steps: 1
+# Optimizer steps taken on the SAME rollout batch before collecting new
+# rollouts (PPO-style inner reuse). WARNING: this is NOT the same as the
+# SDFT paper's 'epochs' (Tables 3/4: 2 for Skill Learning, 4 for Knowledge
+# Acquisition), which are full passes over the dataset that RE-ROLL fresh
+# on-policy trajectories each pass. epochs>1 here reuses stale rollouts
+# and is mildly off-policy (tis_clip partially corrects it). To replicate
+# the paper's epochs, raise num_steps instead.
+epochs: 1
+max_prompt_len: 512
+max_response_len: 1536
+sharding_strategy: FULL_SHARD
+gradient_checkpointing: false
+
+# -----------------------------------------------------------------------
+# Teacher sync
+# How the EMA teacher tracks the student. SDFT paper uses EMA (alpha in
+# {0.01, 0.02, 0.05} per Table 3).
+sync_method: ema  # One of: ema, trust_region, hard_sync, on_policy
+# [ema] teacher <- alpha*student + (1-alpha)*teacher. Small alpha ->
+# stable but lagging teacher. SDFT paper sweeps {0.01, 0.02, 0.05}.
+ema_alpha: 0.02
+# [trust_region] teacher <- beta*student + (1-beta)*initial_weights.
+trust_region_beta: 0.05
+hard_sync_every_n: 100  # [hard_sync] Full copy every N optimizer steps.
+
+# -----------------------------------------------------------------------
+# Runtime
+device_type: ""
+run_name: dummy
+save_dir: sdft_checkpoints
+save_every: 0
+seed: 0
+eval_every: 0  # Pass@k eval on held-out split every N steps (0 = disabled).
+eval_k: 4  # Number of rollouts per question for pass@k evaluation.

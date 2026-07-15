@@ -1,14 +1,15 @@
 import math
 import os
+import sys
 from typing import Any, Literal
 
 import torch
 import torch.distributed as dist
 from loguru import logger
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf
 
 from opd.fsdp.model import StudentModel, TeacherModel
-from opd.generator.rollout import remote_vllm_init_weight_transfer, wait_for_rollout_worker
+from opd.generator.rollout import generate_rollouts_remote, remote_vllm_init_weight_transfer, wait_for_rollout_worker
 from opd.trainer.models import DistributedContext
 from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
 
@@ -18,6 +19,64 @@ def print0(s="", **kwargs):
     ddp_rank = int(os.environ.get("RANK", 0))
     if ddp_rank == 0:
         logger.info(s, **kwargs)
+
+
+def print_run_banner(ctx: DistributedContext, args: Any) -> None:
+    """Prints the algorithm/device summary lines shared by all four training scripts.
+
+    Callers print their own model-description line (which differs per
+    algorithm) immediately before calling this.
+    """
+    print0(f"Algorithm: {args.algorithm}  distill-top-k: {args.distill_top_k}")
+    print0(f"Device: {ctx.device}  Student ranks: {ctx.train_world_size}  Total world: {ctx.ddp_world_size}")
+
+
+def load_config(default_config_path: str) -> DictConfig:
+    """Loads a training run's config from YAML, with optional CLI overrides.
+
+    Usage: `python train_opd.py [path/to/config.yaml] [key=value ...]`
+
+    If the first CLI argument doesn't contain "=", it's treated as a config
+    path and used instead of `default_config_path`; every remaining argument
+    must be an OmegaConf dotlist override (e.g. `lr=1e-5 num_steps=50`),
+    layered on top of the YAML so a launcher script can tweak individual
+    hyperparameters without editing the file.
+
+    Args:
+        default_config_path: Config YAML used when no path is given on the
+          command line.
+
+    Returns:
+        The merged config as an OmegaConf DictConfig (attribute access works
+        the same as `argparse.Namespace`, e.g. `cfg.student_model`).
+    """
+    argv = sys.argv[1:]
+    if argv and "=" not in argv[0]:
+        config_path, overrides = argv[0], argv[1:]
+    else:
+        config_path, overrides = default_config_path, argv
+    cfg = OmegaConf.load(config_path)
+    if overrides:
+        cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(overrides))
+    return cfg
+
+
+def generate_rollouts_for_prompts(args: Any, prompts: list[str], num_samples: int) -> list[dict[str, Any]]:
+    """Calls `generate_rollouts_remote` with the args-derived generation config shared by all four training scripts.
+
+    `prompts` and `num_samples` are the only two things that differ per
+    call site (prompt/message construction is algorithm-specific and stays
+    in each script); `max_new_tokens`/`temperature`/`top_k` always come
+    straight from `args`.
+    """
+    return generate_rollouts_remote(
+        args.rollout_worker_url,
+        prompts=prompts,
+        num_samples=num_samples,
+        max_new_tokens=args.max_new_tokens,
+        temperature=args.temperature,
+        top_k=args.top_k,
+    )
 
 
 def compute_cleanup():
@@ -123,6 +182,28 @@ def build_student(
     student = StudentModel(config, data_parallel_size=train_world_size, process_group=student_group)
     student.prepare_scheduler(total_steps=total_steps)
     return student
+
+
+def build_student_from_args(args: Any, ctx: DistributedContext) -> StudentModel:
+    """Calls `build_student` with the args/ctx-derived arguments shared by all four training scripts.
+
+    `scheduler`/`warmup_ratio` are only CLI flags on the two self-teacher
+    scripts (SDPO/OPSD); `getattr` falls back to `build_student`'s own
+    defaults on the other two, where the flags don't exist.
+    """
+    return build_student(
+        args.student_model,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        max_grad_norm=args.max_grad_norm,
+        gradient_checkpointing=args.gradient_checkpointing,
+        sharding_strategy=args.sharding_strategy,
+        train_world_size=ctx.train_world_size,
+        student_group=ctx.student_group,
+        total_steps=args.num_steps * args.epochs,
+        scheduler_name=getattr(args, "scheduler", "cosine"),
+        warmup_ratio=getattr(args, "warmup_ratio", 0.05),
+    )
 
 
 def build_teacher(model_name: str) -> TeacherModel:

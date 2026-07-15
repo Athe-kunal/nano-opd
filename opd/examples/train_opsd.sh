@@ -7,8 +7,18 @@ OPD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO_ROOT="$(cd "$OPD_DIR/.." && pwd)"
 BASE_DIR="${opd_BASE_DIR:-$REPO_ROOT/.opd}"
 
+CONFIG_YAML="${CONFIG_YAML:-$OPD_DIR/examples/opsd.yaml}"
+
+# Reads a single key out of $CONFIG_YAML.
+read_cfg() {
+  uv run --extra gpu --directory "$REPO_ROOT" python -c "
+from omegaconf import OmegaConf
+print(OmegaConf.load('$CONFIG_YAML')['$1'])
+"
+}
 # In OPSD the teacher is the FROZEN initial policy — same checkpoint as student.
-STUDENT_MODEL="${STUDENT_MODEL:-Qwen/Qwen3-1.7B}"
+STUDENT_MODEL="$(read_cfg student_model)"
+NUM_STEPS="$(read_cfg num_steps)"
 
 # GPU assignment (comma-separated physical GPU IDs)
 #   TRAIN_GPUS    – student FSDP training ranks (0..N-1)
@@ -26,34 +36,6 @@ WEIGHT_TRANSFER_BACKEND="${WEIGHT_TRANSFER_BACKEND:-nccl}"
 
 USE_WANDB="${USE_WANDB:-1}"
 
-NUM_STEPS="${NUM_STEPS:-100}"
-SAVE_EVERY="${SAVE_EVERY:-100}"
-TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-2}"
-EPOCHS="${EPOCHS:-1}"
-LR="${LR:-1e-5}"
-WEIGHT_DECAY="${WEIGHT_DECAY:-0.0}"
-MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
-PROMPTS_PER_STEP="${PROMPTS_PER_STEP:-1}"
-MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1536}"
-MAX_PROMPT_LEN="${MAX_PROMPT_LEN:-512}"
-MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-1536}"
-TEMPERATURE="${TEMPERATURE:-1.0}"
-DATASET_ID="${DATASET_ID:-siyanzhao/Openthoughts_math_30k_opsd}"
-DATASET_SPLIT="${DATASET_SPLIT:-train}"
-
-# Forward KL is the OPSD default (Table 3 of the paper).
-ALGORITHM="${ALGORITHM:-forward_kl}"
-DISTILL_TOP_K="${DISTILL_TOP_K:-100}"
-STUDENT_CHUNK_SIZE="${STUDENT_CHUNK_SIZE:--1}"
-TEACHER_CHUNK_SIZE="${TEACHER_CHUNK_SIZE:--1}"
-TIS_CLIP="${TIS_CLIP:-0.0}"
-KL_CLIP="${KL_CLIP:-0.05}"
-
-SCHEDULER="${SCHEDULER:-cosine}"
-WARMUP_RATIO="${WARMUP_RATIO:-0.05}"
-
-SEED="${SEED:-0}"
-
 # Post-training math evaluation (opd.eval.eval_math.run_eval).
 # Reuses the already-running, weight-synced rollout worker — no separate
 # vLLM engine, checkpoint loading, or LoRA needed.
@@ -68,15 +50,6 @@ EVAL_VAL_N="${EVAL_VAL_N:-6}"
 EVAL_WANDB_PROJECT="${EVAL_WANDB_PROJECT:-}"
 EVAL_WANDB_RUN_NAME="${EVAL_WANDB_RUN_NAME:-$TAG}"
 EVAL_STEP="${EVAL_STEP:-$NUM_STEPS}"
-
-# FSDP sharding strategy — choose one of:
-#   FULL_SHARD          params+grads+optimizer sharded; unshard around fwd/bwd
-#   SHARD_GRAD_OP       params sharded; keep unsharded after fwd until bwd done
-#   NO_SHARD            replicate everything (like DDP)
-#   HYBRID_SHARD        FULL_SHARD within a node, replicate across nodes
-#   _HYBRID_SHARD_ZERO2 SHARD_GRAD_OP within a node, replicate across nodes
-SHARDING_STRATEGY="${SHARDING_STRATEGY:-FULL_SHARD}"
-GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-0}"
 
 RUN_DIR="$BASE_DIR/opsd/$TAG"
 SAVE_DIR="$RUN_DIR/checkpoints"
@@ -159,12 +132,11 @@ mkdir -p "$RUN_DIR" "$SAVE_DIR"
 
 echo "[launcher] run tag         : $TAG"
 echo "[launcher] run dir         : $RUN_DIR"
+echo "[launcher] config          : $CONFIG_YAML"
 echo "[launcher] student model   : $STUDENT_MODEL  (teacher = frozen initial policy)"
 echo "[launcher] train GPUs      : $TRAIN_GPUS  ($TRAIN_NPROC student ranks)"
 echo "[launcher] teacher GPUs    : $TEACHER_GPUS  ($TEACHER_NPROC teacher rank)"
 echo "[launcher] rollout GPUs    : $ROLLOUT_GPUS  (tp=$ROLLOUT_TP)"
-echo "[launcher] algorithm       : $ALGORITHM"
-echo "[launcher] sharding        : $SHARDING_STRATEGY"
 
 # ---------------------------------------------------------------------------
 # Start vLLM rollout worker
@@ -193,59 +165,20 @@ curl -sf "$HEALTH_URL" | grep -q '"ok": *true' \
   || { echo "[launcher] rollout worker did not become healthy" >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
-# Build optional flags
-EXTRA_FLAGS=()
-if [[ "$GRADIENT_CHECKPOINTING" == "1" ]]; then
-  EXTRA_FLAGS+=(--gradient-checkpointing)
-fi
-if (( $(echo "$KL_CLIP > 0" | bc -l) )); then
-  EXTRA_FLAGS+=(--kl-clip "$KL_CLIP")
-fi
-if (( $(echo "$TIS_CLIP > 0" | bc -l) )); then
-  EXTRA_FLAGS+=(--tis-clip "$TIS_CLIP")
-fi
-
-# ---------------------------------------------------------------------------
 # Start student trainer + teacher
 echo "[launcher] starting OPSD trainer -> $TRAIN_LOG"
 CUDA_VISIBLE_DEVICES="$TRAIN_GPUS,$TEACHER_GPUS" \
   uv run --extra gpu --directory "$REPO_ROOT" torchrun --standalone --nproc_per_node="$TOTAL_NPROC" \
-    "$OPD_DIR/trainer/train_opsd.py" \
-    --student-model "$STUDENT_MODEL" \
-    --train-world-size "$TRAIN_NPROC" \
-    --dataset-id "$DATASET_ID" \
-    --dataset-split "$DATASET_SPLIT" \
-    --algorithm "$ALGORITHM" \
-    --distill-top-k "$DISTILL_TOP_K" \
-    --student-chunk-size "$STUDENT_CHUNK_SIZE" \
-    --teacher-chunk-size "$TEACHER_CHUNK_SIZE" \
-    --rollout-worker-url "http://$ROLLOUT_HOST:$ROLLOUT_PORT" \
-    --rollout-worker-world-size "$ROLLOUT_TP" \
-    --num-steps "$NUM_STEPS" \
-    --prompts-per-step "$PROMPTS_PER_STEP" \
-    --train-batch-size "$TRAIN_BATCH_SIZE" \
-    --epochs "$EPOCHS" \
-    --max-new-tokens "$MAX_NEW_TOKENS" \
-    --max-prompt-len "$MAX_PROMPT_LEN" \
-    --max-response-len "$MAX_RESPONSE_LEN" \
-    --temperature "$TEMPERATURE" \
-    --lr "$LR" \
-    --weight-decay "$WEIGHT_DECAY" \
-    --max-grad-norm "$MAX_GRAD_NORM" \
-    --scheduler "$SCHEDULER" \
-    --warmup-ratio "$WARMUP_RATIO" \
-    --sharding-strategy "$SHARDING_STRATEGY" \
-    --save-dir "$SAVE_DIR" \
-    --save-every "$SAVE_EVERY" \
-    --seed "$SEED" \
-    --run-name "$TAG" \
-    "${EXTRA_FLAGS[@]}" \
+    "$OPD_DIR/trainer/train_opsd.py" "$CONFIG_YAML" \
+    train_world_size="$TRAIN_NPROC" \
+    rollout_worker_url="http://$ROLLOUT_HOST:$ROLLOUT_PORT" \
+    rollout_worker_world_size="$ROLLOUT_TP" \
+    save_dir="$SAVE_DIR" \
+    run_name="$TAG" \
     2>&1 | tee "$TRAIN_LOG"
 
 # ---------------------------------------------------------------------------
-# Post-training evaluation with opd.eval.eval_math.run_eval — talks to the
-# still-running, weight-synced rollout worker over HTTP, so no separate vLLM
-# engine or checkpoint loading happens here.
+# Post-training evaluation with opd.eval.eval_math.run_eval.
 if [[ "$RUN_EVAL" == "1" && "$SKIP_EVAL" != "1" ]]; then
   echo "[launcher] running post-training eval on: $EVAL_DATASETS"
   uv run --extra gpu --directory "$REPO_ROOT" python - <<PYEOF 2>&1 | tee "$RUN_DIR/eval.log"

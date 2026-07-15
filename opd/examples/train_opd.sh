@@ -195,9 +195,7 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS,$TEACHER_GPUS" \
     2>&1 | tee "$TRAIN_LOG"
 
 # ---------------------------------------------------------------------------
-# Post-training evaluation with opd.eval.eval_math.run_eval — talks to the
-# still-running, weight-synced rollout worker over HTTP, so no separate vLLM
-# engine or checkpoint loading happens here.
+# Post-training evaluation with opd.eval.eval_math.run_eval.
 if [[ "$RUN_EVAL" == "1" && "$SKIP_EVAL" != "1" ]]; then
   echo "[launcher] running post-training eval on: $EVAL_DATASETS"
   uv run --extra gpu --directory "$REPO_ROOT" python - <<PYEOF 2>&1 | tee "$RUN_DIR/eval.log"

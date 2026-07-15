@@ -1,6 +1,5 @@
 """Self-Distillation Fine-Tuning (SDFT) training loop — EMA self-teacher, demonstration-conditioned."""
 
-import argparse
 import json
 import random
 import time
@@ -12,13 +11,13 @@ from opd.loss import ALGORITHMS
 from opd.trainer.logging_utils import finish_wandb, init_wandb, log_eval_metrics, should_use_wandb
 from opd.trainer.self_distillation_utils import self_distill_minibatch
 from opd.trainer.setup_utils import (
-    add_runtime_args,
     assert_prompts_divisible,
     build_student_from_args,
     build_teacher,
     compute_cleanup,
     generate_rollouts_for_prompts,
     init_distributed,
+    load_config,
     print0,
     print_run_banner,
     topk_selector_for,
@@ -113,7 +112,7 @@ def apply_token_skip_mask(compact_mask: torch.Tensor, num_skip: int) -> torch.Te
 def eval_pass_at_k(
     eval_dataset: list[dict],
     eval_size: int,
-    args,
+    cfg,
     student,
     grader,
     k: int = 4,
@@ -125,7 +124,7 @@ def eval_pass_at_k(
       pass@k  = fraction of questions with at least 1 correct rollout
       avg@k   = average fraction of correct rollouts per question
     """
-    rng = random.Random(args.seed)
+    rng = random.Random(cfg.seed)
     idxs = list(range(len(eval_dataset)))
     rng.shuffle(idxs)
     examples = [eval_dataset[i] for i in idxs[:eval_size]]
@@ -134,7 +133,7 @@ def eval_pass_at_k(
         [{"role": "user", "content": ex["question"]}], tokenize=False, add_generation_prompt=True,
     ) for ex in examples]
 
-    rollouts = generate_rollouts_for_prompts(args, prompts, num_samples=k)
+    rollouts = generate_rollouts_for_prompts(cfg, prompts, num_samples=k)
 
     pass_count = 0
     total_correct = 0
@@ -153,7 +152,7 @@ def eval_pass_at_k(
 # ---------------------------------------------------------------------------
 
 
-def build_sdft_dataset(args) -> list[SdftScienceEnv | SdftToolUseEnv]:
+def build_sdft_dataset(cfg) -> list[SdftScienceEnv | SdftToolUseEnv]:
     """Load the SDFT training dataset from a built-in source or a custom JSONL.
 
     Returns a list of env instances consumed by distributed_opd_loader, each
@@ -162,18 +161,18 @@ def build_sdft_dataset(args) -> list[SdftScienceEnv | SdftToolUseEnv]:
     in arbitrary JSONL files without changing code; --dataset still selects
     which env class (science vs. tooluse) wraps those records.
     """
-    env_cls = _ENV_CLS[args.dataset]
-    if args.dataset_path:
-        with open(args.dataset_path) as f:
+    env_cls = _ENV_CLS[cfg.dataset]
+    if cfg.dataset_path:
+        with open(cfg.dataset_path) as f:
             records = [json.loads(line) for line in f if line.strip()]
-    elif args.dataset == "science":
+    elif cfg.dataset == "science":
         records = load_sdft_science(split="train")
-    elif args.dataset == "tooluse":
+    elif cfg.dataset == "tooluse":
         records = load_sdft_tooluse(split="train")
     else:
-        raise ValueError(f"Unknown dataset: {args.dataset!r}")
-    if args.dataset_limit > 0:
-        records = records[: args.dataset_limit]
+        raise ValueError(f"Unknown dataset: {cfg.dataset!r}")
+    if cfg.dataset_limit > 0:
+        records = records[: cfg.dataset_limit]
     return [env_cls(question=r["question"], demonstration=r["demonstration"]) for r in records]
 
 
@@ -184,168 +183,9 @@ def build_sdft_dataset(args) -> list[SdftScienceEnv | SdftToolUseEnv]:
 if __name__ == "__main__":
 
     # -------------------------------------------------------------------------
-    # CLI
-    parser = argparse.ArgumentParser(
-        description="Self-Distillation Fine-Tuning (SDFT) — on-policy distillation "
-        "from a demonstration-conditioned self-teacher."
-    )
-    # Model
-    parser.add_argument(
-        "--student-model",
-        type=str,
-        required=True,
-        help="HuggingFace model ID or path. Used for both student and (EMA) teacher.",
-    )
-    parser.add_argument(
-        "--train-world-size",
-        type=int,
-        required=True,
-        help="Number of student (FSDP) ranks. The teacher occupies "
-        "rank train_world_size in the torchrun world.",
-    )
-    # Dataset — built-in sources pulled from the Self-Distillation GitHub repo,
-    # or a custom JSONL on disk.
-    parser.add_argument(
-        "--dataset",
-        type=str,
-        default="science",
-        choices=["science", "tooluse"],
-        help="Built-in dataset to pull from the Self-Distillation GitHub repo. "
-        "'science': science Q&A with worked demonstrations. "
-        "'tooluse': tool-use tasks with golden Action/Action_Input sequences.",
-    )
-    parser.add_argument(
-        "--dataset-path",
-        type=str,
-        default="",
-        help="Optional override: path to a custom JSONL, one record "
-        'per line {"question": ..., "demonstration": ...}. '
-        "Takes precedence over --dataset when set.",
-    )
-    parser.add_argument(
-        "--dataset-limit",
-        type=int,
-        default=0,
-        help="Cap the number of training examples (0 = use all).",
-    )
-    # Algorithm
-    parser.add_argument(
-        "--algorithm",
-        type=str,
-        default="reverse_kl",
-        choices=list(ALGORITHMS.keys()),
-        help="Distillation loss. SDFT paper uses reverse_kl.",
-    )
-    parser.add_argument(
-        "--distill-top-k",
-        type=int,
-        default=100,
-        help="Top-K vocab for KL distillation. Larger K is more faithful "
-        "but uses more memory and bandwidth. NOTE: the SDFT paper's "
-        "analytic per-token KL estimator sums over the FULL "
-        "vocabulary V; top-K is a nano-opd memory/bandwidth approximation, "
-        "not part of the paper. Raise K toward V to reduce the truncation bias.",
-    )
-    parser.add_argument("--student-chunk-size", type=int, default=-1)
-    parser.add_argument("--teacher-chunk-size", type=int, default=-1)
-    parser.add_argument(
-        "--tis-clip",
-        type=float,
-        default=0.0,
-        help="TIS importance-weight clip C (0 disables). Corrects for "
-        "log-prob gap between vLLM inference and training forward pass.",
-    )
-    # Loss masking — suppress 'Based on the text...' preamble artifacts
-    parser.add_argument(
-        "--num-loss-tokens-to-skip",
-        type=int,
-        default=5,
-        help="Mask the first N response tokens from the distillation loss. "
-        "SDFT paper (Section 5, 'Learned Artifacts') masks 'the first few "
-        "tokens' to suppress preamble artifacts (e.g. 'Based on the text...') "
-        "the student mimics from the demonstration-conditioned teacher; the "
-        "paper does not give an exact count, so N=5 is a nano-opd default.",
-    )
-    # Generation
-    parser.add_argument("--max-new-tokens", type=int, default=1024)
-    parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--top-k", type=int, default=50)
-    parser.add_argument(
-        "--rollout-worker-url", type=str, default="http://127.0.0.1:8047"
-    )
-    parser.add_argument("--rollout-worker-world-size", type=int, default=1)
-    # Training
-    parser.add_argument("--lr", type=float, default=1e-5)
-    parser.add_argument("--weight-decay", type=float, default=0.0)
-    parser.add_argument("--max-grad-norm", type=float, default=1.0)
-    parser.add_argument("--num-steps", type=int, default=200)
-    parser.add_argument(
-        "--prompts-per-step",
-        type=int,
-        default=8,
-        help="Number of distinct (question, demonstration) pairs per step. "
-        "Unlike SDPO, there is no num-samples multiplier: each pair "
-        "produces exactly one on-policy rollout.",
-    )
-    parser.add_argument("--train-batch-size", type=int, default=4)
-    parser.add_argument(
-        "--grad-accum-steps",
-        type=int,
-        default=1,
-        help="Gradient accumulation steps. Each minibatch is split into this many "
-        "micro batches; gradients accumulate before a single optimizer step. "
-        "Effective batch size = train-batch-size * grad-accum-steps.",
-    )
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        default=1,
-        help="Optimizer steps taken on the SAME rollout batch before collecting "
-        "new rollouts (PPO-style inner reuse). WARNING: this is NOT the same "
-        "as the SDFT paper's 'epochs' (Tables 3/4: 2 for Skill Learning, 4 for "
-        "Knowledge Acquisition), which are full passes over the dataset that "
-        "RE-ROLL fresh on-policy trajectories each pass. epochs>1 here reuses "
-        "stale rollouts and is mildly off-policy (--tis-clip partially corrects "
-        "it). To replicate the paper's epochs, raise --num-steps instead.",
-    )
-    parser.add_argument("--max-prompt-len", type=int, default=512)
-    parser.add_argument("--max-response-len", type=int, default=1536)
-    parser.add_argument("--sharding-strategy", type=str, default="FULL_SHARD")
-    parser.add_argument("--gradient-checkpointing", action="store_true")
-    # Teacher sync
-    parser.add_argument(
-        "--sync-method",
-        type=str,
-        default="ema",
-        choices=list(SYNC_METHODS.keys()),
-        help="How the EMA teacher tracks the student. SDFT paper uses EMA "
-        "(alpha in {0.01, 0.02, 0.05} per Table 3).",
-    )
-    parser.add_argument(
-        "--ema-alpha",
-        type=float,
-        default=0.02,
-        help="[ema] teacher ← α·student + (1−α)·teacher. "
-        "Small α → stable but lagging teacher. "
-        "SDFT paper sweeps {0.01, 0.02, 0.05}.",
-    )
-    parser.add_argument(
-        "--trust-region-beta",
-        type=float,
-        default=0.05,
-        help="[trust_region] teacher ← β·student + (1−β)·initial_weights.",
-    )
-    parser.add_argument(
-        "--hard-sync-every-n",
-        type=int,
-        default=100,
-        help="[hard_sync] Full copy every N optimizer steps.",
-    )
-    # Runtime
-    add_runtime_args(parser, default_save_dir="sdft_checkpoints")
-    parser.add_argument("--eval-every", type=int, default=0, help="Pass@k eval on held-out split every N steps (0 = disabled).")
-    parser.add_argument("--eval-k", type=int, default=4, help="Number of rollouts per question for pass@k evaluation.")
-    args = parser.parse_args()
+    # Config — see opd/examples/sdft.yaml for the full set of hyperparameters
+    # (grouped and commented) and `load_config`'s docstring for CLI override syntax.
+    cfg = load_config(default_config_path="opd/examples/sdft.yaml")
 
     use_wandb = should_use_wandb()
 
@@ -353,75 +193,75 @@ if __name__ == "__main__":
     # Distributed init — same rank split as OPD/SDPO:
     #   ranks 0..train_world_size-1  →  student (FSDP)
     #   rank  train_world_size       →  teacher (plain nn.Module, EMA of student)
-    ctx = init_distributed(args.device_type, args.train_world_size)
+    ctx = init_distributed(cfg.device_type, cfg.train_world_size)
 
     print0(
-        f"Model: {args.student_model}  (student = teacher, synced via {args.sync_method})"
+        f"Model: {cfg.student_model}  (student = teacher, synced via {cfg.sync_method})"
     )
-    print_run_banner(ctx, args)
-    print0(f"Loss token skip: {args.num_loss_tokens_to_skip}")
+    print_run_banner(ctx, cfg)
+    print0(f"Loss token skip: {cfg.num_loss_tokens_to_skip}")
 
     init_wandb(
-        args.run_name, ctx.master_process, use_wandb,
+        cfg.run_name, ctx.master_process, use_wandb,
         config={
-            "student_model": args.student_model,
-            "algorithm": args.algorithm,
-            "distill_top_k": args.distill_top_k,
-            "sync_method": args.sync_method,
-            "ema_alpha": args.ema_alpha,
-            "lr": args.lr,
-            "num_steps": args.num_steps,
-            "prompts_per_step": args.prompts_per_step,
-            "train_batch_size": args.train_batch_size,
-            "epochs": args.epochs,
-            "max_new_tokens": args.max_new_tokens,
-            "temperature": args.temperature,
-            "num_loss_tokens_to_skip": args.num_loss_tokens_to_skip,
+            "student_model": cfg.student_model,
+            "algorithm": cfg.algorithm,
+            "distill_top_k": cfg.distill_top_k,
+            "sync_method": cfg.sync_method,
+            "ema_alpha": cfg.ema_alpha,
+            "lr": cfg.lr,
+            "num_steps": cfg.num_steps,
+            "prompts_per_step": cfg.prompts_per_step,
+            "train_batch_size": cfg.train_batch_size,
+            "epochs": cfg.epochs,
+            "max_new_tokens": cfg.max_new_tokens,
+            "temperature": cfg.temperature,
+            "num_loss_tokens_to_skip": cfg.num_loss_tokens_to_skip,
         },
     )
 
-    assert_prompts_divisible(args.prompts_per_step, ctx.train_world_size)
+    assert_prompts_divisible(cfg.prompts_per_step, ctx.train_world_size)
 
     # -------------------------------------------------------------------------
     # Model setup
     if ctx.is_student:
-        student = build_student_from_args(args, ctx)
+        student = build_student_from_args(cfg, ctx)
 
     if ctx.is_teacher:
         # Same checkpoint as the student; weights will be EMA-synced after each step.
-        teacher = build_teacher(args.student_model)
+        teacher = build_teacher(cfg.student_model)
 
     # -------------------------------------------------------------------------
     # Teacher syncer
     syncer_kwargs: dict = {}
-    if args.sync_method == "ema":
-        syncer_kwargs["alpha"] = args.ema_alpha
-    elif args.sync_method == "trust_region":
+    if cfg.sync_method == "ema":
+        syncer_kwargs["alpha"] = cfg.ema_alpha
+    elif cfg.sync_method == "trust_region":
         if ctx.is_teacher:
             syncer_kwargs["initial_params"] = [
                 p.data.clone() for p in teacher.model.parameters()
             ]
         else:
             syncer_kwargs["initial_params"] = []
-        syncer_kwargs["beta"] = args.trust_region_beta
-    elif args.sync_method == "hard_sync":
-        syncer_kwargs["sync_every_n_steps"] = args.hard_sync_every_n
+        syncer_kwargs["beta"] = cfg.trust_region_beta
+    elif cfg.sync_method == "hard_sync":
+        syncer_kwargs["sync_every_n_steps"] = cfg.hard_sync_every_n
 
-    syncer = build_syncer(args.sync_method, **syncer_kwargs)
+    syncer = build_syncer(cfg.sync_method, **syncer_kwargs)
 
     # -------------------------------------------------------------------------
     # Loss function and top-K selection
     # SDFT uses reverse KL by default: KL(π_student || π_teacher).
     # For reverse KL, the student selects the top-K indices (the student-weighted
     # sum means we only need tokens where the student has mass).
-    loss_fn = ALGORITHMS[args.algorithm]
-    select_topk_by: Literal["student", "teacher"] = topk_selector_for(args.algorithm)
-    top_k = args.distill_top_k
+    loss_fn = ALGORITHMS[cfg.algorithm]
+    select_topk_by: Literal["student", "teacher"] = topk_selector_for(cfg.algorithm)
+    top_k = cfg.distill_top_k
 
     # -------------------------------------------------------------------------
     # vLLM weight-transfer setup + trainer construction
     trainer = build_trainer(
-        args, ctx,
+        cfg, ctx,
         student if ctx.is_student else None, teacher if ctx.is_teacher else None,
         use_wandb,
     )
@@ -431,13 +271,13 @@ if __name__ == "__main__":
     eval_dataset: list[dict] = []
     grader = None
     if ctx.is_student:
-        dataset = build_sdft_dataset(args)
-        if args.eval_every > 0:
+        dataset = build_sdft_dataset(cfg)
+        if cfg.eval_every > 0:
             # Custom JSONL datasets (--dataset-path) have no held-out eval split.
-            eval_dataset = [] if args.dataset_path else _EVAL_LOADERS[args.dataset]()
-            grader = _GRADERS[args.dataset]
+            eval_dataset = [] if cfg.dataset_path else _EVAL_LOADERS[cfg.dataset]()
+            grader = _GRADERS[cfg.dataset]
         loader = distributed_opd_loader(
-            dataset, args.prompts_per_step, ctx.train_world_size, ctx.ddp_rank, seed=args.seed
+            dataset, cfg.prompts_per_step, ctx.train_world_size, ctx.ddp_rank, seed=cfg.seed
         )
         loader_iter = iter(loader)
 
@@ -447,7 +287,7 @@ if __name__ == "__main__":
         # How many minibatches are in this accumulation window? The last
         # window may be smaller than G if n_mb % G != 0 — same adaptive-window
         # divisor SDPO uses, so a short final window isn't under-weighted.
-        G = args.grad_accum_steps
+        G = cfg.grad_accum_steps
         window_start = (mb.mb_idx // G) * G
         window_size = min(window_start + G, mb.n_mb) - window_start
 
@@ -455,15 +295,15 @@ if __name__ == "__main__":
             mb, acc,
             ctx=ctx, student=student if ctx.is_student else None, teacher=teacher if ctx.is_teacher else None,
             select_topk_by=select_topk_by, top_k=top_k,
-            student_chunk_size=args.student_chunk_size, teacher_chunk_size=args.teacher_chunk_size,
-            loss_fn=loss_fn, is_pg=args.algorithm == "mopd_pg_loss",
-            tis_clip=args.tis_clip, divisor=window_size,
-            mask_fn=lambda m: apply_token_skip_mask(m, args.num_loss_tokens_to_skip),
+            student_chunk_size=cfg.student_chunk_size, teacher_chunk_size=cfg.teacher_chunk_size,
+            loss_fn=loss_fn, is_pg=cfg.algorithm == "mopd_pg_loss",
+            tis_clip=cfg.tis_clip, divisor=window_size,
+            mask_fn=lambda m: apply_token_skip_mask(m, cfg.num_loss_tokens_to_skip),
         )
 
     # -------------------------------------------------------------------------
     # Training loop
-    for step in range(args.num_steps):
+    for step in range(cfg.num_steps):
         t0 = time.time()
 
         # -- Rollout generation (student ranks only) --
@@ -482,7 +322,7 @@ if __name__ == "__main__":
             ]
 
             # SDFT: single on-policy trajectory per prompt
-            rollouts = generate_rollouts_for_prompts(args, prompts, num_samples=1)
+            rollouts = generate_rollouts_for_prompts(cfg, prompts, num_samples=1)
 
             # Attach demonstration-conditioned teacher prompt to each rollout.
             # The teacher sees: question + worked demonstration → richer context
@@ -511,15 +351,15 @@ if __name__ == "__main__":
         trainer.step(
             step, t0, batch, teacher_batch, do_minibatch,
             has_teacher_batch=True,
-            accum_steps=args.grad_accum_steps,
+            accum_steps=cfg.grad_accum_steps,
             syncer=syncer,
             teacher_sync_scope="epoch",
         )
 
         # -- Pass@k eval (master rank only) --
-        if args.eval_every > 0 and (step + 1) % args.eval_every == 0 and ctx.master_process and eval_dataset:
-            k = args.eval_k
-            pass_at_k, avg_at_k = eval_pass_at_k(eval_dataset, len(eval_dataset), args, student, grader, k=k)
+        if cfg.eval_every > 0 and (step + 1) % cfg.eval_every == 0 and ctx.master_process and eval_dataset:
+            k = cfg.eval_k
+            pass_at_k, avg_at_k = eval_pass_at_k(eval_dataset, len(eval_dataset), cfg, student, grader, k=k)
             print0(f"[eval step={step+1}] pass@{k}={pass_at_k:.3f} avg@{k}={avg_at_k:.3f} (n={len(eval_dataset)})")
             log_eval_metrics(
                 {f"eval/pass_at_{k}": pass_at_k, f"eval/avg_at_{k}": avg_at_k},

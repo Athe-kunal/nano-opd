@@ -1,0 +1,65 @@
+# Config for opd/trainer/train_opd.py — On-Policy Distillation with a
+# separate frozen teacher.
+#
+# Usage:
+#   python opd/trainer/train_opd.py opd/examples/opd.yaml
+#   python opd/trainer/train_opd.py opd/examples/opd.yaml lr=1e-5 num_steps=50
+#
+# `???` = must be overridden (here or via `key=value` CLI override).
+
+# -----------------------------------------------------------------------
+# Model
+student_model: Qwen/Qwen2.5-1.5B-Instruct
+teacher_model: open-thoughts/OpenThinker3-7B
+# Number of student (FSDP) ranks. Teacher ranks occupy the remaining ranks
+# in the torchrun world. Hardware-dependent; supplied by the launcher script.
+train_world_size: ???
+
+# -----------------------------------------------------------------------
+# Algorithm
+# One of: reverse_kl, forward_kl, jsd, mopd_loss, mopd_pg_loss
+algorithm: reverse_kl
+distill_top_k: 100  # Top-K vocab for KL distillation
+# Chunk size along T for {student,teacher} logits in top-K computation
+# (-1 = no chunking). Start with chunking only if you hit OOM errors.
+student_chunk_size: -1
+teacher_chunk_size: -1
+tis_clip: 0.0  # TIS importance-weight clip C (0 disables)
+
+# -----------------------------------------------------------------------
+# Generation
+num_samples: 4  # Completions per prompt
+max_new_tokens: 256
+temperature: 1.0
+top_k: 50  # vLLM sampling top-k
+rollout_worker_url: http://127.0.0.1:8047
+rollout_worker_world_size: 1
+
+# -----------------------------------------------------------------------
+# Training
+lr: 1e-6
+weight_decay: 0.0
+max_grad_norm: 1.0
+num_steps: 200
+prompts_per_step: 8
+# Sequences per gradient accumulation step. Optimizer updates after all
+# prompts_per_step * num_samples sequences are processed.
+train_batch_size: 4
+epochs: 1  # Optimizer steps per rollout batch
+max_prompt_len: 512
+max_response_len: 1536
+sharding_strategy: FULL_SHARD
+gradient_checkpointing: false
+
+# -----------------------------------------------------------------------
+# Runtime
+device_type: ""
+run_name: dummy
+save_dir: opd_checkpoints
+save_every: 0
+seed: 0
+eval_every: 0  # Eval on AIME every N steps (0=disabled)
+eval_k: 4  # Number of samples per problem for pass@k eval
+eval_max_tokens: 4096
+# One of: livecodebench, sciknoweval, dapo_math
+dataset: dapo_math

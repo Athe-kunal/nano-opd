@@ -8,8 +8,19 @@ OPD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO_ROOT="$(cd "$OPD_DIR/.." && pwd)"
 BASE_DIR="${opd_BASE_DIR:-$REPO_ROOT/.opd}"
 
-STUDENT_MODEL="${STUDENT_MODEL:-Qwen/Qwen2.5-1.5B-Instruct}"
-TEACHER_MODEL="${TEACHER_MODEL:-open-thoughts/OpenThinker3-7B}"
+CONFIG_YAML="${CONFIG_YAML:-$OPD_DIR/examples/opd.yaml}"
+
+# Reads a single key out of $CONFIG_YAML.
+read_cfg() {
+  uv run --extra gpu --directory "$REPO_ROOT" python -c "
+from omegaconf import OmegaConf
+print(OmegaConf.load('$CONFIG_YAML')['$1'])
+"
+}
+STUDENT_MODEL="$(read_cfg student_model)"
+TEACHER_MODEL="$(read_cfg teacher_model)"
+DATASET="$(read_cfg dataset)"
+NUM_STEPS="$(read_cfg num_steps)"
 
 # GPU assignment (comma-separated physical GPU IDs)
 #   TRAIN_GPUS must not overlap ROLLOUT_GPUS or TEACHER_GPUS (enforced below).
@@ -27,24 +38,6 @@ ROLLOUT_GPU_MEM_UTIL="${ROLLOUT_GPU_MEM_UTIL:-0.5}"
 WEIGHT_TRANSFER_BACKEND="${WEIGHT_TRANSFER_BACKEND:-nccl}"
 
 USE_WANDB="${USE_WANDB:-0}"
-
-NUM_STEPS="${NUM_STEPS:-200}"
-SAVE_EVERY="${SAVE_EVERY:-100}"
-TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-2}"
-LR="${LR:-5e-5}"
-PROMPTS_PER_STEP="${PROMPTS_PER_STEP:-16}"
-NUM_SAMPLES="${NUM_SAMPLES:-4}"
-MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-8192}"
-MAX_PROMPT_LEN="${MAX_PROMPT_LEN:-2048}"
-MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-8192}"
-DATASET="${DATASET:-dapo_math}"
-ALGORITHM="${ALGORITHM:-mopd_pg_loss}"
-DISTILL_TOP_K="${DISTILL_TOP_K:-100}"
-STUDENT_CHUNK_SIZE="${STUDENT_CHUNK_SIZE:--1}"
-TEACHER_CHUNK_SIZE="${TEACHER_CHUNK_SIZE:--1}"
-EVAL_EVERY="${EVAL_EVERY:-20}"
-EVAL_K="${EVAL_K:-4}"
-EVAL_MAX_TOKENS="${EVAL_MAX_TOKENS:-4096}"
 
 # Post-training math evaluation (opd.eval.eval_math.run_eval).
 # Reuses the already-running, weight-synced rollout worker — no separate
@@ -65,14 +58,6 @@ EVAL_VAL_N="${EVAL_VAL_N:-6}"
 EVAL_WANDB_PROJECT="${EVAL_WANDB_PROJECT:-}"
 EVAL_WANDB_RUN_NAME="${EVAL_WANDB_RUN_NAME:-$TAG}"
 EVAL_STEP="${EVAL_STEP:-$NUM_STEPS}"
-
-# FSDP sharding strategy — choose one of:
-#   FULL_SHARD          params+grads+optimizer sharded; unshard around fwd/bwd
-#   SHARD_GRAD_OP       params sharded; keep unsharded after fwd until bwd done
-#   NO_SHARD            replicate everything (like DDP)
-#   HYBRID_SHARD        FULL_SHARD within a node, replicate across nodes
-#   _HYBRID_SHARD_ZERO2 SHARD_GRAD_OP within a node, replicate across nodes
-SHARDING_STRATEGY="${SHARDING_STRATEGY:-NO_SHARD}"
 
 RUN_DIR="$BASE_DIR/opd/$TAG"
 SAVE_DIR="$RUN_DIR/checkpoints"
@@ -158,13 +143,12 @@ mkdir -p "$RUN_DIR" "$SAVE_DIR"
 
 echo "[launcher] run tag         : $TAG"
 echo "[launcher] run dir         : $RUN_DIR"
+echo "[launcher] config          : $CONFIG_YAML"
 echo "[launcher] student model   : $STUDENT_MODEL"
 echo "[launcher] teacher model   : $TEACHER_MODEL"
 echo "[launcher] train GPUs      : $TRAIN_GPUS  ($TRAIN_NPROC student ranks)"
 echo "[launcher] teacher GPUs    : $TEACHER_GPUS  ($TEACHER_NPROC teacher ranks)"
 echo "[launcher] rollout GPUs    : $ROLLOUT_GPUS  (tp=$ROLLOUT_TP)"
-echo "[launcher] algorithm       : $ALGORITHM"
-echo "[launcher] sharding        : $SHARDING_STRATEGY"
 
 # ---------------------------------------------------------------------------
 # Start vLLM rollout worker
@@ -202,32 +186,12 @@ curl -sf "$HEALTH_URL" | grep -q '"ok": *true' \
 echo "[launcher] starting trainer -> $TRAIN_LOG"
 CUDA_VISIBLE_DEVICES="$TRAIN_GPUS,$TEACHER_GPUS" \
   uv run --extra gpu --directory "$REPO_ROOT" torchrun --standalone --nproc_per_node="$TOTAL_NPROC" \
-    "$OPD_DIR/trainer/train_opd.py" \
-    --student-model "$STUDENT_MODEL" \
-    --teacher-model "$TEACHER_MODEL" \
-    --train-world-size "$TRAIN_NPROC" \
-    --dataset "$DATASET" \
-    --algorithm "$ALGORITHM" \
-    --distill-top-k "$DISTILL_TOP_K" \
-    --student-chunk-size "$STUDENT_CHUNK_SIZE" \
-    --teacher-chunk-size "$TEACHER_CHUNK_SIZE" \
-    --rollout-worker-url "http://$ROLLOUT_HOST:$ROLLOUT_PORT" \
-    --rollout-worker-world-size "$ROLLOUT_TP" \
-    --num-steps "$NUM_STEPS" \
-    --prompts-per-step "$PROMPTS_PER_STEP" \
-    --num-samples "$NUM_SAMPLES" \
-    --train-batch-size "$TRAIN_BATCH_SIZE" \
-    --max-new-tokens "$MAX_NEW_TOKENS" \
-    --max-prompt-len "$MAX_PROMPT_LEN" \
-    --max-response-len "$MAX_RESPONSE_LEN" \
-    --lr "$LR" \
-    --sharding-strategy "$SHARDING_STRATEGY" \
-    --save-dir "$SAVE_DIR" \
-    --save-every "$SAVE_EVERY" \
-    --eval-every "$EVAL_EVERY" \
-    --eval-k "$EVAL_K" \
-    --eval-max-tokens "$EVAL_MAX_TOKENS" \
-    --run-name "$TAG" \
+    "$OPD_DIR/trainer/train_opd.py" "$CONFIG_YAML" \
+    train_world_size="$TRAIN_NPROC" \
+    rollout_worker_url="http://$ROLLOUT_HOST:$ROLLOUT_PORT" \
+    rollout_worker_world_size="$ROLLOUT_TP" \
+    save_dir="$SAVE_DIR" \
+    run_name="$TAG" \
     2>&1 | tee "$TRAIN_LOG"
 
 # ---------------------------------------------------------------------------

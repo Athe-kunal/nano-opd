@@ -1,4 +1,3 @@
-import argparse
 import time
 from typing import Literal
 
@@ -6,13 +5,13 @@ from opd.loss import ALGORITHMS
 from opd.trainer.logging_utils import finish_wandb, init_wandb, should_use_wandb
 from opd.trainer.self_distillation_utils import self_distill_minibatch
 from opd.trainer.setup_utils import (
-    add_runtime_args,
     assert_prompts_divisible,
     build_student_from_args,
     build_teacher,
     compute_cleanup,
     generate_rollouts_for_prompts,
     init_distributed,
+    load_config,
     print0,
     print_run_banner,
     topk_selector_for,
@@ -67,131 +66,65 @@ def _build_teacher_messages(
 
 if __name__ == "__main__":
 
-    parser = argparse.ArgumentParser(
-        description="On-Policy Self-Distillation (OPSD) — a single LLM acts as "
-                    "both student (sees problem only) and teacher (sees problem + "
-                    "reference solution). The teacher is the frozen initial policy."
-    )
-    # Model — student and teacher start from the same checkpoint; teacher is frozen
-    parser.add_argument("--student-model", type=str, required=True,
-                        help="HuggingFace model ID or path. Used for both student "
-                             "(updated) and teacher (frozen initial policy).")
-    parser.add_argument("--train-world-size", type=int, required=True,
-                        help="Number of student (FSDP) ranks. The teacher occupies "
-                             "rank train_world_size in the torchrun world.")
-    # Dataset — siyanzhao/Openthoughts_math_30k_opsd (hardcoded)
-    parser.add_argument("--dataset-id", type=str,
-                        default="siyanzhao/Openthoughts_math_30k_opsd",
-                        help="HuggingFace dataset ID for OPSD training.")
-    parser.add_argument("--dataset-split", type=str, default="train",
-                        help="HuggingFace split to load.")
-    # Algorithm
-    parser.add_argument("--algorithm", type=str, default="forward_kl",
-                        choices=list(ALGORITHMS.keys()),
-                        help="Distillation loss. OPSD paper (Table 3) finds forward KL "
-                             "KL(p_T || p_S) consistently outperforms reverse KL and JSD.")
-    parser.add_argument("--distill-top-k", type=int, default=100,
-                        help="Top-K vocab for KL distillation. Larger K is more faithful "
-                             "but uses more memory and bandwidth.")
-    parser.add_argument("--student-chunk-size", type=int, default=-1)
-    parser.add_argument("--teacher-chunk-size", type=int, default=-1)
-    parser.add_argument("--tis-clip", type=float, default=0.0,
-                        help="TIS importance-weight clip C (0 disables). Corrects for "
-                             "log-prob gap between vLLM inference and training forward pass.")
-    parser.add_argument("--kl-clip", type=float, default=0.0,
-                        help="Per-token pointwise KL clip τ (0 disables). Clips each "
-                             "token's divergence contribution to prevent stylistic tokens "
-                             "from dominating the gradient signal (OPSD paper Section 3.2 "
-                             "and Figure 4). Strongly recommended — the paper shows this "
-                             "prevents performance collapse on Qwen3-1.7B.")
-    # Generation
-    parser.add_argument("--max-new-tokens", type=int, default=1024)
-    parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--top-k", type=int, default=50)
-    parser.add_argument("--rollout-worker-url", type=str, default="http://127.0.0.1:8047")
-    parser.add_argument("--rollout-worker-world-size", type=int, default=1)
-    # Training
-    parser.add_argument("--lr", type=float, default=1e-5)
-    parser.add_argument("--weight-decay", type=float, default=0.0)
-    parser.add_argument("--max-grad-norm", type=float, default=1.0)
-    parser.add_argument("--num-steps", type=int, default=100,
-                        help="OPSD paper converges within 100 gradient update steps.")
-    parser.add_argument("--prompts-per-step", type=int, default=8,
-                        help="Number of distinct (problem, solution) pairs per step. "
-                             "Each pair produces exactly one on-policy rollout (num_samples=1).")
-    parser.add_argument("--train-batch-size", type=int, default=4)
-    parser.add_argument("--epochs", type=int, default=1,
-                        help="Optimizer steps per rollout batch before collecting new rollouts.")
-    parser.add_argument("--max-prompt-len", type=int, default=512,
-                        help="Hard cap on prompt tokens. Raises if exceeded.")
-    parser.add_argument("--max-response-len", type=int, default=1536,
-                        help="Cap on response tokens. Truncates silently if exceeded.")
-    parser.add_argument("--sharding-strategy", type=str, default="FULL_SHARD")
-    parser.add_argument("--gradient-checkpointing", action="store_true")
-    parser.add_argument("--scheduler", type=str, default="cosine",
-                        choices=["cosine", "linear", "constant"],
-                        help="LR scheduler. 'constant' disables warmup/decay entirely.")
-    parser.add_argument("--warmup-ratio", type=float, default=0.05,
-                        help="Fraction of total steps used for LR warmup.")
-    # Runtime
-    add_runtime_args(parser, default_save_dir="opsd_checkpoints")
-    args = parser.parse_args()
+    # Config — see opd/examples/opsd.yaml for the full set of hyperparameters
+    # (grouped and commented) and `load_config`'s docstring for CLI override syntax.
+    cfg = load_config(default_config_path="opd/examples/opsd.yaml")
 
     use_wandb = should_use_wandb()
 
     # Distributed init — same rank split as OPD/SDFT:
     #   ranks 0..train_world_size-1  →  student (FSDP, updated by optimizer)
     #   rank  train_world_size       →  teacher (plain nn.Module, frozen initial policy)
-    ctx = init_distributed(args.device_type, args.train_world_size)
+    ctx = init_distributed(cfg.device_type, cfg.train_world_size)
 
-    print0(f"Model: {args.student_model}  (teacher = frozen initial policy)")
-    print_run_banner(ctx, args)
-    if args.kl_clip > 0.0:
-        print0(f"Per-token KL clip: {args.kl_clip}")
+    print0(f"Model: {cfg.student_model}  (teacher = frozen initial policy)")
+    print_run_banner(ctx, cfg)
+    if cfg.kl_clip > 0.0:
+        print0(f"Per-token KL clip: {cfg.kl_clip}")
 
     init_wandb(
-        args.run_name, ctx.master_process, use_wandb,
+        cfg.run_name, ctx.master_process, use_wandb,
         config={
-            "student_model": args.student_model,
-            "algorithm": args.algorithm,
-            "distill_top_k": args.distill_top_k,
-            "kl_clip": args.kl_clip,
-            "lr": args.lr,
-            "num_steps": args.num_steps,
-            "prompts_per_step": args.prompts_per_step,
-            "train_batch_size": args.train_batch_size,
-            "epochs": args.epochs,
-            "max_new_tokens": args.max_new_tokens,
-            "temperature": args.temperature,
+            "student_model": cfg.student_model,
+            "algorithm": cfg.algorithm,
+            "distill_top_k": cfg.distill_top_k,
+            "kl_clip": cfg.kl_clip,
+            "lr": cfg.lr,
+            "num_steps": cfg.num_steps,
+            "prompts_per_step": cfg.prompts_per_step,
+            "train_batch_size": cfg.train_batch_size,
+            "epochs": cfg.epochs,
+            "max_new_tokens": cfg.max_new_tokens,
+            "temperature": cfg.temperature,
         },
     )
 
-    assert_prompts_divisible(args.prompts_per_step, ctx.train_world_size)
+    assert_prompts_divisible(cfg.prompts_per_step, ctx.train_world_size)
 
     # -------------------------------------------------------------------------
     # Model setup
     if ctx.is_student:
-        student = build_student_from_args(args, ctx)
+        student = build_student_from_args(cfg, ctx)
 
     if ctx.is_teacher:
-        teacher = build_teacher(args.student_model)
-        print(f"[teacher] Loaded initial policy from {args.student_model} (frozen)", flush=True)
+        teacher = build_teacher(cfg.student_model)
+        print(f"[teacher] Loaded initial policy from {cfg.student_model} (frozen)", flush=True)
 
 
-    loss_fn = ALGORITHMS[args.algorithm]
-    select_topk_by: Literal["student", "teacher"] = topk_selector_for(args.algorithm)
-    top_k = args.distill_top_k
+    loss_fn = ALGORITHMS[cfg.algorithm]
+    select_topk_by: Literal["student", "teacher"] = topk_selector_for(cfg.algorithm)
+    top_k = cfg.distill_top_k
 
     trainer = build_trainer(
-        args, ctx,
+        cfg, ctx,
         student if ctx.is_student else None, teacher if ctx.is_teacher else None,
         use_wandb,
     )
 
     if ctx.is_student:
-        dataset     = OPSDMathEnv.load(split=args.dataset_split, dataset_id=args.dataset_id)
+        dataset     = OPSDMathEnv.load(split=cfg.dataset_split, dataset_id=cfg.dataset_id)
         loader      = distributed_opd_loader(
-            dataset, args.prompts_per_step, ctx.train_world_size, ctx.ddp_rank, seed=args.seed
+            dataset, cfg.prompts_per_step, ctx.train_world_size, ctx.ddp_rank, seed=cfg.seed
         )
         loader_iter = iter(loader)
 
@@ -205,14 +138,14 @@ if __name__ == "__main__":
             mb, acc,
             ctx=ctx, student=student if ctx.is_student else None, teacher=teacher if ctx.is_teacher else None,
             select_topk_by=select_topk_by, top_k=top_k,
-            student_chunk_size=args.student_chunk_size, teacher_chunk_size=args.teacher_chunk_size,
-            loss_fn=loss_fn, is_pg=args.algorithm == "mopd_pg_loss",
-            tis_clip=args.tis_clip, divisor=mb.n_mb,
-            kl_clip=args.kl_clip if args.kl_clip > 0.0 else None,
+            student_chunk_size=cfg.student_chunk_size, teacher_chunk_size=cfg.teacher_chunk_size,
+            loss_fn=loss_fn, is_pg=cfg.algorithm == "mopd_pg_loss",
+            tis_clip=cfg.tis_clip, divisor=mb.n_mb,
+            kl_clip=cfg.kl_clip if cfg.kl_clip > 0.0 else None,
         )
 
     # Training loop — all ranks iterate together
-    for step in range(args.num_steps):
+    for step in range(cfg.num_steps):
         t0 = time.time()
 
         # -- Rollout generation (student ranks only) --
@@ -231,7 +164,7 @@ if __name__ == "__main__":
             ]
 
             # OPSD: single on-policy trajectory per prompt
-            rollouts = generate_rollouts_for_prompts(args, prompts, num_samples=1)
+            rollouts = generate_rollouts_for_prompts(cfg, prompts, num_samples=1)
 
             # Attach reference-conditioned teacher prompt to each rollout.
             # The teacher sees: problem + ground-truth solution y* → richer

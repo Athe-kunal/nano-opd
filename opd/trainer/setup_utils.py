@@ -1,12 +1,12 @@
-import argparse
 import math
 import os
+import sys
 from typing import Any, Literal
 
 import torch
 import torch.distributed as dist
 from loguru import logger
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf
 
 from opd.fsdp.model import StudentModel, TeacherModel
 from opd.generator.rollout import generate_rollouts_remote, remote_vllm_init_weight_transfer, wait_for_rollout_worker
@@ -31,20 +31,34 @@ def print_run_banner(ctx: DistributedContext, args: Any) -> None:
     print0(f"Device: {ctx.device}  Student ranks: {ctx.train_world_size}  Total world: {ctx.ddp_world_size}")
 
 
-def add_runtime_args(parser: argparse.ArgumentParser, default_save_dir: str) -> None:
-    """Registers the runtime flags shared by all four training scripts.
+def load_config(default_config_path: str) -> DictConfig:
+    """Loads a training run's config from YAML, with optional CLI overrides.
+
+    Usage: `python train_opd.py [path/to/config.yaml] [key=value ...]`
+
+    If the first CLI argument doesn't contain "=", it's treated as a config
+    path and used instead of `default_config_path`; every remaining argument
+    must be an OmegaConf dotlist override (e.g. `lr=1e-5 num_steps=50`),
+    layered on top of the YAML so a launcher script can tweak individual
+    hyperparameters without editing the file.
 
     Args:
-        parser: The script's argparse parser, already populated with its
-          algorithm-specific flags.
-        default_save_dir: Per-script default for `--save-dir` (the only one
-          of these flags whose default differs between scripts).
+        default_config_path: Config YAML used when no path is given on the
+          command line.
+
+    Returns:
+        The merged config as an OmegaConf DictConfig (attribute access works
+        the same as `argparse.Namespace`, e.g. `cfg.student_model`).
     """
-    parser.add_argument("--device-type", type=str, default="")
-    parser.add_argument("--run-name", type=str, default="dummy")
-    parser.add_argument("--save-dir", type=str, default=default_save_dir)
-    parser.add_argument("--save-every", type=int, default=0)
-    parser.add_argument("--seed", type=int, default=0)
+    argv = sys.argv[1:]
+    if argv and "=" not in argv[0]:
+        config_path, overrides = argv[0], argv[1:]
+    else:
+        config_path, overrides = default_config_path, argv
+    cfg = OmegaConf.load(config_path)
+    if overrides:
+        cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(overrides))
+    return cfg
 
 
 def generate_rollouts_for_prompts(args: Any, prompts: list[str], num_samples: int) -> list[dict[str, Any]]:

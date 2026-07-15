@@ -1,0 +1,79 @@
+# Config for opd/trainer/train_opsd.py — On-Policy Self-Distillation (OPSD).
+# A single LLM acts as both student (sees problem only) and teacher (sees
+# problem + reference solution). The teacher is the frozen initial policy.
+#
+# Usage:
+#   python opd/trainer/train_opsd.py opd/examples/opsd.yaml
+#   python opd/trainer/train_opsd.py opd/examples/opsd.yaml lr=1e-5 num_steps=50
+#
+# `???` = must be overridden (here or via `key=value` CLI override).
+
+# -----------------------------------------------------------------------
+# Model — student and teacher start from the same checkpoint; teacher is frozen.
+# HuggingFace model ID or path. Used for both student (updated) and teacher
+# (frozen initial policy).
+student_model: Qwen/Qwen3-1.7B
+# Number of student (FSDP) ranks. The teacher occupies rank
+# train_world_size in the torchrun world. Hardware-dependent; supplied by
+# the launcher script.
+train_world_size: ???
+
+# -----------------------------------------------------------------------
+# Dataset — HuggingFace dataset ID/split for OPSD training.
+dataset_id: siyanzhao/Openthoughts_math_30k_opsd
+dataset_split: train
+
+# -----------------------------------------------------------------------
+# Algorithm
+# Distillation loss. OPSD paper (Table 3) finds forward KL KL(p_T || p_S)
+# consistently outperforms reverse KL and JSD.
+algorithm: forward_kl
+# Top-K vocab for KL distillation. Larger K is more faithful but uses more
+# memory and bandwidth.
+distill_top_k: 100
+student_chunk_size: -1
+teacher_chunk_size: -1
+# TIS importance-weight clip C (0 disables). Corrects for log-prob gap
+# between vLLM inference and training forward pass.
+tis_clip: 0.0
+# Per-token pointwise KL clip tau (0 disables). Clips each token's
+# divergence contribution to prevent stylistic tokens from dominating the
+# gradient signal (OPSD paper Section 3.2 and Figure 4). Strongly
+# recommended — the paper shows this prevents performance collapse on
+# Qwen3-1.7B.
+kl_clip: 0.0
+
+# -----------------------------------------------------------------------
+# Generation
+max_new_tokens: 1024
+temperature: 1.0
+top_k: 50
+rollout_worker_url: http://127.0.0.1:8047
+rollout_worker_world_size: 1
+
+# -----------------------------------------------------------------------
+# Training
+lr: 1e-5
+weight_decay: 0.0
+max_grad_norm: 1.0
+num_steps: 100  # OPSD paper converges within 100 gradient update steps.
+# Number of distinct (problem, solution) pairs per step. Each pair produces
+# exactly one on-policy rollout (num_samples=1).
+prompts_per_step: 8
+train_batch_size: 4
+epochs: 1  # Optimizer steps per rollout batch before collecting new rollouts.
+max_prompt_len: 512  # Hard cap on prompt tokens. Raises if exceeded.
+max_response_len: 1536  # Cap on response tokens. Truncates silently if exceeded.
+sharding_strategy: FULL_SHARD
+gradient_checkpointing: false
+# LR scheduler. 'constant' disables warmup/decay entirely.
+scheduler: cosine  # One of: cosine, linear, constant
+warmup_ratio: 0.05  # Fraction of total steps used for LR warmup.
+
+# -----------------------------------------------------------------------
+# Runtime
+device_type: ""
+run_name: dummy
+save_dir: opsd_checkpoints
+save_every: 0
+seed: 0

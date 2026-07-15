@@ -7,8 +7,19 @@ OPD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO_ROOT="$(cd "$OPD_DIR/.." && pwd)"
 BASE_DIR="${opd_BASE_DIR:-$REPO_ROOT/.opd}"
 
-# In SDPO the teacher IS the student — only one model checkpoint needed.
-STUDENT_MODEL="${STUDENT_MODEL:-Qwen/Qwen2.5-1.5B-Instruct}"
+CONFIG_YAML="${CONFIG_YAML:-$OPD_DIR/examples/sdpo.yaml}"
+
+# Reads a single key out of $CONFIG_YAML.
+read_cfg() {
+  uv run --extra gpu --directory "$REPO_ROOT" python -c "
+from omegaconf import OmegaConf
+print(OmegaConf.load('$CONFIG_YAML')['$1'])
+"
+}
+# In SDPO the teacher IS the student (EMA copy) — only one checkpoint needed.
+STUDENT_MODEL="$(read_cfg student_model)"
+DATASET="$(read_cfg dataset)"
+NUM_STEPS="$(read_cfg num_steps)"
 
 # GPU assignment (comma-separated physical GPU IDs)
 #   TRAIN_GPUS    – student FSDP training ranks (0..N-1)
@@ -25,47 +36,6 @@ ROLLOUT_GPU_MEM_UTIL="${ROLLOUT_GPU_MEM_UTIL:-0.5}"
 WEIGHT_TRANSFER_BACKEND="${WEIGHT_TRANSFER_BACKEND:-nccl}"
 
 USE_WANDB="${USE_WANDB:-1}"
-
-NUM_STEPS="${NUM_STEPS:-100}"
-SAVE_EVERY="${SAVE_EVERY:-100}"
-TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-2}"
-GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-1}"
-EPOCHS="${EPOCHS:-1}"
-LR="${LR:-5e-7}"
-WEIGHT_DECAY="${WEIGHT_DECAY:-0.0}"
-MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
-PROMPTS_PER_STEP="${PROMPTS_PER_STEP:-16}"
-NUM_SAMPLES="${NUM_SAMPLES:-4}"
-MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-8192}"
-MAX_PROMPT_LEN="${MAX_PROMPT_LEN:-8192}"
-MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-15872}"
-TEMPERATURE="${TEMPERATURE:-1.0}"
-DATASET="${DATASET:-sciknoweval}"
-
-# JSD is the SDPO default (symmetric, bounded in [0, log2], more stable than pure KL).
-ALGORITHM="${ALGORITHM:-jsd}"
-DISTILL_TOP_K="${DISTILL_TOP_K:-100}"
-STUDENT_CHUNK_SIZE="${STUDENT_CHUNK_SIZE:--1}"
-TEACHER_CHUNK_SIZE="${TEACHER_CHUNK_SIZE:--1}"
-TIS_CLIP="${TIS_CLIP:-0.0}"
-
-# Teacher sync — controls how the self-teacher tracks the student after each step.
-#   ema          : teacher ← α·student + (1−α)·teacher  (smooth, recommended)
-#   trust_region : teacher ← β·student + (1−β)·initial_weights  (anchored to init)
-#   hard_sync    : full copy every N steps (DQN-style, less smooth)
-#   on_policy    : teacher = live student (ablation only, can diverge)
-SYNC_METHOD="${SYNC_METHOD:-ema}"
-EMA_ALPHA="${EMA_ALPHA:-0.05}"
-TRUST_REGION_BETA="${TRUST_REGION_BETA:-0.05}"
-HARD_SYNC_EVERY_N="${HARD_SYNC_EVERY_N:-5}"
-
-EVAL_EVERY="${EVAL_EVERY:-20}"
-EVAL_K="${EVAL_K:-4}"
-EVAL_MAX_TOKENS="${EVAL_MAX_TOKENS:-4096}"
-SCIKNOWEVAL_TEST_SIZE="${SCIKNOWEVAL_TEST_SIZE:-0.01}"  # fraction held out for eval (sciknoweval only)
-SCHEDULER="${SCHEDULER:-cosine}"
-WARMUP_RATIO="${WARMUP_RATIO:-0.05}"
-SEED="${SEED:-0}"
 
 # Post-training math evaluation (opd.eval.eval_math.run_eval).
 # Reuses the already-running, weight-synced rollout worker — no separate
@@ -86,15 +56,6 @@ EVAL_VAL_N="${EVAL_VAL_N:-6}"
 EVAL_WANDB_PROJECT="${EVAL_WANDB_PROJECT:-}"
 EVAL_WANDB_RUN_NAME="${EVAL_WANDB_RUN_NAME:-$TAG}"
 EVAL_STEP="${EVAL_STEP:-$NUM_STEPS}"
-
-# FSDP sharding strategy — choose one of:
-#   FULL_SHARD          params+grads+optimizer sharded; unshard around fwd/bwd
-#   SHARD_GRAD_OP       params sharded; keep unsharded after fwd until bwd done
-#   NO_SHARD            replicate everything (like DDP)
-#   HYBRID_SHARD        FULL_SHARD within a node, replicate across nodes
-#   _HYBRID_SHARD_ZERO2 SHARD_GRAD_OP within a node, replicate across nodes
-SHARDING_STRATEGY="${SHARDING_STRATEGY:-NO_SHARD}"
-GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-0}"
 
 RUN_DIR="$BASE_DIR/sdpo/$TAG"
 SAVE_DIR="$RUN_DIR/checkpoints"
@@ -177,13 +138,11 @@ mkdir -p "$RUN_DIR" "$SAVE_DIR"
 
 echo "[launcher] run tag         : $TAG"
 echo "[launcher] run dir         : $RUN_DIR"
+echo "[launcher] config          : $CONFIG_YAML"
 echo "[launcher] student model   : $STUDENT_MODEL  (teacher = EMA of student, same checkpoint)"
 echo "[launcher] train GPUs      : $TRAIN_GPUS  ($TRAIN_NPROC student ranks)"
 echo "[launcher] teacher GPUs    : $TEACHER_GPUS  ($TEACHER_NPROC teacher rank)"
 echo "[launcher] rollout GPUs    : $ROLLOUT_GPUS  (tp=$ROLLOUT_TP)"
-echo "[launcher] algorithm       : $ALGORITHM"
-echo "[launcher] sync method     : $SYNC_METHOD  (ema_alpha=$EMA_ALPHA  tr_beta=$TRUST_REGION_BETA  hard_n=$HARD_SYNC_EVERY_N)"
-echo "[launcher] sharding        : $SHARDING_STRATEGY"
 
 # ---------------------------------------------------------------------------
 # Start vLLM rollout worker (initialized with the student checkpoint)
@@ -212,59 +171,18 @@ curl -sf "$HEALTH_URL" | grep -q '"ok": *true' \
   || { echo "[launcher] rollout worker did not become healthy" >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
-# Build optional flags
-EXTRA_FLAGS=()
-if [[ "$GRADIENT_CHECKPOINTING" == "1" ]]; then
-  EXTRA_FLAGS+=(--gradient-checkpointing)
-fi
-
-# ---------------------------------------------------------------------------
 # Start student trainer + teacher
 # torchrun world: ranks 0..(TRAIN_NPROC-1) = student FSDP, rank TRAIN_NPROC = teacher.
 # CUDA_VISIBLE_DEVICES maps logical indices to physical GPUs in order.
 echo "[launcher] starting SDPO trainer -> $TRAIN_LOG"
 CUDA_VISIBLE_DEVICES="$TRAIN_GPUS,$TEACHER_GPUS" \
   uv run --extra gpu --directory "$REPO_ROOT" torchrun --standalone --nproc_per_node="$TOTAL_NPROC" \
-    "$OPD_DIR/trainer/train_sdpo.py" \
-    --student-model "$STUDENT_MODEL" \
-    --train-world-size "$TRAIN_NPROC" \
-    --dataset "$DATASET" \
-    --algorithm "$ALGORITHM" \
-    --distill-top-k "$DISTILL_TOP_K" \
-    --student-chunk-size "$STUDENT_CHUNK_SIZE" \
-    --teacher-chunk-size "$TEACHER_CHUNK_SIZE" \
-    --tis-clip "$TIS_CLIP" \
-    --rollout-worker-url "http://$ROLLOUT_HOST:$ROLLOUT_PORT" \
-    --rollout-worker-world-size "$ROLLOUT_TP" \
-    --num-steps "$NUM_STEPS" \
-    --prompts-per-step "$PROMPTS_PER_STEP" \
-    --num-samples "$NUM_SAMPLES" \
-    --train-batch-size "$TRAIN_BATCH_SIZE" \
-    --grad-accum-steps "$GRAD_ACCUM_STEPS" \
-    --epochs "$EPOCHS" \
-    --max-new-tokens "$MAX_NEW_TOKENS" \
-    --max-prompt-len "$MAX_PROMPT_LEN" \
-    --max-response-len "$MAX_RESPONSE_LEN" \
-    --temperature "$TEMPERATURE" \
-    --lr "$LR" \
-    --weight-decay "$WEIGHT_DECAY" \
-    --max-grad-norm "$MAX_GRAD_NORM" \
-    --sync-method "$SYNC_METHOD" \
-    --ema-alpha "$EMA_ALPHA" \
-    --trust-region-beta "$TRUST_REGION_BETA" \
-    --hard-sync-every-n "$HARD_SYNC_EVERY_N" \
-    --scheduler "$SCHEDULER" \
-    --warmup-ratio "$WARMUP_RATIO" \
-    --sharding-strategy "$SHARDING_STRATEGY" \
-    --save-dir "$SAVE_DIR" \
-    --save-every "$SAVE_EVERY" \
-    --eval-every "$EVAL_EVERY" \
-    --eval-k "$EVAL_K" \
-    --eval-max-tokens "$EVAL_MAX_TOKENS" \
-    --sciknoweval-test-size "$SCIKNOWEVAL_TEST_SIZE" \
-    --seed "$SEED" \
-    --run-name "$TAG" \
-    "${EXTRA_FLAGS[@]}" \
+    "$OPD_DIR/trainer/train_sdpo.py" "$CONFIG_YAML" \
+    train_world_size="$TRAIN_NPROC" \
+    rollout_worker_url="http://$ROLLOUT_HOST:$ROLLOUT_PORT" \
+    rollout_worker_world_size="$ROLLOUT_TP" \
+    save_dir="$SAVE_DIR" \
+    run_name="$TAG" \
     2>&1 | tee "$TRAIN_LOG"
 
 # ---------------------------------------------------------------------------

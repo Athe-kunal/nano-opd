@@ -12,22 +12,41 @@ The DAPO exporter writes JSONL rows that match the `Example` type used by the tr
 python -m opd.envs.dapo -o datasets/dapo_math.jsonl
 ```
 
-## Main parameters in `train.sh`
+## Training scripts and config
 
-The script takes an optional **run tag** as the first argument (default: `default`). Artifacts go under `NANOCHAT_BASE_DIR` (default: `.opd` under the repo), in `opd/<tag>/` (logs, checkpoints).
+Each algorithm has a launcher under `opd/examples/`: `train_opd.sh`, `train_sdpo.sh`, `train_opsd.sh`, `train_sdft.sh`. Every launcher takes an optional **run tag** as its first argument (default: `default`). Artifacts go under `opd_BASE_DIR` (default: `.opd` under the repo), in `<algorithm>/<tag>/` (logs, checkpoints).
 
-### Models
+**All hyperparameters — model names, algorithm, learning rate, batch sizes, eval cadence, teacher-sync settings, and so on — live in a YAML file**, not in the shell script or as environment variables. Each launcher has a matching config:
 
-- **`STUDENT_MODEL`** / **`TEACHER_MODEL`** — Hugging Face IDs (or paths) for the small student and the teacher used for distillation.
+| Launcher | Config |
+|---|---|
+| `opd/examples/train_opd.sh` | `opd/examples/opd.yaml` |
+| `opd/examples/train_sdpo.sh` | `opd/examples/sdpo.yaml` |
+| `opd/examples/train_opsd.sh` | `opd/examples/opsd.yaml` |
+| `opd/examples/train_sdft.sh` | `opd/examples/sdft.yaml` |
+
+To change a hyperparameter, edit the YAML directly. To point a launcher at a different config file, set `CONFIG_YAML`:
+
+```bash
+CONFIG_YAML=/path/to/my_opd.yaml bash opd/examples/train_opd.sh my_run
+```
+
+Values in the YAML marked `???` (e.g. `train_world_size`) must be overridden — either in the file or via a `key=value` override — before the trainer will run. `train_world_size` is left `???` deliberately: it's hardware-dependent and the launcher scripts always supply it, computed from the GPU list you pass in (see below).
+
+You can also invoke a training script directly, without a launcher, passing the config path and any overrides as trailing `key=value` args:
+
+```bash
+python opd/trainer/train_opd.py opd/examples/opd.yaml train_world_size=1 lr=1e-5 num_steps=50
+```
 
 ### GPUs
 
-Comma-separated physical IDs. **`TRAIN_GPUS` must not overlap** with **`ROLLOUT_GPUS`** or **`TEACHER_GPUS`** (the launcher checks this). **`ROLLOUT_GPUS`** and **`TEACHER_GPUS`** **may reuse the same IDs** if you want to **colocate** the vLLM rollout worker and the teacher on the same GPUs; give them disjoint IDs if you want those roles on separate devices.
+The one thing the YAML doesn't hold is GPU placement — it's deployment-specific, so it stays as environment variables on the launcher. Comma-separated physical IDs. **`TRAIN_GPUS` must not overlap** with **`ROLLOUT_GPUS`** or **`TEACHER_GPUS`** (the launcher checks this). **`ROLLOUT_GPUS`** and **`TEACHER_GPUS`** **may reuse the same IDs** if you want to **colocate** the vLLM rollout worker and the teacher on the same GPUs; give them disjoint IDs if you want those roles on separate devices.
 
 Example (student on GPU 3; teacher and rollouts both on GPU 2):
 
 ```bash
-ROLLOUT_GPUS=2 TRAIN_GPUS=3 TEACHER_GPUS=2 bash opd/train.sh
+ROLLOUT_GPUS=2 TRAIN_GPUS=3 TEACHER_GPUS=2 bash opd/examples/train_opd.sh
 ```
 
 - **`ROLLOUT_GPUS`** — GPUs for the vLLM rollout worker (student sampling). Multiple IDs set tensor-parallel size for rollout.
@@ -40,20 +59,19 @@ ROLLOUT_GPUS=2 TRAIN_GPUS=3 TEACHER_GPUS=2 bash opd/train.sh
 - **`ROLLOUT_GPU_MEM_UTIL`** — vLLM GPU memory fraction.
 - **`WEIGHT_TRANSFER_BACKEND`** — Backend for weight sync to the worker (e.g. `nccl`).
 
-### Training loop and batching
+### Training loop, batching, and objective (in the YAML)
 
-- **`NUM_STEPS`** — Optimization steps.
-- **`PROMPTS_PER_STEP`** — How many prompts to roll out per step (on-policy data volume).
-- **`NUM_SAMPLES`** — Samples per prompt (for variance / ranking in the objective).
-- **`TRAIN_BATCH_SIZE`** — Per-step training microbatch behavior (as wired into `trrain_opd.py`).
-- **`LR`** — Learning rate.
+- **`num_steps`** — Optimization steps.
+- **`prompts_per_step`** — How many prompts to roll out per step (on-policy data volume).
+- **`num_samples`** — Samples per prompt (OPD/SDPO only; OPSD/SDFT roll out one trajectory per prompt).
+- **`train_batch_size`** — Sequences per gradient-accumulation microbatch.
+- **`lr`** — Learning rate.
+- **`max_new_tokens`** — Generation cap for rollouts.
+- **`max_prompt_len`** / **`max_response_len`** — Truncation ceilings for training sequences.
+- **`algorithm`** — Distillation loss variant (`reverse_kl`, `forward_kl`, `jsd`, `mopd_loss`, `mopd_pg_loss`; default differs per script).
+- **`distill_top_k`** — Top-K vocab used when matching the teacher distribution.
 
-### Sequence and objective
-
-- **`MAX_NEW_TOKENS`** — Generation cap for rollouts.
-- **`MAX_SEQ_LEN`** — Truncation / packing ceiling for training sequences.
-- **`ALGORITHM`** — Distillation loss variant (default: `reverse_kl`).
-- **`DISTILL_TOP_K`** — Top-k used when matching teacher distribution (semantics follow `trrain_opd.py`).
+See the comments in each `opd/examples/*.yaml` for the full list — every field is documented inline, grouped by Model / Algorithm / Generation / Training / Runtime.
 
 ### Distillation health metrics (logged to W&B)
 
@@ -63,23 +81,23 @@ Three token-level metrics are logged under `metrics/` each step:
 - **`overlap_token_advantage`** — within the shared tokens, measures whether the student's probability mass matches the teacher's. A value near zero means good calibration; negative means the student is overconfident relative to the teacher.
 - **`entropy_gap`** — absolute difference in entropy between teacher and student distributions at each token position. A narrowing gap means the student is matching the teacher's confidence level. A persistent gap means the student has collapsed to sharper modes than the teacher.
 
-### Checkpointing and eval
+### Checkpointing and eval (in the YAML)
 
-- **`SAVE_EVERY`** — Checkpoint frequency.
-- **`EVAL_EVERY`** / **`EVAL_K`** / **`EVAL_MAX_TOKENS`** — How often to run eval and generation limits for eval.
+- **`save_every`** — Checkpoint frequency.
+- **`eval_every`** / **`eval_k`** / **`eval_max_tokens`** — How often to run eval and generation limits for eval.
 
-### FSDP
+### FSDP (in the YAML)
 
-- **`SHARDING_STRATEGY`** — FSDP sharding mode (e.g. `FULL_SHARD`).
+- **`sharding_strategy`** — FSDP sharding mode (e.g. `FULL_SHARD`).
 
-### Chunking (optional)
+### Chunking (optional, in the YAML)
 
-- **`STUDENT_CHUNK_SIZE`** / **`TEACHER_CHUNK_SIZE`** — Chunk sizes for long-sequence handling; `-1` typically means “don’t chunk” (see how `trrain_opd.py` interprets them).
+- **`student_chunk_size`** / **`teacher_chunk_size`** — Chunk sizes for long-sequence handling; `-1` means "don't chunk." Only needed if you hit OOM errors.
 
 ### Running
 
-Override variables as environment variables when invoking the script, for example:
+Edit the YAML for hyperparameters; use GPU environment variables for placement, for example:
 
 ```bash
-STUDENT_MODEL=... TRAIN_GPUS=0,1 bash opd/train.sh my_run
+TRAIN_GPUS=0,1 bash opd/examples/train_opd.sh my_run
 ```

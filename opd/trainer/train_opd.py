@@ -14,6 +14,7 @@ from opd.trainer.distillation_utils import (
 from opd.trainer.models import MopdPGExchange, TopKExchange
 from opd.trainer.logging_utils import finish_wandb, init_wandb, should_use_wandb
 from opd.trainer.setup_utils import (
+    accum_window_size,
     assert_prompts_divisible,
     build_student_from_args,
     build_teacher,
@@ -67,6 +68,7 @@ if __name__ == "__main__":
             "num_steps": cfg.num_steps,
             "prompts_per_step": cfg.prompts_per_step,
             "train_batch_size": cfg.train_batch_size,
+            "grad_accum_steps": cfg.grad_accum_steps,
             "epochs": cfg.epochs,
             "num_samples": cfg.num_samples,
             "max_new_tokens": cfg.max_new_tokens,
@@ -142,7 +144,7 @@ if __name__ == "__main__":
     def _mopd_pg_minibatch(
         mb: MinibatchTensors, acc: StepAccumulator,
         student_logits: torch.Tensor | None, teacher_logits: torch.Tensor | None,
-        B: int, T: int,
+        B: int, T: int, divisor: int,
     ) -> None:
         """MOPD policy-gradient step (mopd_pg_loss): sampled-token-only exchange.
 
@@ -176,7 +178,7 @@ if __name__ == "__main__":
         )
         loss = mopd_pg_loss_and_backward(
             student=student, pg=pg, loss_fn=loss_fn,
-            tis_weights=tis_weights, divisor=mb.n_mb,
+            tis_weights=tis_weights, divisor=divisor,
         )
         acc.add_loss(loss)
 
@@ -189,7 +191,7 @@ if __name__ == "__main__":
     def _topk_kl_minibatch(
         mb: MinibatchTensors, acc: StepAccumulator,
         student_logits: torch.Tensor | None, teacher_logits: torch.Tensor | None,
-        B: int, T: int,
+        B: int, T: int, divisor: int,
     ) -> None:
         """Shared step for the top-K KL family: reverse_kl, forward_kl, jsd, mopd_loss.
 
@@ -206,7 +208,7 @@ if __name__ == "__main__":
 
         loss = topk_kl_loss_and_backward(
             student=student, student_logits=student_logits, topk=topk, loss_fn=loss_fn,
-            response_mask=shift_mask, tis_weights=tis_weights, divisor=mb.n_mb,
+            response_mask=shift_mask, tis_weights=tis_weights, divisor=divisor,
             student_chunk_size=cfg.student_chunk_size,
         )
         acc.add_loss(loss)
@@ -223,10 +225,12 @@ if __name__ == "__main__":
         student_logits = student.get_logits(mb.mb_ids, mb.mb_attn)[:, :-1] if ctx.is_student else None
         teacher_logits = teacher.get_logits(mb.mb_ids, mb.mb_attn)[:, :-1] if ctx.is_teacher else None
 
+        divisor = accum_window_size(mb, cfg.grad_accum_steps)
+
         if cfg.algorithm == "mopd_pg_loss":
-            _mopd_pg_minibatch(mb, acc, student_logits, teacher_logits, B, T)
+            _mopd_pg_minibatch(mb, acc, student_logits, teacher_logits, B, T, divisor)
         else:
-            _topk_kl_minibatch(mb, acc, student_logits, teacher_logits, B, T)
+            _topk_kl_minibatch(mb, acc, student_logits, teacher_logits, B, T, divisor)
 
     for step in range(cfg.num_steps):
         t0 = time.time()
@@ -243,7 +247,10 @@ if __name__ == "__main__":
 
         batch, teacher_batch = trainer.prepare_batches(rollouts, has_teacher_batch=False)
 
-        trainer.step(step, t0, batch, teacher_batch, do_minibatch, has_teacher_batch=False)
+        trainer.step(
+            step, t0, batch, teacher_batch, do_minibatch,
+            has_teacher_batch=False, accum_steps=cfg.grad_accum_steps,
+        )
 
         trainer.barrier()
 

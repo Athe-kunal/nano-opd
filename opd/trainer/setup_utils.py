@@ -10,7 +10,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from opd.fsdp.model import StudentModel, TeacherModel
 from opd.generator.rollout import generate_rollouts_remote, remote_vllm_init_weight_transfer, wait_for_rollout_worker
-from opd.trainer.models import DistributedContext
+from opd.trainer.models import DistributedContext, MinibatchTensors
 from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
 
 
@@ -264,6 +264,27 @@ def assert_prompts_divisible(prompts_per_step: int, train_world_size: int) -> No
         f"prompts_per_step ({prompts_per_step}) must be divisible by "
         f"train_world_size ({train_world_size})"
     )
+
+
+def accum_window_size(mb: MinibatchTensors, grad_accum_steps: int | None) -> int:
+    """Size of `mb`'s gradient-accumulation window, for scaling its loss contribution.
+
+    `grad_accum_steps` of `None` means one window spanning the whole batch —
+    matching `Trainer.step`'s own `accum_steps=None` default (one optimizer
+    step per batch). Otherwise windows are `grad_accum_steps` minibatches
+    wide; the last window in a batch may be smaller if
+    `n_mb % grad_accum_steps != 0`.
+
+    Args:
+        mb: The current minibatch (`mb.mb_idx`, `mb.n_mb`).
+        grad_accum_steps: Value of the `grad_accum_steps` config field.
+
+    Returns:
+        Number of minibatches in `mb`'s window — the loss divisor.
+    """
+    G = mb.n_mb if grad_accum_steps is None else grad_accum_steps
+    window_start = (mb.mb_idx // G) * G
+    return min(window_start + G, mb.n_mb) - window_start
 
 
 def topk_selector_for(algorithm: str) -> Literal["student", "teacher"]:

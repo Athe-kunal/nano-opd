@@ -60,7 +60,10 @@ num_steps: 100  # OPSD paper converges within 100 gradient update steps.
 # Number of distinct (problem, solution) pairs per step. Each pair produces
 # exactly one on-policy rollout (num_samples=1).
 prompts_per_step: 8
-train_batch_size: 4
+train_batch_size: 4  # Sequences per gradient-accumulation microbatch.
+# Optimizer step every N minibatches. null = one step per full rollout batch
+# (accumulate everything). Effective batch size = train_batch_size * grad_accum_steps.
+grad_accum_steps: null
 epochs: 1  # Optimizer steps per rollout batch before collecting new rollouts.
 max_prompt_len: 512  # Hard cap on prompt tokens. Raises if exceeded.
 max_response_len: 1536  # Cap on response tokens. Truncates silently if exceeded.

@@ -9,6 +9,7 @@ from opd.loss import ALGORITHMS
 from opd.trainer.logging_utils import finish_wandb, init_wandb, should_use_wandb
 from opd.trainer.self_distillation_utils import self_distill_minibatch
 from opd.trainer.setup_utils import (
+    accum_window_size,
     assert_prompts_divisible,
     build_student_from_args,
     build_teacher,
@@ -176,9 +177,7 @@ if __name__ == "__main__":
     # where the teacher had no augmented context (teacher == student prompt,
     # so the KL signal is meaningless there).
     def do_minibatch(mb: MinibatchTensors, acc: StepAccumulator) -> None:
-        G = cfg.grad_accum_steps
-        window_start = (mb.mb_idx // G) * G
-        window_size = min(window_start + G, mb.n_mb) - window_start
+        window_size = accum_window_size(mb, cfg.grad_accum_steps)
 
         self_distill_minibatch(
             mb, acc,

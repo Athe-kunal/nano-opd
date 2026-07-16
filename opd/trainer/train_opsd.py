@@ -5,6 +5,7 @@ from opd.loss import ALGORITHMS
 from opd.trainer.logging_utils import finish_wandb, init_wandb, should_use_wandb
 from opd.trainer.self_distillation_utils import self_distill_minibatch
 from opd.trainer.setup_utils import (
+    accum_window_size,
     assert_prompts_divisible,
     build_student_from_args,
     build_teacher,
@@ -93,6 +94,7 @@ if __name__ == "__main__":
             "num_steps": cfg.num_steps,
             "prompts_per_step": cfg.prompts_per_step,
             "train_batch_size": cfg.train_batch_size,
+            "grad_accum_steps": cfg.grad_accum_steps,
             "epochs": cfg.epochs,
             "max_new_tokens": cfg.max_new_tokens,
             "temperature": cfg.temperature,
@@ -130,6 +132,8 @@ if __name__ == "__main__":
 
 
     def do_minibatch(mb: MinibatchTensors, acc: StepAccumulator) -> None:
+        window_size = accum_window_size(mb, cfg.grad_accum_steps)
+
         # Per-token pointwise KL clipping. Stylistic
         # tokens can exhibit much higher KL than math tokens, dominating the
         # gradient signal. Clipping each token's divergence contribution to τ
@@ -140,7 +144,7 @@ if __name__ == "__main__":
             select_topk_by=select_topk_by, top_k=top_k,
             student_chunk_size=cfg.student_chunk_size, teacher_chunk_size=cfg.teacher_chunk_size,
             loss_fn=loss_fn, is_pg=cfg.algorithm == "mopd_pg_loss",
-            tis_clip=cfg.tis_clip, divisor=mb.n_mb,
+            tis_clip=cfg.tis_clip, divisor=window_size,
             kl_clip=cfg.kl_clip if cfg.kl_clip > 0.0 else None,
         )
 
@@ -189,7 +193,10 @@ if __name__ == "__main__":
 
         batch, teacher_batch = trainer.prepare_batches(rollouts, has_teacher_batch=True)
 
-        trainer.step(step, t0, batch, teacher_batch, do_minibatch, has_teacher_batch=True)
+        trainer.step(
+            step, t0, batch, teacher_batch, do_minibatch,
+            has_teacher_batch=True, accum_steps=cfg.grad_accum_steps,
+        )
 
         trainer.barrier()
 

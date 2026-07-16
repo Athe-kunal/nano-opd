@@ -41,8 +41,8 @@ max_grad_norm: 1.0
 num_steps: 200
 prompts_per_step: 8
 train_batch_size: 4
-# Optimizer step every N minibatches. Effective batch size =
-# train_batch_size * grad_accum_steps.
+# Optimizer step every N minibatches. null = one step per full rollout batch
+# (accumulate everything). Effective batch size = train_batch_size * grad_accum_steps.
 grad_accum_steps: 1
 epochs: 1
 max_prompt_len: 512  # Hard cap on prompt tokens. Raises if exceeded.

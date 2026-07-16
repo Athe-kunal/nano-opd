@@ -73,6 +73,7 @@ prompts_per_step: 8
 train_batch_size: 4
 # Gradient accumulation steps. Each minibatch is split into this many
 # micro batches; gradients accumulate before a single optimizer step.
+# null = one step per full rollout batch (accumulate everything).
 # Effective batch size = train_batch_size * grad_accum_steps.
 grad_accum_steps: 1
 # Optimizer steps taken on the SAME rollout batch before collecting new

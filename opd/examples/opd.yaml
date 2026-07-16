@@ -22,8 +22,8 @@ algorithm: reverse_kl
 distill_top_k: 100  # Top-K vocab for KL distillation
 # Chunk size along T for {student,teacher} logits in top-K computation
 # (-1 = no chunking). Start with chunking only if you hit OOM errors.
-student_chunk_size: -1
-teacher_chunk_size: -1
+student_chunk_size: 128
+teacher_chunk_size: 128
 tis_clip: 0.0  # TIS importance-weight clip C (0 disables)
 
 # -----------------------------------------------------------------------
@@ -42,14 +42,15 @@ weight_decay: 0.0
 max_grad_norm: 1.0
 num_steps: 200
 prompts_per_step: 8
-# Sequences per gradient accumulation step. Optimizer updates after all
-# prompts_per_step * num_samples sequences are processed.
-train_batch_size: 4
+train_batch_size: 4  # Sequences per gradient-accumulation microbatch.
+# Optimizer step every N minibatches. null = one step per full rollout batch
+# (accumulate everything). Effective batch size = train_batch_size * grad_accum_steps.
+grad_accum_steps: null
 epochs: 1  # Optimizer steps per rollout batch
 max_prompt_len: 512
 max_response_len: 8192
 sharding_strategy: FULL_SHARD
-gradient_checkpointing: false
+gradient_checkpointing: true
 
 # -----------------------------------------------------------------------
 # Runtime

@@ -11,6 +11,7 @@ from opd.loss import ALGORITHMS
 from opd.trainer.logging_utils import finish_wandb, init_wandb, log_eval_metrics, should_use_wandb
 from opd.trainer.self_distillation_utils import self_distill_minibatch
 from opd.trainer.setup_utils import (
+    accum_window_size,
     assert_prompts_divisible,
     build_student_from_args,
     build_teacher,
@@ -213,6 +214,7 @@ if __name__ == "__main__":
             "num_steps": cfg.num_steps,
             "prompts_per_step": cfg.prompts_per_step,
             "train_batch_size": cfg.train_batch_size,
+            "grad_accum_steps": cfg.grad_accum_steps,
             "epochs": cfg.epochs,
             "max_new_tokens": cfg.max_new_tokens,
             "temperature": cfg.temperature,
@@ -284,12 +286,7 @@ if __name__ == "__main__":
     # -------------------------------------------------------------------------
     # Per-minibatch exchange + loss + backward.
     def do_minibatch(mb: MinibatchTensors, acc: StepAccumulator) -> None:
-        # How many minibatches are in this accumulation window? The last
-        # window may be smaller than G if n_mb % G != 0 — same adaptive-window
-        # divisor SDPO uses, so a short final window isn't under-weighted.
-        G = cfg.grad_accum_steps
-        window_start = (mb.mb_idx // G) * G
-        window_size = min(window_start + G, mb.n_mb) - window_start
+        window_size = accum_window_size(mb, cfg.grad_accum_steps)
 
         self_distill_minibatch(
             mb, acc,

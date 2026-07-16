@@ -31,8 +31,8 @@ algorithm: forward_kl
 # Top-K vocab for KL distillation. Larger K is more faithful but uses more
 # memory and bandwidth.
 distill_top_k: 100
-student_chunk_size: -1
-teacher_chunk_size: -1
+student_chunk_size: 128
+teacher_chunk_size: 128
 # TIS importance-weight clip C (0 disables). Corrects for log-prob gap
 # between vLLM inference and training forward pass.
 tis_clip: 0.0
@@ -45,7 +45,7 @@ kl_clip: 0.0
 
 # -----------------------------------------------------------------------
 # Generation
-max_new_tokens: 1024
+max_new_tokens: 8192
 temperature: 1.0
 top_k: 50
 rollout_worker_url: http://${rollout_host}:${rollout_port}
@@ -56,7 +56,7 @@ rollout_worker_world_size: 1
 lr: 1e-5
 weight_decay: 0.0
 max_grad_norm: 1.0
-num_steps: 100  # OPSD paper converges within 100 gradient update steps.
+num_steps: 1  # OPSD paper converges within 100 gradient update steps.
 # Number of distinct (problem, solution) pairs per step. Each pair produces
 # exactly one on-policy rollout (num_samples=1).
 prompts_per_step: 8
@@ -65,10 +65,10 @@ train_batch_size: 4  # Sequences per gradient-accumulation microbatch.
 # (accumulate everything). Effective batch size = train_batch_size * grad_accum_steps.
 grad_accum_steps: null
 epochs: 1  # Optimizer steps per rollout batch before collecting new rollouts.
-max_prompt_len: 512  # Hard cap on prompt tokens. Raises if exceeded.
-max_response_len: 1536  # Cap on response tokens. Truncates silently if exceeded.
+max_prompt_len: 1024  # Hard cap on prompt tokens. Raises if exceeded.
+max_response_len: 8192  # Cap on response tokens. Truncates silently if exceeded.
 sharding_strategy: FULL_SHARD
-gradient_checkpointing: false
+gradient_checkpointing: true
 # LR scheduler. 'constant' disables warmup/decay entirely.
 scheduler: cosine  # One of: cosine, linear, constant
 warmup_ratio: 0.05  # Fraction of total steps used for LR warmup.
@@ -107,7 +107,7 @@ use_wandb: true
 # rollout worker — no separate vLLM engine or checkpoint loading needed.
 skip_eval: false
 run_eval: true
-posttrain_eval_datasets: aime_2025,aime_2024,hmmt_2025
+posttrain_eval_datasets: aime_2025 #aime_2024,hmmt_2025
 posttrain_eval_max_new_tokens: 38912
 posttrain_eval_temperature: 1.0
 posttrain_eval_top_k: -1

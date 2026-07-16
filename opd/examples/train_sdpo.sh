@@ -195,23 +195,23 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS,$TEACHER_GPUS" \
 # still-running, weight-synced rollout worker over HTTP, so no separate vLLM
 # engine or checkpoint loading happens here.
 if [[ "$RUN_EVAL" == "True" && "$SKIP_EVAL" != "True" ]]; then
-  echo "[launcher] running post-training eval on: $EVAL_DATASETS"
+  echo "[launcher] running post-training eval on: $POSTTRAIN_EVAL_DATASETS"
   uv run --extra gpu --directory "$REPO_ROOT" python - <<PYEOF 2>&1 | tee "$RUN_DIR/eval.log"
 import wandb
 
 from opd.eval.eval_math import run_eval
 
-if "$EVAL_WANDB_PROJECT":
-    wandb.init(project="$EVAL_WANDB_PROJECT", name="$EVAL_WANDB_RUN_NAME")
+if "$POSTTRAIN_EVAL_WANDB_PROJECT":
+    wandb.init(project="$POSTTRAIN_EVAL_WANDB_PROJECT", name="$POSTTRAIN_EVAL_WANDB_RUN_NAME")
 
 run_eval(
     rollout_worker_url="http://$ROLLOUT_HOST:$ROLLOUT_PORT",
-    eval_k=$EVAL_VAL_N,
-    eval_max_tokens=$EVAL_MAX_NEW_TOKENS,
-    step=$EVAL_STEP,
-    eval_datasets="$EVAL_DATASETS",
-    temperature=$EVAL_TEMPERATURE,
-    top_k=$EVAL_TOP_K,
+    eval_k=$POSTTRAIN_EVAL_VAL_N,
+    eval_max_tokens=$POSTTRAIN_EVAL_MAX_NEW_TOKENS,
+    step=$POSTTRAIN_EVAL_STEP,
+    eval_datasets="$POSTTRAIN_EVAL_DATASETS",
+    temperature=$POSTTRAIN_EVAL_TEMPERATURE,
+    top_k=$POSTTRAIN_EVAL_TOP_K,
 )
 
 if wandb.run is not None:

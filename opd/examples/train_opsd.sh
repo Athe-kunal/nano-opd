@@ -42,6 +42,38 @@ export ROLLOUT_PORT
 export USE_WANDB
 
 # ---------------------------------------------------------------------------
+# WORLD_GPUS restricts which physical GPUs this launcher may use, e.g.
+# `CUDA_VISIBLE_DEVICES=2,3 bash opd/examples/train_opsd.sh`. train_gpus/
+# rollout_gpus/teacher_gpus in the YAML are LOCAL indices into this list
+# (0-based), not physical IDs — with CUDA_VISIBLE_DEVICES=2,3, rollout_gpus:
+# "0" means physical GPU 2 and train_gpus: "1" means physical GPU 3. If
+# CUDA_VISIBLE_DEVICES isn't set, the YAML's GPU fields are used as physical
+# IDs directly (no remapping).
+WORLD_GPUS="${CUDA_VISIBLE_DEVICES:-}"
+IFS=, read -r -a WORLD_GPU_LIST <<< "$WORLD_GPUS"
+
+# Translates a comma-separated list of local indices (from the YAML) into
+# physical GPU IDs via $WORLD_GPU_LIST.
+to_physical_gpus() {
+  local indices="$1"
+  if [[ -z "$WORLD_GPUS" ]]; then
+    echo "$indices"
+    return
+  fi
+  local idx_arr physical=()
+  IFS=, read -r -a idx_arr <<< "$indices"
+  for idx in "${idx_arr[@]}"; do
+    physical+=("${WORLD_GPU_LIST[$idx]}")
+  done
+  local IFS=,
+  echo "${physical[*]}"
+}
+
+TRAIN_GPUS="$(to_physical_gpus "$TRAIN_GPUS")"
+ROLLOUT_GPUS="$(to_physical_gpus "$ROLLOUT_GPUS")"
+TEACHER_GPUS="$(to_physical_gpus "$TEACHER_GPUS")"
+
+# ---------------------------------------------------------------------------
 # Parse GPU lists
 IFS=, read -r -a TRAIN_GPU_LIST   <<< "$TRAIN_GPUS"
 IFS=, read -r -a ROLLOUT_GPU_LIST <<< "$ROLLOUT_GPUS"
@@ -112,6 +144,7 @@ mkdir -p "$RUN_DIR" "$SAVE_DIR"
 echo "[launcher] run tag         : $TAG"
 echo "[launcher] run dir         : $RUN_DIR"
 echo "[launcher] config          : $CONFIG_YAML"
+echo "[launcher] world GPUs      : ${WORLD_GPUS:-<none, YAML fields are physical IDs>}"
 echo "[launcher] student model   : $STUDENT_MODEL  (teacher = frozen initial policy)"
 echo "[launcher] train GPUs      : $TRAIN_GPUS  ($TRAIN_NPROC student ranks)"
 echo "[launcher] teacher GPUs    : $TEACHER_GPUS  ($TEACHER_NPROC teacher rank)"

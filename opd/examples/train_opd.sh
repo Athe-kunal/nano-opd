@@ -10,10 +10,8 @@ BASE_DIR="${opd_BASE_DIR:-$REPO_ROOT/.opd}"
 
 CONFIG_YAML="${CONFIG_YAML:-$OPD_DIR/examples/opd.yaml}"
 
-# Resolve the values this script needs before the trainer starts (model
-# names, rollout worker settings, post-training eval settings) straight out
-# of $CONFIG_YAML. `run_name` is set to $TAG first so any `${run_name}`
-# interpolations in the YAML (e.g. posttrain_eval_wandb_run_name) resolve to it.
+# run_name is set to $TAG first so any ${run_name} interpolations in the
+# YAML (e.g. posttrain_eval_wandb_run_name) resolve to it.
 eval "$(uv run --extra gpu --directory "$REPO_ROOT" python -c "
 import shlex
 from omegaconf import OmegaConf
@@ -43,7 +41,33 @@ export ROLLOUT_PORT
 export USE_WANDB
 
 # ---------------------------------------------------------------------------
-# Parse GPU lists
+# train_gpus/rollout_gpus/teacher_gpus in the YAML are 0-based indices into
+# CUDA_VISIBLE_DEVICES, not physical IDs — e.g. CUDA_VISIBLE_DEVICES=2,3
+# with rollout_gpus: "0" means physical GPU 2. Unset CUDA_VISIBLE_DEVICES ->
+# YAML fields used as physical IDs directly.
+WORLD_GPUS="${CUDA_VISIBLE_DEVICES:-}"
+IFS=, read -r -a WORLD_GPU_LIST <<< "$WORLD_GPUS"
+
+to_physical_gpus() {
+  local indices="$1"
+  if [[ -z "$WORLD_GPUS" ]]; then
+    echo "$indices"
+    return
+  fi
+  local idx_arr physical=()
+  IFS=, read -r -a idx_arr <<< "$indices"
+  for idx in "${idx_arr[@]}"; do
+    physical+=("${WORLD_GPU_LIST[$idx]}")
+  done
+  local IFS=,
+  echo "${physical[*]}"
+}
+
+TRAIN_GPUS="$(to_physical_gpus "$TRAIN_GPUS")"
+ROLLOUT_GPUS="$(to_physical_gpus "$ROLLOUT_GPUS")"
+TEACHER_GPUS="$(to_physical_gpus "$TEACHER_GPUS")"
+
+# ---------------------------------------------------------------------------
 IFS=, read -r -a TRAIN_GPU_LIST   <<< "$TRAIN_GPUS"
 IFS=, read -r -a ROLLOUT_GPU_LIST <<< "$ROLLOUT_GPUS"
 IFS=, read -r -a TEACHER_GPU_LIST <<< "$TEACHER_GPUS"
@@ -59,7 +83,6 @@ if (( TEACHER_NPROC != 1 )); then
   exit 1
 fi
 
-# TRAIN_GPUS must be disjoint from ROLLOUT_GPUS and TEACHER_GPUS (rollout/teacher may share)
 for tgpu in "${TRAIN_GPU_LIST[@]}"; do
   for rgpu in "${ROLLOUT_GPU_LIST[@]}"; do
     if [[ "$tgpu" == "$rgpu" ]]; then
@@ -116,6 +139,7 @@ mkdir -p "$RUN_DIR" "$SAVE_DIR"
 echo "[launcher] run tag         : $TAG"
 echo "[launcher] run dir         : $RUN_DIR"
 echo "[launcher] config          : $CONFIG_YAML"
+echo "[launcher] world GPUs      : ${WORLD_GPUS:-<none, YAML fields are physical IDs>}"
 echo "[launcher] student model   : $STUDENT_MODEL"
 echo "[launcher] teacher model   : $TEACHER_MODEL"
 echo "[launcher] train GPUs      : $TRAIN_GPUS  ($TRAIN_NPROC student ranks)"
@@ -123,7 +147,6 @@ echo "[launcher] teacher GPUs    : $TEACHER_GPUS  ($TEACHER_NPROC teacher ranks)
 echo "[launcher] rollout GPUs    : $ROLLOUT_GPUS  (tp=$ROLLOUT_TP)"
 
 # ---------------------------------------------------------------------------
-# Start vLLM rollout worker
 # setsid: new session so WORKER_PID is a process-group leader; cleanup can
 # signal the whole group (uv, Python, vLLM workers) with kill -TERM -- -PID.
 echo "[launcher] starting rollout worker -> $WORKER_LOG"
@@ -138,7 +161,6 @@ setsid env CUDA_VISIBLE_DEVICES="$ROLLOUT_GPUS" \
     >"$WORKER_LOG" 2>&1 &
 WORKER_PID="$!"
 
-# Wait for the worker to become healthy
 echo "[launcher] waiting for rollout worker health"
 HEALTH_URL="http://$ROLLOUT_HOST:$ROLLOUT_PORT/health"
 for _ in $(seq 300); do
@@ -152,9 +174,7 @@ curl -sf "$HEALTH_URL" | grep -q '"ok": *true' \
   || { echo "[launcher] rollout worker did not become healthy" >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
-# Start student trainer + teacher
 # torchrun world: ranks 0..(TRAIN_NPROC-1) = student, ranks TRAIN_NPROC..(TOTAL_NPROC-1) = teacher.
-# CUDA_VISIBLE_DEVICES maps logical device indices to physical GPUs in that order.
 echo "[launcher] starting trainer -> $TRAIN_LOG"
 CUDA_VISIBLE_DEVICES="$TRAIN_GPUS,$TEACHER_GPUS" \
   uv run --extra gpu --directory "$REPO_ROOT" torchrun --standalone --nproc_per_node="$TOTAL_NPROC" \

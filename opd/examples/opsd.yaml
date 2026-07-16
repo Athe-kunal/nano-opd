@@ -79,8 +79,11 @@ save_every: 0
 seed: 0
 
 # -----------------------------------------------------------------------
-# GPU assignment (comma-separated physical GPU IDs; consumed by the
-# launcher script to build CUDA_VISIBLE_DEVICES and process counts).
+# GPU assignment. These are 0-based LOCAL indices into the launcher's
+# world GPU list (the CUDA_VISIBLE_DEVICES the launcher script was started
+# with) — not physical GPU IDs. E.g. with CUDA_VISIBLE_DEVICES=2,3,
+# rollout_gpus: "0" means physical GPU 2. If CUDA_VISIBLE_DEVICES wasn't
+# set, these are used as physical IDs directly.
 #   train_gpus must not overlap rollout_gpus or teacher_gpus (enforced by the launcher).
 #   rollout_gpus and teacher_gpus may be the same list to colocate vLLM + teacher.
 train_gpus: "1"        # student FSDP training ranks

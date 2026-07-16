@@ -89,8 +89,7 @@ use_wandb: false
 # Post-training math evaluation (opd.eval.eval_math.run_eval), run once
 # after training finishes. Reuses the already-running, weight-synced
 # rollout worker — no separate vLLM engine or checkpoint loading needed.
-skip_eval: false
-run_eval: true  # only meaningful for math datasets (dapo_math, opsd_math)
+skip_eval: false  # true always forces post-training eval off, regardless of dataset
 posttrain_eval_datasets: aime_2025,aime_2024,hmmt_2025
 posttrain_eval_max_new_tokens: 38912
 posttrain_eval_temperature: 1.0

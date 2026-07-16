@@ -20,14 +20,14 @@ train_world_size: 1
 # Algorithm
 algorithm: jsd
 distill_top_k: 100  # Top-K vocab for KL distillation
-student_chunk_size: -1
-teacher_chunk_size: -1
+student_chunk_size: 128
+teacher_chunk_size: 128
 tis_clip: 0.0  # TIS importance-weight clip C (0 disables)
 
 # -----------------------------------------------------------------------
 # Generation
 num_samples: 4  # Completions per prompt (group size G in Algorithm 1)
-max_new_tokens: 256
+max_new_tokens: 8192
 temperature: 1.0
 top_k: 50
 rollout_worker_url: http://${rollout_host}:${rollout_port}
@@ -38,17 +38,17 @@ rollout_worker_world_size: 1
 lr: 1e-6
 weight_decay: 0.0
 max_grad_norm: 1.0
-num_steps: 200
+num_steps: 1
 prompts_per_step: 8
 train_batch_size: 4
 # Optimizer step every N minibatches. null = one step per full rollout batch
 # (accumulate everything). Effective batch size = train_batch_size * grad_accum_steps.
 grad_accum_steps: 1
 epochs: 1
-max_prompt_len: 512  # Hard cap on prompt tokens. Raises if exceeded.
-max_response_len: 1536  # Cap on response tokens. Truncates silently if exceeded.
+max_prompt_len: 1024  # Hard cap on prompt tokens. Raises if exceeded.
+max_response_len: 8192  # Cap on response tokens. Truncates silently if exceeded.
 sharding_strategy: FULL_SHARD
-gradient_checkpointing: false
+gradient_checkpointing: true
 scheduler: cosine  # One of: cosine, linear, constant
 warmup_ratio: 0.05
 
@@ -71,12 +71,12 @@ run_name: dummy
 save_dir: opd_checkpoints
 save_every: 0
 seed: 0
-eval_every: 0
+eval_every: 1
 eval_k: 4
-eval_max_tokens: 4096
+eval_max_tokens: 8192
 sciknoweval_test_size: 0.1
 # One of: dapo_math, livecodebench, sciknoweval
-dataset: sciknoweval
+dataset: dapo_math
 
 # -----------------------------------------------------------------------
 # GPU assignment. These are 0-based LOCAL indices into the launcher's
@@ -102,8 +102,7 @@ use_wandb: true
 # Post-training math evaluation (opd.eval.eval_math.run_eval), run once
 # after training finishes. Reuses the already-running, weight-synced
 # rollout worker — no separate vLLM engine or checkpoint loading needed.
-skip_eval: false
-run_eval: false  # only meaningful for math datasets (dapo_math, opsd_math)
+skip_eval: false  # true always forces post-training eval off, regardless of dataset
 posttrain_eval_datasets: aime_2025,aime_2024,hmmt_2025
 posttrain_eval_max_new_tokens: 38912
 posttrain_eval_temperature: 1.0

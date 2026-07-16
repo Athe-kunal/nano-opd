@@ -22,12 +22,16 @@ for key in (
     'student_model', 'dataset',
     'train_gpus', 'rollout_gpus', 'teacher_gpus',
     'rollout_host', 'rollout_port', 'rollout_gpu_mem_util', 'weight_transfer_backend',
-    'use_wandb', 'skip_eval', 'run_eval',
+    'use_wandb', 'skip_eval',
     'posttrain_eval_datasets', 'posttrain_eval_max_new_tokens', 'posttrain_eval_temperature',
     'posttrain_eval_top_k', 'posttrain_eval_val_n', 'posttrain_eval_wandb_project',
     'posttrain_eval_wandb_run_name', 'posttrain_eval_step',
 ):
     print(f'{key.upper()}={shlex.quote(str(cfg[key]))}')
+# opd.eval.eval_math only supports DAPO-style math benchmarks (boxed-answer
+# checking) — auto-enable post-training eval for math datasets, off otherwise.
+# skip_eval (above) still overrides this to force it off regardless.
+print(f'RUN_EVAL={shlex.quote(str(cfg.dataset in (\"dapo_math\", \"opsd_math\")))}')
 ")"
 
 RUN_DIR="$BASE_DIR/sdpo/$TAG"

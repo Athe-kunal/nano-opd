@@ -25,18 +25,29 @@ BASE_DIR="${opd_BASE_DIR:-$REPO_ROOT/.opd}"
 CONFIG_YAML="${CONFIG_YAML:-$OPD_DIR/examples/sdft.yaml}"
 
 # Resolve the values this script needs before the trainer starts (model
-# name, dataset path, rollout worker settings) straight out of $CONFIG_YAML.
+# name, dataset path, rollout worker settings, post-training eval settings)
+# straight out of $CONFIG_YAML. `run_name` is set to $TAG first so any
+# `${run_name}` interpolations in the YAML (e.g. posttrain_eval_wandb_run_name)
+# resolve to it.
 eval "$(uv run --extra gpu --directory "$REPO_ROOT" python -c "
 import shlex
 from omegaconf import OmegaConf
 cfg = OmegaConf.load('$CONFIG_YAML')
+cfg.run_name = '$TAG'
 for key in (
-    'student_model', 'dataset_path',
+    'student_model', 'dataset', 'dataset_path',
     'train_gpus', 'rollout_gpus', 'teacher_gpus',
     'rollout_host', 'rollout_port', 'rollout_gpu_mem_util', 'weight_transfer_backend',
-    'use_wandb',
+    'use_wandb', 'skip_eval',
+    'posttrain_eval_datasets', 'posttrain_eval_max_new_tokens', 'posttrain_eval_temperature',
+    'posttrain_eval_top_k', 'posttrain_eval_val_n', 'posttrain_eval_wandb_project',
+    'posttrain_eval_wandb_run_name', 'posttrain_eval_step',
 ):
     print(f'{key.upper()}={shlex.quote(str(cfg[key]))}')
+# opd.eval.eval_math only supports DAPO-style math benchmarks (boxed-answer
+# checking) — auto-enable post-training eval for math datasets, off otherwise.
+# skip_eval (above) still overrides this to force it off regardless.
+print(f'RUN_EVAL={shlex.quote(str(cfg.dataset in (\"dapo_math\", \"opsd_math\")))}')
 ")"
 
 RUN_DIR="$BASE_DIR/sdft/$TAG"
@@ -209,3 +220,30 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS,$TEACHER_GPUS" \
     save_dir="$SAVE_DIR" \
     run_name="$TAG" \
     2>&1 | tee "$TRAIN_LOG"
+
+# ---------------------------------------------------------------------------
+# Post-training evaluation with opd.eval.eval_math.run_eval.
+if [[ "$RUN_EVAL" == "True" && "$SKIP_EVAL" != "True" ]]; then
+  echo "[launcher] running post-training eval on: $POSTTRAIN_EVAL_DATASETS"
+  uv run --extra gpu --directory "$REPO_ROOT" python - <<PYEOF 2>&1 | tee "$RUN_DIR/eval.log"
+import wandb
+
+from opd.eval.eval_math import run_eval
+
+if "$POSTTRAIN_EVAL_WANDB_PROJECT":
+    wandb.init(project="$POSTTRAIN_EVAL_WANDB_PROJECT", name="$POSTTRAIN_EVAL_WANDB_RUN_NAME")
+
+run_eval(
+    rollout_worker_url="http://$ROLLOUT_HOST:$ROLLOUT_PORT",
+    eval_k=$POSTTRAIN_EVAL_VAL_N,
+    eval_max_tokens=$POSTTRAIN_EVAL_MAX_NEW_TOKENS,
+    step=$POSTTRAIN_EVAL_STEP,
+    eval_datasets="$POSTTRAIN_EVAL_DATASETS",
+    temperature=$POSTTRAIN_EVAL_TEMPERATURE,
+    top_k=$POSTTRAIN_EVAL_TOP_K,
+)
+
+if wandb.run is not None:
+    wandb.finish()
+PYEOF
+fi

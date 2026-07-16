@@ -107,7 +107,7 @@ use_wandb: true
 # rollout worker — no separate vLLM engine or checkpoint loading needed.
 skip_eval: false
 run_eval: true
-posttrain_eval_datasets: aime_2025 #aime_2024,hmmt_2025
+posttrain_eval_datasets: aime_2025,aime_2024,hmmt_2025
 posttrain_eval_max_new_tokens: 38912
 posttrain_eval_temperature: 1.0
 posttrain_eval_top_k: -1

@@ -177,6 +177,10 @@ def run_eval(
         loaded = await asyncio.gather(*[_load_dataset_problems(name) for name in dataset_names])
         total_examples = sum(len(prompts) for _, prompts, _ in loaded)
 
+        # The rollout worker's engine is vLLM's AsyncLLM, which batches
+        # whatever requests are concurrently in flight internally, so firing
+        # all per-problem requests at once (across every dataset) gets real
+        # continuous-batching throughput, not just one tqdm tick per example.
         with async_tqdm(total=total_examples, desc="math eval examples") as pbar:
             per_dataset_rollouts = await asyncio.gather(*[
                 asyncio.gather(*[

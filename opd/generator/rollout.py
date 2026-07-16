@@ -4,9 +4,10 @@ Rollout / batch utilities for RL training.
 Generation runs in a separate vLLM worker process. The trainer calls the
 `*_remote` helpers (HTTP to the worker) and pushes weights into the worker
 in-place via NCCL using `sync_weights_to_vllm_inplace`. The worker itself
-uses `generate_rollouts` from this module.
+uses `generate_rollouts_async` from this module.
 """
 
+import asyncio
 import json
 import time
 from loguru import logger
@@ -15,11 +16,13 @@ import urllib.error
 import urllib.request
 from vllm import SamplingParams
 from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine, NCCLTrainerSendWeightsArgs
+from vllm.utils import random_uuid
 
 import torch
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
-def generate_rollouts(
+
+async def generate_rollouts_async(
     vllm_engine: Any,
     tokenizer: Any,
     prompts: list[str],
@@ -28,10 +31,17 @@ def generate_rollouts(
     temperature: float,
     top_k: int,
 ) -> list[dict[str, Any]]:
-    """Generates `num_samples` completions per prompt using vLLM.
+    """Generates `num_samples` completions per prompt using vLLM's async engine.
+
+    Fires one concurrent `vllm_engine.generate(...)` call per prompt instead
+    of one call for the whole prompt list — the async engine's internal
+    scheduler batches whatever requests are in flight together, so N
+    concurrent callers get real continuous-batching throughput (unlike the
+    offline `LLM` engine, whose `.generate()` is a single blocking batch call
+    not safe to invoke concurrently from multiple callers).
 
     Args:
-        vllm_engine: A vLLM `LLM`-like engine exposing `.generate`.
+        vllm_engine: A vLLM `AsyncLLM`-like engine exposing an async `.generate`.
         tokenizer: Tokenizer used to determine the EOS stop string.
         prompts: Prompt strings to generate completions for.
         num_samples: Number of completions to sample per prompt.
@@ -51,8 +61,16 @@ def generate_rollouts(
         logprobs=1,
         stop=[tokenizer.eos_token] if tokenizer.eos_token else None,
     )
-    outputs = vllm_engine.generate(prompts, sampling_params)
-    results: list[dict[str,Any]] = []
+
+    async def _generate_one(prompt: str) -> Any:
+        final_output = None
+        async for request_output in vllm_engine.generate(prompt, sampling_params, random_uuid()):
+            final_output = request_output
+        return final_output
+
+    outputs = await asyncio.gather(*[_generate_one(prompt) for prompt in prompts])
+
+    results: list[dict[str, Any]] = []
     for output in outputs:
         prompt_text = output.prompt
         for completion in output.outputs:
@@ -174,7 +192,7 @@ def generate_rollouts_remote(
         top_k: Sampling top-k cutoff.
 
     Returns:
-        A flat list of rollout dicts, in the same order as `generate_rollouts`.
+        A flat list of rollout dicts, in the same order as `generate_rollouts_async`.
     """
     payload = {
         "prompts": prompts,
@@ -197,7 +215,7 @@ def prepare_batch(
     """Packs a list of rollouts into padded training tensors.
 
     Args:
-        rollouts: Rollout dicts as produced by `generate_rollouts`.
+        rollouts: Rollout dicts as produced by `generate_rollouts_async`.
         tokenizer: Tokenizer supplying the pad token id.
         max_prompt_len: Maximum allowed prompt length; raises if exceeded.
         max_response_len: Response length to truncate completions to.

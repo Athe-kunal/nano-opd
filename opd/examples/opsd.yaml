@@ -56,7 +56,7 @@ rollout_worker_world_size: 1
 lr: 1e-5
 weight_decay: 0.0
 max_grad_norm: 1.0
-num_steps: 1  # OPSD paper converges within 100 gradient update steps.
+num_steps: 100  # OPSD paper converges within 100 gradient update steps.
 # Number of distinct (problem, solution) pairs per step. Each pair produces
 # exactly one on-policy rollout (num_samples=1).
 prompts_per_step: 8

@@ -40,7 +40,7 @@ rollout_worker_world_size: 1
 lr: 1e-6
 weight_decay: 0.0
 max_grad_norm: 1.0
-num_steps: 1  # OPD paper converges within 100 gradient update steps.
+num_steps: 100  # OPD paper converges within 100 gradient update steps.
 prompts_per_step: 8
 train_batch_size: 4  # Sequences per gradient-accumulation microbatch.
 # Optimizer step every N minibatches. null = one step per full rollout batch

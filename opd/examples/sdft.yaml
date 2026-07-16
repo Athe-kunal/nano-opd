@@ -65,7 +65,7 @@ rollout_worker_world_size: 1
 lr: 1e-5
 weight_decay: 0.0
 max_grad_norm: 1.0
-num_steps: 1
+num_steps: 100
 # Number of distinct (question, demonstration) pairs per step. Unlike
 # SDPO, there is no num-samples multiplier: each pair produces exactly one
 # on-policy rollout.

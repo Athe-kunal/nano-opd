@@ -52,8 +52,8 @@ All losses operate on top-K truncated distributions, `[B, T, K]` where K = `dist
 ## Key parameters
 
 - **`distill-top-k`** (default 100) — top-K vocab truncation for the KL computation. Memory optimization (`[B, T, K]` not `[B, T, V]`) and signal-quality improvement (tail of the distribution is mostly noise).
-- **`num-samples`** (default 4) — completions generated per prompt at each step. More samples reduce variance in the distillation signal at the cost of rollout compute.
-- **`prompts-per-step`** (default 8) — distinct prompts sampled per step. `prompts-per-step × num-samples` = total rollouts per step; must be divisible by `train-world-size`.
+- **`num-samples`** (OPD/SDPO only, default 4) — completions generated per prompt at each step. More samples reduce variance in the distillation signal at the cost of rollout compute. OPSD and SDFT have no such knob: both hardcode one rollout per prompt (`num_samples=1` at the `generate_rollouts_for_prompts` call site), so neither YAML defines the field.
+- **`prompts-per-step`** (default 8) — distinct prompts sampled per step. Total rollouts per step = `prompts-per-step × num-samples` for OPD/SDPO, and just `prompts-per-step` for OPSD/SDFT; must be divisible by `train-world-size`.
 - **`epochs`** (default 1) — optimizer steps on one rollout batch before collecting new rollouts. `>1` is PPO-style reuse and risks off-policy drift.
 - **`temperature`** (default 1.0) — rollout sampling temperature. Don't use 0 (greedy) — distillation needs diversity in the student's on-policy distribution.
 - **`ema-alpha`** (SDPO only, default 0.05) — `teacher ← α·student + (1−α)·teacher`. Small α = stable but lagging teacher.

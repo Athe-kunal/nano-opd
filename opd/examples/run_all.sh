@@ -26,8 +26,8 @@ set -euo pipefail
 
 OPD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TAG_PREFIX="${1:-dapo_math_run}"
-# train_opd.sh train_sdpo.sh train_opsd.sh 
-SCRIPTS=(train_sdft.sh)
+# train_opd.sh train_sdpo.sh train_opsd.sh train_sdft.sh
+SCRIPTS=(train_opsd.sh)
 
 for script in "${SCRIPTS[@]}"; do
   tag="${TAG_PREFIX}_${script%.sh}"

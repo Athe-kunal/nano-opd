@@ -31,7 +31,7 @@ To change a hyperparameter, edit the YAML directly. To point a launcher at a dif
 CONFIG_YAML=/path/to/my_opd.yaml bash opd/examples/train_opd.sh my_run
 ```
 
-Values in the YAML marked `???` (e.g. `train_world_size`) must be overridden — either in the file or via a `key=value` override — before the trainer will run. `train_world_size` is left `???` deliberately: it's hardware-dependent and the launcher scripts always supply it, computed from the GPU list you pass in (see below).
+Values marked `???` in a YAML must be overridden — in the file or via a `key=value` override — before the trainer runs. `train_world_size` is hardware-dependent; the launchers always supply it from `train_gpus` (see below), overriding whatever the YAML holds.
 
 You can also invoke a training script directly, without a launcher, passing the config path and any overrides as trailing `key=value` args:
 
@@ -41,17 +41,17 @@ python opd/trainer/train_opd.py opd/examples/opd.yaml train_world_size=1 lr=1e-5
 
 ### GPUs
 
-The one thing the YAML doesn't hold is GPU placement — it's deployment-specific, so it stays as environment variables on the launcher. Comma-separated physical IDs. **`TRAIN_GPUS` must not overlap** with **`ROLLOUT_GPUS`** or **`TEACHER_GPUS`** (the launcher checks this). **`ROLLOUT_GPUS`** and **`TEACHER_GPUS`** **may reuse the same IDs** if you want to **colocate** the vLLM rollout worker and the teacher on the same GPUs; give them disjoint IDs if you want those roles on separate devices.
+GPU placement is in the YAML, as three comma-separated lists:
 
-Example (student on GPU 3; teacher and rollouts both on GPU 2):
+- **`rollout_gpus`** — vLLM rollout worker. Multiple IDs set rollout tensor-parallel size.
+- **`train_gpus`** — FSDP student training, one rank each. Sets `train_world_size`.
+- **`teacher_gpus`** — teacher forward passes. Exactly one GPU.
 
-```bash
-ROLLOUT_GPUS=2 TRAIN_GPUS=3 TEACHER_GPUS=2 bash opd/examples/train_opd.sh
-```
+Rules (enforced by the launcher):
 
-- **`ROLLOUT_GPUS`** — GPUs for the vLLM rollout worker (student sampling). Multiple IDs set tensor-parallel size for rollout.
-- **`TRAIN_GPUS`** — GPUs for FSDP student training (`torchrun` ranks for the student).
-- **`TEACHER_GPUS`** — GPUs for the teacher forward passes (can match `ROLLOUT_GPUS` to colocate with vLLM).
+- `train_gpus` must not overlap `rollout_gpus` or `teacher_gpus`.
+- `rollout_gpus` and `teacher_gpus` may reuse the same IDs, to colocate the teacher with vLLM.
+- `CUDA_VISIBLE_DEVICES` set → YAML GPU fields are 0-based indices into it (`CUDA_VISIBLE_DEVICES=2,3` + `rollout_gpus: "0"` = physical GPU 2). Unset → they are physical IDs.
 
 ### Rollout worker (in the YAML)
 
@@ -103,14 +103,20 @@ After training finishes, these launchers run a one-off AIME/HMMT eval (`opd.eval
 
 - **`sharding_strategy`** — FSDP sharding mode (e.g. `FULL_SHARD`).
 
-### Chunking (optional, in the YAML)
+### Chunking and OOM (in the YAML)
 
-- **`student_chunk_size`** / **`teacher_chunk_size`** — Chunk sizes for long-sequence handling; `-1` means "don't chunk." Only needed if you hit OOM errors.
+- **`student_chunk_size`** / **`teacher_chunk_size`** — chunk the top-K log-prob gather along T; `-1` = don't chunk.
+
+Chunking does **not** shrink peak memory on the student. That peak is the `[B, T, V]` logits tensor plus its gradient (`train_batch_size × seq_len × vocab × 2 bytes`, doubled for backward), which the forward materializes regardless. To actually cut it, in order of leverage:
+
+1. Lower **`max_new_tokens`** / **`max_response_len`** — `T` also sets rollout wall-clock, so this is the only knob that helps speed too.
+2. Lower **`train_batch_size`**.
+3. Add GPUs to **`train_gpus`** — `FULL_SHARD` is a no-op at one rank (FSDP silently falls back to `NO_SHARD`); a second rank shards params/grads/optimizer state.
 
 ### Running
 
-Edit the YAML for hyperparameters; use GPU environment variables for placement, for example:
+Edit the YAML (hyperparameters and GPU placement both live there), then:
 
 ```bash
-TRAIN_GPUS=0,1 bash opd/examples/train_opd.sh my_run
+bash opd/examples/train_opd.sh my_run
 ```

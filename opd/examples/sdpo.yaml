@@ -71,7 +71,7 @@ run_name: dummy
 save_dir: opd_checkpoints
 save_every: 0
 seed: 0
-eval_every: 1
+eval_every: 100
 eval_k: 4
 eval_max_tokens: 8192
 sciknoweval_test_size: 0.1

@@ -42,11 +42,13 @@ def load_sdft_science(split: str = "train") -> list[dict]:
 def load_sdft_science_eval() -> list[dict]:
     """Load science MCQ eval split for pass@k evaluation.
 
-    The eval split has a different schema from train: each row has `prompt`
-    (the MCQ question) and `answer` (correct letter A/B/C/D).
+    The eval split has a different schema from train: `prompt` is already a
+    full [system, user] conversation (the system turn carries the
+    <answer>X</answer> format instruction `grade_science_response` parses),
+    and `answer` is the correct letter A/B/C/D.
     """
     ds = load_arrow_split(_BASE_URL, "eval")
-    return [{"question": row["prompt"], "answer": row["answer"]} for row in ds]
+    return [{"messages": row["prompt"], "answer": row["answer"]} for row in ds]
 
 
 def grade_science_response(response: str, answer: str) -> bool:

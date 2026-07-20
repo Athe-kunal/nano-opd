@@ -47,7 +47,7 @@ train_batch_size: 4  # Sequences per gradient-accumulation microbatch.
 # (accumulate everything). Effective batch size = train_batch_size * grad_accum_steps.
 grad_accum_steps: null
 epochs: 1  # Optimizer steps per rollout batch
-max_prompt_len: 512
+max_prompt_len: 1024
 max_response_len: 8192
 sharding_strategy: FULL_SHARD
 gradient_checkpointing: true
@@ -83,7 +83,7 @@ rollout_host: 127.0.0.1
 rollout_port: 8048
 rollout_gpu_mem_util: 0.5  # vLLM GPU memory fraction
 weight_transfer_backend: nccl
-use_wandb: false
+use_wandb: true
 
 # -----------------------------------------------------------------------
 # Post-training math evaluation (opd.eval.eval_math.run_eval), run once

@@ -84,7 +84,7 @@ grad_accum_steps: 1
 # and is mildly off-policy (tis_clip partially corrects it). To replicate
 # the paper's epochs, raise num_steps instead.
 epochs: 1
-max_prompt_len: 512
+max_prompt_len: 1024
 max_response_len: 1536
 sharding_strategy: FULL_SHARD
 gradient_checkpointing: false
@@ -108,7 +108,7 @@ run_name: dummy
 save_dir: sdft_checkpoints
 save_every: 0
 seed: 0
-eval_every: 0  # Pass@k eval on held-out split every N steps (0 = disabled).
+eval_every: 100 # Pass@k eval on held-out split every N steps (0 = disabled).
 eval_k: 4  # Number of rollouts per question for pass@k evaluation.
 
 # -----------------------------------------------------------------------
@@ -140,7 +140,7 @@ use_wandb: true
 # is normally a no-op; kept for parity with the other launchers and in case
 # a future SDFT dataset variant is math-flavored.
 skip_eval: false  # true always forces post-training eval off, regardless of dataset
-posttrain_eval_datasets: aime_2025,aime_2024,hmmt_2025
+posttrain_eval_datasets: aime_2025 #,aime_2024,hmmt_2025
 posttrain_eval_max_new_tokens: 38912
 posttrain_eval_temperature: 1.0
 posttrain_eval_top_k: -1

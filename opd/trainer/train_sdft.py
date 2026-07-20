@@ -130,8 +130,10 @@ def eval_pass_at_k(
     rng.shuffle(idxs)
     examples = [eval_dataset[i] for i in idxs[:eval_size]]
 
+    # Eval loaders supply a full [system, user] conversation — the system turn
+    # carries the output-format instruction the graders parse.
     prompts = [student.tokenizer.apply_chat_template(
-        [{"role": "user", "content": ex["question"]}], tokenize=False, add_generation_prompt=True,
+        ex["messages"], tokenize=False, add_generation_prompt=True,
     ) for ex in examples]
 
     rollouts = generate_rollouts_for_prompts(cfg, prompts, num_samples=k)

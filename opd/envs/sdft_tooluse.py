@@ -68,12 +68,17 @@ def load_sdft_tooluse_eval() -> list[dict]:
     """Load tooluse eval split for pass@k evaluation.
 
     Unlike load_sdft_tooluse, keeps golden_answer as a raw list[dict] so the
-    grader can compare action names directly.
+    grader can compare action names directly. `messages` mirrors the [system,
+    user] conversation `SdftToolUseEnv.init` builds, so eval prompts the model
+    the same way training does.
     """
     ds = load_arrow_split(_BASE_URL, "eval")
     records: list[dict] = []
     for row in ds:
-        records.append({"question": _build_question(row), "golden_answer": row.get("golden_answer") or []})
+        records.append({
+            "messages": build_system_user_conversation(_SYSTEM_PROMPT, _build_question(row)),
+            "golden_answer": row.get("golden_answer") or [],
+        })
     return records
 
 

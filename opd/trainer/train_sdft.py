@@ -361,7 +361,10 @@ if __name__ == "__main__":
             pass_at_k, avg_at_k = eval_pass_at_k(eval_dataset, len(eval_dataset), cfg, student, grader, k=k)
             print0(f"[eval step={step+1}] pass@{k}={pass_at_k:.3f} avg@{k}={avg_at_k:.3f} (n={len(eval_dataset)})")
             log_eval_metrics(
-                {f"eval/pass_at_{k}": pass_at_k, f"eval/avg_at_{k}": avg_at_k},
+                {
+                    f"eval/{cfg.dataset}/pass@{k}": pass_at_k,
+                    f"eval/{cfg.dataset}/avg@{k}": avg_at_k,
+                },
                 step + 1, ctx.master_process, use_wandb,
             )
 

@@ -188,7 +188,7 @@ def run_sciknow_eval(
 
     total_responses = len(test_rows) * eval_k
     accuracy = total_correct / total_responses
-    metrics = {"eval/accuracy": accuracy}
+    metrics = {"eval/sciknoweval/accuracy": accuracy}
 
     print0(f"[sciknoweval eval step={step}] {json.dumps(metrics)}")
     for r in per_problem:

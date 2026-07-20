@@ -253,5 +253,5 @@ def run_livecodebench_eval(
     return run_pass_at_k_eval(
         rollout_worker_url, prompts, range(len(problems)),
         eval_k, eval_max_tokens, step, temperature, top_k,
-        is_correct=is_correct, metrics_key=f"eval/pass@{eval_k}", log_prefix="lcb eval",
+        is_correct=is_correct, metrics_key=f"eval/livecodebench/pass@{eval_k}", log_prefix="lcb eval",
     )

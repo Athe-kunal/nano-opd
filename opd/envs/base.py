@@ -64,7 +64,8 @@ def run_pass_at_k_eval(
         is_correct: `(problem_index, rollout) -> bool`, called once per
           generated rollout.
         metrics_key: The single key under which the averaged pass@k is
-          logged (e.g. `"eval/pass@4"`).
+          logged. Follow the `eval/{dataset_name}/pass@{k}` convention
+          shared by every eval site (e.g. `"eval/livecodebench/pass@4"`).
         log_prefix: Prefix for the `print0` summary line, e.g. `"lcb eval"`
           → `"[lcb eval step=3] ..."`.
 

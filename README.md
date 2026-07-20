@@ -2,6 +2,17 @@
 
 **nano-opd** is a hackable library for on-policy distillation: you can swap models, data, and training knobs without fighting a monolithic stack.
 
+## Algorithms
+
+| Algorithm | Teacher | Paper |
+|---|---|---|
+| **OPD** | separate frozen model | [On-Policy Distillation of Language Models](https://thinkingmachines.ai/blog/on-policy-distillation/) |
+| **SDPO** | EMA of student, feedback-conditioned | [Reinforcement Learning via Self-Distillation](https://arxiv.org/abs/2601.20802) |
+| **OPSD** | frozen initial policy, reference-solution-conditioned | [Self-Distilled Reasoner](https://arxiv.org/abs/2601.18734) |
+| **SDFT** | EMA of student, demonstration-conditioned | [Self-Distillation Enables Continual Learning](https://arxiv.org/abs/2601.19897) |
+
+Losses: reverse KL, forward KL, JSD, `mopd`, `mopd_pg` — all top-K truncated (`opd/loss.py`).
+
 ## Exporting training data (`dapo_dataset.py`)
 
 The DAPO exporter writes JSONL rows that match the `Example` type used by the trainer's dataset code. From the repo root (with `PYTHONPATH` set as you normally would for this package), you can run:

@@ -67,7 +67,7 @@ def run_pass_at_k_eval(
           logged. Follow the `eval/{dataset_name}/pass@{k}` convention
           shared by every eval site (e.g. `"eval/livecodebench/pass@4"`).
         log_prefix: Prefix for the `print0` summary line, e.g. `"lcb eval"`
-          → `"[lcb eval step=3] ..."`.
+          -> `"[lcb eval step=3] ..."`.
 
     Returns:
         `{metrics_key: average pass@k over all problems}`.

@@ -168,8 +168,8 @@ def compute_jsd_loss(
 ) -> torch.Tensor:
     """JSD(student || teacher) with tail term.
 
-    jsd_alpha=0.5 → symmetric JSD (SDPO default).
-    jsd_alpha=0.0 → forward KL.  jsd_alpha=1.0 → reverse KL.
+    jsd_alpha=0.5 -> symmetric JSD (SDPO default).
+    jsd_alpha=0.0 -> forward KL.  jsd_alpha=1.0 -> reverse KL.
 
     The mixture M is formed over both the top-K support and the tail bucket:
         M_tail = α · (1 - Σ_K p_s) + (1-α) · (1 - Σ_K p_t)

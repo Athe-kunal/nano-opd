@@ -53,8 +53,8 @@ class EMASyncer(TeacherSyncer):
     teaching signal.
 
     Args:
-        alpha: EMA update rate in (0, 1]. Higher → faster adaptation, more noise.
-               Lower → more stability, teacher lags further behind student.
+        alpha: EMA update rate in (0, 1]. Higher -> faster adaptation, more noise.
+               Lower -> more stability, teacher lags further behind student.
     """
 
     def __init__(self, alpha: float = 0.05) -> None:
@@ -131,7 +131,7 @@ class HardSyncSyncer(TeacherSyncer):
     ablation experiments.
 
     Args:
-        sync_every_n_steps: Copy student → teacher every this many optimizer steps.
+        sync_every_n_steps: Copy student -> teacher every this many optimizer steps.
     """
 
     def __init__(self, sync_every_n_steps: int = 100) -> None:

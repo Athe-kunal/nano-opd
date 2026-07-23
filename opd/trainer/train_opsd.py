@@ -74,8 +74,8 @@ if __name__ == "__main__":
     use_wandb = should_use_wandb()
 
     # Distributed init — same rank split as OPD/SDFT:
-    #   ranks 0..train_world_size-1  →  student (FSDP, updated by optimizer)
-    #   rank  train_world_size       →  teacher (plain nn.Module, frozen initial policy)
+    #   ranks 0..train_world_size-1  ->  student (FSDP, updated by optimizer)
+    #   rank  train_world_size       ->  teacher (plain nn.Module, frozen initial policy)
     ctx = init_distributed(cfg.device_type, cfg.train_world_size)
 
     print0(f"Model: {cfg.student_model}  (teacher = frozen initial policy)")
@@ -171,7 +171,7 @@ if __name__ == "__main__":
             rollouts = generate_rollouts_for_prompts(cfg, prompts, num_samples=1)
 
             # Attach reference-conditioned teacher prompt to each rollout.
-            # The teacher sees: problem + ground-truth solution y* → richer
+            # The teacher sees: problem + ground-truth solution y* -> richer
             # context than the student (problem only).
             for i, ex in enumerate(examples):
                 r            = rollouts[i]    # one rollout per prompt (num_samples=1)

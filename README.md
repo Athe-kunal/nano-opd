@@ -62,7 +62,7 @@ Rules (enforced by the launcher):
 
 - `train_gpus` must not overlap `rollout_gpus` or `teacher_gpus`.
 - `rollout_gpus` and `teacher_gpus` may reuse the same IDs, to colocate the teacher with vLLM.
-- `CUDA_VISIBLE_DEVICES` set → YAML GPU fields are 0-based indices into it (`CUDA_VISIBLE_DEVICES=2,3` + `rollout_gpus: "0"` = physical GPU 2). Unset → they are physical IDs.
+- `CUDA_VISIBLE_DEVICES` set -> YAML GPU fields are 0-based indices into it (`CUDA_VISIBLE_DEVICES=2,3` + `rollout_gpus: "0"` = physical GPU 2). Unset -> they are physical IDs.
 
 ### Rollout worker (in the YAML)
 

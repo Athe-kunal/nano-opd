@@ -195,8 +195,8 @@ if __name__ == "__main__":
 
     # -------------------------------------------------------------------------
     # Distributed init — same rank split as OPD/SDPO:
-    #   ranks 0..train_world_size-1  →  student (FSDP)
-    #   rank  train_world_size       →  teacher (plain nn.Module, EMA of student)
+    #   ranks 0..train_world_size-1  ->  student (FSDP)
+    #   rank  train_world_size       ->  teacher (plain nn.Module, EMA of student)
     ctx = init_distributed(cfg.device_type, cfg.train_world_size)
 
     print0(
@@ -325,7 +325,7 @@ if __name__ == "__main__":
             rollouts = generate_rollouts_for_prompts(cfg, prompts, num_samples=1)
 
             # Attach demonstration-conditioned teacher prompt to each rollout.
-            # The teacher sees: question + worked demonstration → richer context
+            # The teacher sees: question + worked demonstration -> richer context
             # than the student, which sees only the question.
             for i, ex in enumerate(examples):
                 r = rollouts[i]  # single rollout per prompt (num_samples=1)

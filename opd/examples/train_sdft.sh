@@ -7,9 +7,9 @@ set -euo pipefail
 #   Learning", arXiv:2601.19897.
 #
 # SDFT distills, on-policy, from a DEMONSTRATION-CONDITIONED self-teacher:
-#   - student sees only the question x        → π_θ(y|x)
+#   - student sees only the question x        -> π_θ(y|x)
 #   - teacher is an EMA copy of the student, conditioned in-context on a worked
-#     demonstration c                          → π(y|x,c)
+#     demonstration c                          -> π(y|x,c)
 #   - loss is the reverse KL  D_KL(π_θ(·|x) ‖ π(·|x,c))
 #
 # Like SDPO there is only ONE checkpoint (teacher = EMA of student), so the

@@ -80,8 +80,8 @@ if __name__ == "__main__":
 
     # -------------------------------------------------------------------------
     # Distributed init — same rank split as OPD:
-    #   ranks 0..train_world_size-1  →  student (FSDP)
-    #   rank  train_world_size       →  teacher (plain nn.Module, same model)
+    #   ranks 0..train_world_size-1  ->  student (FSDP)
+    #   rank  train_world_size       ->  teacher (plain nn.Module, same model)
     ctx = init_distributed(cfg.device_type, cfg.train_world_size)
 
     print0(f"Model: {cfg.student_model}  (student = teacher, synced via {cfg.sync_method})")

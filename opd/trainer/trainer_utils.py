@@ -213,7 +213,7 @@ class Trainer:
             for name, dtype in extra_specs.items():
                 val, h = rb.bcast_or_alloc_async(
                     tensor=extra_tensors[name][idx] if ctx.is_student else None,
-                    transfer="student→all", shape=(batch_size,), dtype=dtype,
+                    transfer="student->all", shape=(batch_size,), dtype=dtype,
                 )
                 h.wait()
                 extra[name] = val

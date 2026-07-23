@@ -105,6 +105,15 @@ Hyperparameters for each training script live in `opd/examples/{opd,sdpo,opsd,sd
 | `opd/envs/dapo_dataset.py` | DAPO math dataset exporter |
 | `opd/eval/eval_math.py` | AIME 2024/2025 and HMMT 2025 evaluation (pass@k) |
 
+## Conventions
+
+- **Unpack tensor shapes into named variables — never index `.shape[N]`.** Write
+  `batch_size, seq_len = mb_ids.shape` (or `_, T, _ = student_logits.shape` when a
+  dim is unused), not `mb_ids.shape[0]` / `student_logits.shape[1]`. Naming the
+  dimension at the point of extraction makes tensor code self-documenting; one
+  extra line for readability is always worth it. Use `_` for genuinely unused
+  dims to keep linters quiet.
+
 ## Entry points for hacking
 
 - **New loss function**: add to `loss.py`, register in `ALGORITHMS`, add a choice to `--algorithm` in the training scripts.

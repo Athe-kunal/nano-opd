@@ -18,7 +18,7 @@ def compute_overlap_ratio(
 ) -> torch.Tensor:  # scalar
     """Fraction of student top-K tokens that also appear in the teacher's top-K."""
     in_intersection = _topk_intersection_mask(student_topk_idx, teacher_topk_idx)
-    top_k = student_topk_idx.shape[-1]
+    *_, top_k = student_topk_idx.shape
     overlap_per_position = torch.einsum("btk->bt", in_intersection.float()) / top_k  # [B, T]
     return overlap_per_position.mean()
 

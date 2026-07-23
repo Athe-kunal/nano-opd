@@ -16,9 +16,13 @@ The low-level broadcast primitives go one step further and wrap `ctx` in a
 `RankBroadcaster` instance, since those calls repeat `device`/`group` at
 nearly every line.
 
+Every transfer is a broadcast on `all_group`; call sites name their direction
+with a `Transfer` label (`student→teacher`, `teacher→student`, ...) so the data
+flow is readable without decoding `is_owner`/`src` pairs.
+
 Sections:
-  1. Low-level broadcast primitives (RankBroadcaster; includes minibatch
-     input broadcast, student -> all ranks)
+  1. Low-level broadcast primitives (RankBroadcaster; the Transfer direction
+     vocabulary and its resolver live here)
   2. Batch preparation (packing, padding, alignment)
   3. Teacher weight sync (SDPO / SDFT self-teacher)
   4. MOPD policy-gradient exchange
@@ -39,10 +43,13 @@ from opd.fsdp.algorithms import (
     teacher_topk_logprobs,
 )
 from opd.fsdp.model import StudentModel, TeacherModel
-from opd.loss import compute_tis_weights
 from opd.trainer.models import DistributedContext, MinibatchExchangeResult, MopdPGExchange, TopKExchange
 from opd.trainer.setup_utils import print0
 from opd.trainer.sync_teacher import TeacherSyncer
+
+# Direction label for a cross-rank transfer, read as `source→consumer`.
+# See `RankBroadcaster._owner_and_src` for how it maps to (is_owner, src).
+Transfer = Literal["student→teacher", "student→all", "teacher→student", "teacher→all"]
 
 # ---------------------------------------------------------------------------
 # 1. Low-level broadcast primitives
@@ -62,29 +69,41 @@ class RankBroadcaster:
     def __init__(self, ctx: DistributedContext) -> None:
         self.ctx = ctx
 
+    def _owner_and_src(self, transfer: Transfer) -> tuple[bool, int]:
+        """Resolve a transfer label to `(is_owner, src)` for `dist.broadcast`.
+
+        Every transfer here is a broadcast on `all_group`; the `→consumer`
+        suffix names the intended consumer only. The source (left of `→`)
+        selects the owning rank: student → rank 0, teacher →
+        `teacher_global_rank`.
+        """
+        source = transfer.split("→", 1)[0]
+        if source == "student":
+            return self.ctx.is_student, 0
+        return self.ctx.is_teacher, self.ctx.teacher_global_rank
+
     def bcast_or_alloc_async(
         self,
         *,
         tensor: torch.Tensor | None,
-        is_owner: bool,
+        transfer: Transfer,
         shape: tuple[int, ...],
         dtype: torch.dtype,
-        src: int,
     ) -> tuple[torch.Tensor, dist.Work]:
         """If not the owning rank, allocate a placeholder; issue the broadcast without waiting for it.
 
         Args:
             tensor: The tensor to broadcast, if this rank owns it; otherwise ignored.
-            is_owner: Whether this rank is `src` and holds the real data.
+            transfer: Direction label; resolves to the owning rank and `src`.
             shape: Shape to allocate the placeholder with, on non-owning ranks.
             dtype: Dtype to allocate the placeholder with, on non-owning ranks.
-            src: Source rank of the broadcast.
 
         Returns:
             `(tensor, handle)`. Call `handle.wait()` before reading `tensor`. Lets
             several independent broadcasts overlap on the wire instead of
             completing one at a time.
         """
+        is_owner, src = self._owner_and_src(transfer)
         if not is_owner:
             tensor = torch.empty(shape, dtype=dtype, device=self.ctx.device)
         handle = dist.broadcast(tensor, src=src, group=self.ctx.all_group, async_op=True)
@@ -94,8 +113,7 @@ class RankBroadcaster:
         self,
         *,
         specs: list[tuple[torch.Tensor | None, tuple[int, ...], torch.dtype]],
-        is_owner: bool,
-        src: int,
+        transfer: Transfer,
     ) -> list[torch.Tensor]:
         """Issues `bcast_or_alloc_async` for each `(tensor, shape, dtype)` in `specs`, then waits on all.
 
@@ -110,15 +128,14 @@ class RankBroadcaster:
             specs: `(tensor, shape, dtype)` triples, one per tensor to broadcast.
               `tensor` is only read on the owning rank; non-owning ranks use
               `shape`/`dtype` to allocate a placeholder.
-            is_owner: Whether this rank is `src` and holds the real data for
-              every tensor in `specs`.
-            src: Source rank of the broadcast.
+            transfer: Direction label shared by every tensor in `specs`;
+              resolves to the owning rank and `src`.
 
         Returns:
             The broadcast tensors, in the same order as `specs`.
         """
         pending = [
-            self.bcast_or_alloc_async(tensor=tensor, is_owner=is_owner, shape=shape, dtype=dtype, src=src)
+            self.bcast_or_alloc_async(tensor=tensor, transfer=transfer, shape=shape, dtype=dtype)
             for tensor, shape, dtype in specs
         ]
         tensors, handles = zip(*pending)
@@ -126,8 +143,8 @@ class RankBroadcaster:
             handle.wait()
         return list(tensors)
 
-    def broadcast_shape(self, local_shape: tuple[int, int] | None) -> tuple[int, int]:
-        """Broadcasts a 2D tensor's `(dim0, dim1)` shape from student rank 0 to all ranks.
+    def broadcast_shape(self, local_shape: tuple[int, int] | None, transfer: Transfer) -> tuple[int, int]:
+        """Broadcasts a 2D tensor's `(dim0, dim1)` shape ahead of its payload.
 
         Used by `broadcast_minibatch` and `broadcast_teacher_inputs`, which both
         need to tell non-owning ranks how large a placeholder to allocate before
@@ -135,13 +152,14 @@ class RankBroadcaster:
 
         Args:
             local_shape: This rank's local `(dim0, dim1)` shape (student ranks only).
+            transfer: Direction label, forwarded from the payload broadcast.
 
         Returns:
             The broadcast `(dim0, dim1)` shape.
         """
         shape_t = torch.tensor(local_shape, dtype=torch.long, device=self.ctx.device) if self.ctx.is_student else None
         shape_t, handle = self.bcast_or_alloc_async(
-            tensor=shape_t, is_owner=self.ctx.is_student, shape=(2,), dtype=torch.long, src=0,
+            tensor=shape_t, transfer=transfer, shape=(2,), dtype=torch.long,
         )
         handle.wait()
         return int(shape_t[0].item()), int(shape_t[1].item())
@@ -150,10 +168,15 @@ class RankBroadcaster:
         self, mb_ids: torch.Tensor | None, mb_attn: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Broadcasts input_ids and attention_mask from student rank 0 to all ranks."""
-        B, T = self.broadcast_shape((mb_ids.shape[0], mb_ids.shape[1]) if self.ctx.is_student else None)
+        if self.ctx.is_student:
+            batch_size, seq_len = mb_ids.shape
+            local_shape = (batch_size, seq_len)
+        else:
+            local_shape = None
+        B, T = self.broadcast_shape(local_shape, "student→all")
         mb_ids, mb_attn = self.bcast_or_alloc_many(
             specs=[(mb_ids, (B, T), torch.long), (mb_attn, (B, T), torch.long)],
-            is_owner=self.ctx.is_student, src=0,
+            transfer="student→all",
         )
         return mb_ids, mb_attn
 
@@ -168,14 +191,19 @@ class RankBroadcaster:
         Used when teacher and student have different inputs (e.g. SDFT, where the
         teacher prompt includes a worked demonstration).
         """
-        B, T_t = self.broadcast_shape((t_mb_ids.shape[0], t_mb_ids.shape[1]) if self.ctx.is_student else None)
+        if self.ctx.is_student:
+            batch_size, teacher_seq_len = t_mb_ids.shape
+            local_shape = (batch_size, teacher_seq_len)
+        else:
+            local_shape = None
+        B, T_t = self.broadcast_shape(local_shape, "student→teacher")
         t_mb_ids, t_mb_attn, t_mb_mask = self.bcast_or_alloc_many(
             specs=[
                 (t_mb_ids, (B, T_t), torch.long),
                 (t_mb_attn, (B, T_t), torch.long),
                 (t_mb_mask, (B, T_t), torch.float),
             ],
-            is_owner=self.ctx.is_student, src=0,
+            transfer="student→teacher",
         )
         return t_mb_ids, t_mb_attn, t_mb_mask
 
@@ -236,11 +264,12 @@ def align_to_rmax(
     Returns:
         `(t_resp, t_compact_mask)`, both with their second dimension equal to `R_max`.
     """
-    if t_resp.shape[1] < R_max:
-        pad = R_max - t_resp.shape[1]
-        t_resp = torch.cat([t_resp, t_resp.new_zeros(t_resp.shape[0], pad, t_resp.shape[-1])], dim=1)
-        t_compact_mask = torch.cat([t_compact_mask, t_compact_mask.new_zeros(t_compact_mask.shape[0], pad)], dim=1)
-    elif t_resp.shape[1] > R_max:
+    batch_size, teacher_len, feat_dim = t_resp.shape
+    if teacher_len < R_max:
+        pad = R_max - teacher_len
+        t_resp = torch.cat([t_resp, t_resp.new_zeros(batch_size, pad, feat_dim)], dim=1)
+        t_compact_mask = torch.cat([t_compact_mask, t_compact_mask.new_zeros(batch_size, pad)], dim=1)
+    elif teacher_len > R_max:
         t_resp, t_compact_mask = t_resp[:, :R_max], t_compact_mask[:, :R_max]
     return t_resp, t_compact_mask
 
@@ -328,9 +357,10 @@ def sync_student_to_teacher(
     if ctx.is_student:
         with FSDP.summon_full_params(student_fsdp_model, writeback=False, recurse=True):
             for s_param in student_fsdp_model.parameters():
-                # Rank 0 sends; other student ranks and teacher rank receive.
-                # writeback=False ensures the receive on non-zero student ranks
-                # does not corrupt the FSDP shards.
+                # student→teacher: rank 0 sends full student params; other
+                # student ranks and the teacher rank receive. writeback=False
+                # ensures the receive on non-zero student ranks does not corrupt
+                # the FSDP shards.
                 dist.broadcast(s_param.data, src=0, group=ctx.all_group)
 
     if ctx.is_teacher:
@@ -368,8 +398,7 @@ def fetch_teacher_sampled_logprob(
     else:
         t_logprob = None
     t_logprob, h = RankBroadcaster(ctx).bcast_or_alloc_async(
-        tensor=t_logprob, is_owner=ctx.is_teacher, shape=(B, T), dtype=torch.bfloat16,
-        src=ctx.teacher_global_rank,
+        tensor=t_logprob, transfer="teacher→student", shape=(B, T), dtype=torch.bfloat16,
     )
     h.wait()
     return t_logprob
@@ -428,7 +457,7 @@ def exchange_mopd_pg_packed(
             (t_logprob_resp, (B, R_max), torch.bfloat16),
             (t_compact_mask, (B, R_max), torch.float32),
         ],
-        is_owner=ctx.is_teacher, src=ctx.teacher_global_rank,
+        transfer="teacher→student",
     )
 
     return MopdPGExchange(
@@ -539,7 +568,7 @@ def fetch_teacher_topk(
     rb = RankBroadcaster(ctx)
     student_topk_idx = student_topk_indices(student_logits, top_k, student_chunk_size) if ctx.is_student else None
     student_topk_idx, h = rb.bcast_or_alloc_async(
-        tensor=student_topk_idx, is_owner=ctx.is_student, shape=(B, T, top_k), dtype=torch.long, src=0,
+        tensor=student_topk_idx, transfer="student→teacher", shape=(B, T, top_k), dtype=torch.long,
     )
     h.wait()
 
@@ -556,7 +585,7 @@ def fetch_teacher_topk(
             (t_logprobs_at_student, (B, T, top_k), torch.bfloat16),
             (t_compact_mask, (B, T), torch.float32),
         ],
-        is_owner=ctx.is_teacher, src=ctx.teacher_global_rank,
+        transfer="teacher→student",
     )
 
     if select_topk_by == "student":
@@ -664,6 +693,7 @@ def minibatch_exchange(
         A `MinibatchExchangeResult` with `pg` set (and `topk` `None`) when
         `is_pg` is True, or `topk` set (and `pg` `None`) otherwise.
     """
+    batch_size, _ = mb_ids.shape   # mb_ids is broadcast to every rank
     if ctx.is_student:
         student_logits = student.get_logits(mb_ids, mb_attn)[:, :-1]
         s_shift_mask = mb_mask[:, 1:]
@@ -676,7 +706,7 @@ def minibatch_exchange(
             R_max_local = int(torch.einsum("bt->b", s_shift_mask.long()).max().item())
         else:
             s_resp, s_compact_mask = pack_response_logits(student_logits, s_shift_mask)
-            R_max_local = s_resp.shape[1]
+            _, R_max_local, _ = s_resp.shape
     else:
         student_logits = s_shift_mask = s_resp = s_compact_mask = None
         R_max_local = 0
@@ -685,7 +715,7 @@ def minibatch_exchange(
     rb = RankBroadcaster(ctx)
     R_max_t, h = rb.bcast_or_alloc_async(
         tensor=torch.tensor([R_max_local], dtype=torch.long, device=ctx.device) if ctx.is_student else None,
-        is_owner=ctx.is_student, shape=(1,), dtype=torch.long, src=0,
+        transfer="student→teacher", shape=(1,), dtype=torch.long,
     )
     h.wait()
     R_max = int(R_max_t.item())
@@ -709,7 +739,7 @@ def minibatch_exchange(
             teacher_ids=t_mb_ids if ctx.is_teacher else None,
             s_shift_mask=s_shift_mask if ctx.is_student else None,
             t_shift_mask=t_shift_mask if ctx.is_teacher else None,
-            R_max=R_max, B=mb_ids.shape[0],
+            R_max=R_max, B=batch_size,
             teacher_chunk_size=teacher_chunk_size,
         )
         return MinibatchExchangeResult(
@@ -721,7 +751,7 @@ def minibatch_exchange(
     topk = fetch_teacher_topk(
         ctx=ctx, select_topk_by=select_topk_by,
         student_logits=s_resp, teacher_logits=t_resp, t_compact_mask=t_compact_mask,
-        B=mb_ids.shape[0], T=R_max, top_k=top_k,
+        B=batch_size, T=R_max, top_k=top_k,
         student_chunk_size=student_chunk_size, teacher_chunk_size=teacher_chunk_size,
     )
     return MinibatchExchangeResult(

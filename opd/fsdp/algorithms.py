@@ -38,7 +38,7 @@ def student_topk_indices(
     Returns:
         Top-K vocab indices, `[B, T, K]`.
     """
-    T = student_logits.shape[1]
+    _, T, _ = student_logits.shape
     chunk = _effective_chunk(T, chunk_size)
     parts = []
 
@@ -64,7 +64,7 @@ def teacher_logprobs_at_indices(
     Returns:
         Teacher log-probs at `topk_idx`, `[B, T, K]`.
     """
-    T = teacher_logits.shape[1]
+    _, T, _ = teacher_logits.shape
     chunk = _effective_chunk(T, chunk_size)
     parts = []
     with torch.no_grad():
@@ -91,7 +91,7 @@ def teacher_topk_logprobs(
     Returns:
         `(topk_idx, topk_logprobs)`, each `[B, T, K]`.
     """
-    T = teacher_logits.shape[1]
+    _, T, _ = teacher_logits.shape
     chunk = _effective_chunk(T, chunk_size)
     idx_parts, lp_parts = [], []
     with torch.no_grad():
@@ -144,7 +144,7 @@ def student_logprobs_at_indices(
     Returns:
         Student log-probs at `topk_idx`, `[B, T, K]`, differentiable.
     """
-    T = student_logits.shape[1]
+    _, T, _ = student_logits.shape
     chunk = _effective_chunk(T, chunk_size)
     parts = []
     for t0, t1 in _chunk_range(T, chunk):

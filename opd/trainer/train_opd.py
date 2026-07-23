@@ -220,7 +220,8 @@ if __name__ == "__main__":
             acc.add_health_metrics(ratio, adv, ent_gap)
 
     def do_minibatch(mb: MinibatchTensors, acc: StepAccumulator) -> None:
-        B, T = mb.mb_ids.shape[0], mb.mb_ids.shape[1] - 1
+        batch_size, seq_len = mb.mb_ids.shape
+        B, T = batch_size, seq_len - 1
         # last token logits are not required, hence indexed till -1
         student_logits = student.get_logits(mb.mb_ids, mb.mb_attn)[:, :-1] if ctx.is_student else None
         teacher_logits = teacher.get_logits(mb.mb_ids, mb.mb_attn)[:, :-1] if ctx.is_teacher else None

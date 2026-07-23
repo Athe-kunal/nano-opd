@@ -174,7 +174,10 @@ class Trainer:
         """
         ctx = self.ctx
         rb = RankBroadcaster(ctx)
-        num_sequences = batch["input_ids"].shape[0] if ctx.is_student else 0
+        if ctx.is_student:
+            num_sequences, _ = batch["input_ids"].shape
+        else:
+            num_sequences = 0
         n_mb, perm = broadcast_n_minibatches(
             ctx.is_student, num_sequences, self.args.train_batch_size, ctx.device, ctx.all_group,
         )
@@ -206,12 +209,13 @@ class Trainer:
                 )
 
             extra: dict[str, torch.Tensor] = {}
+            batch_size, _ = mb_ids.shape
             for name, dtype in extra_specs.items():
-                if ctx.is_student:
-                    val = extra_tensors[name][idx]
-                else:
-                    val = torch.zeros(mb_ids.shape[0], dtype=dtype, device=ctx.device)
-                dist.broadcast(val, src=0, group=ctx.all_group)
+                val, h = rb.bcast_or_alloc_async(
+                    tensor=extra_tensors[name][idx] if ctx.is_student else None,
+                    transfer="student→all", shape=(batch_size,), dtype=dtype,
+                )
+                h.wait()
                 extra[name] = val
 
             mb = MinibatchTensors(

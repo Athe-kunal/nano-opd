@@ -100,7 +100,8 @@ def apply_token_skip_mask(compact_mask: torch.Tensor, num_skip: int) -> torch.Te
     if num_skip <= 0:
         return compact_mask
     skip = torch.zeros_like(compact_mask)
-    if compact_mask.shape[1] > num_skip:
+    _, seq_len = compact_mask.shape
+    if seq_len > num_skip:
         skip[:, num_skip:] = 1.0
     return compact_mask * skip
 

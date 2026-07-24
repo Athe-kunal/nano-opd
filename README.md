@@ -2,6 +2,8 @@
 
 **nano-opd** is a hackable library for on-policy distillation: you can swap models, data, and training knobs without fighting a monolithic stack.
 
+This follows my YouTube [video](https://youtu.be/iiYUccK4nJU?si=_-b0qU_1IYCTsW4j) on the same topic.
+
 ## Algorithms
 
 | Algorithm | Teacher | Paper |

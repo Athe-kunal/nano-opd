@@ -1,0 +1,128 @@
+# Config for opd/trainer/train_dce.py — Dynamic Co-Evolution + SRCL (arXiv 2609.30652).
+# A single LLM acts as both student (sees problem only) and teacher (sees
+# problem + reference solution in the assistant turn). The teacher is re-synced
+# to the student every `teacher_sync_every_n` steps.
+#
+# Usage:
+#   python opd/trainer/train_dce.py opd/examples/dce.yaml
+#   python opd/trainer/train_dce.py opd/examples/dce.yaml lr=1e-5 num_steps=50
+#
+# `???` = must be overridden (here or via `key=value` CLI override).
+
+# -----------------------------------------------------------------------
+# Model — student and teacher start from the same checkpoint.
+# HuggingFace model ID or path. Used for both student and teacher.
+student_model: Qwen/Qwen3-1.7B
+# Number of student (FSDP) ranks. The teacher occupies rank
+# train_world_size in the torchrun world. Hardware-dependent; supplied by
+# the launcher script.
+train_world_size: 1
+
+# -----------------------------------------------------------------------
+# Dataset — HuggingFace dataset ID/split for OPSD training.
+dataset_id: siyanzhao/Openthoughts_math_30k_opsd
+dataset_split: train
+
+# -----------------------------------------------------------------------
+# Algorithm
+# Distillation loss. OPSD paper (Table 3) finds forward KL KL(p_T || p_S)
+# consistently outperforms reverse KL and JSD.
+algorithm: forward_kl
+# Top-K vocab for KL distillation. Larger K is more faithful but uses more
+# memory and bandwidth.
+distill_top_k: 100
+student_chunk_size: 128
+teacher_chunk_size: 128
+# TIS importance-weight clip C (0 disables). Corrects for log-prob gap
+# between vLLM inference and training forward pass.
+tis_clip: 0.0
+# Per-token pointwise KL clip tau (0 disables). Clips each token's
+# divergence contribution to prevent stylistic tokens from dominating the
+# gradient signal (OPSD paper Section 3.2 and Figure 4). Strongly
+# recommended — the paper shows this prevents performance collapse on
+# Qwen3-1.7B.
+kl_clip: 0.0
+# Teacher refresh: copy student -> teacher every N steps. 1 = fully dynamic
+# co-evolution (paper's best); larger N = periodic-snapshot ablation.
+teacher_sync_every_n: 1
+# Reference-solution tokens shown to the teacher (paper Table 24).
+max_reference_tokens: 512
+
+# -----------------------------------------------------------------------
+# SRCL — cross-entropy on verified, greedy, gold-free rewrites of own rollouts.
+srcl_enabled: true
+# Weight of the SRCL loss relative to the distillation loss (lambda_S / lambda_G).
+srcl_weight: 0.1
+
+# -----------------------------------------------------------------------
+# Generation
+max_new_tokens: 8192
+temperature: 1.1
+top_k: 20
+rollout_worker_url: http://${rollout_host}:${rollout_port}
+rollout_worker_world_size: 1
+
+# -----------------------------------------------------------------------
+# Training
+lr: 1e-5
+weight_decay: 0.0
+max_grad_norm: 1.0
+num_steps: 100  # OPSD paper converges within 100 gradient update steps.
+# Number of distinct (problem, solution) pairs per step. Each pair produces
+# exactly one on-policy rollout (num_samples=1).
+prompts_per_step: 8
+train_batch_size: 2  # Sequences per gradient-accumulation microbatch.
+# Optimizer step every N minibatches. null = one step per full rollout batch
+# (accumulate everything). Effective batch size = train_batch_size * grad_accum_steps.
+grad_accum_steps: 16
+epochs: 1  # Keep 1: SRCL grads only join the first epoch's optimizer step.
+max_prompt_len: 1024  # Hard cap on prompt tokens. Raises if exceeded.
+max_response_len: 8192  # Cap on response tokens. Truncates silently if exceeded.
+sharding_strategy: FULL_SHARD
+gradient_checkpointing: true
+# LR scheduler. 'constant' disables warmup/decay entirely.
+scheduler: cosine  # One of: cosine, linear, constant
+warmup_ratio: 0.05  # Fraction of total steps used for LR warmup.
+
+# -----------------------------------------------------------------------
+# Runtime
+device_type: ""
+run_name: dummy
+save_dir: dce_checkpoints
+save_every: 0
+seed: 0
+
+# -----------------------------------------------------------------------
+# GPU assignment. These are 0-based LOCAL indices into the launcher's
+# world GPU list (the CUDA_VISIBLE_DEVICES the launcher script was started
+# with) — not physical GPU IDs. E.g. with CUDA_VISIBLE_DEVICES=2,3,
+# rollout_gpus: "0" means physical GPU 2. If CUDA_VISIBLE_DEVICES wasn't
+# set, these are used as physical IDs directly.
+#   train_gpus must not overlap rollout_gpus or teacher_gpus (enforced by the launcher).
+#   rollout_gpus and teacher_gpus may be the same list to colocate vLLM + teacher.
+train_gpus: "1"        # student FSDP training ranks
+rollout_gpus: "0"      # vLLM rollout worker
+teacher_gpus: "0"      # teacher model rank (exactly one GPU)
+
+# -----------------------------------------------------------------------
+# Rollout worker (vLLM HTTP server the launcher script starts)
+rollout_host: 127.0.0.1
+rollout_port: 8047
+rollout_gpu_mem_util: 0.5  # vLLM GPU memory fraction
+weight_transfer_backend: nccl
+use_wandb: true
+
+# -----------------------------------------------------------------------
+# Post-training math evaluation (opd.eval.eval_math.run_eval), run once
+# after training finishes. Reuses the already-running, weight-synced
+# rollout worker — no separate vLLM engine or checkpoint loading needed.
+skip_eval: false
+run_eval: true
+posttrain_eval_datasets: aime_2025,aime_2024,hmmt_2025
+posttrain_eval_max_new_tokens: 38912
+posttrain_eval_temperature: 1.0
+posttrain_eval_top_k: -1
+posttrain_eval_val_n: 6  # samples per problem for pass@k
+posttrain_eval_wandb_project: ""
+posttrain_eval_wandb_run_name: ${run_name}
+posttrain_eval_step: ${num_steps}

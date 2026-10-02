@@ -16,7 +16,7 @@ trainer (FSDP, train_opd.py / train_sdpo.py / train_opsd.py / train_sdft.py)
 
 The trainer and rollout worker are separate processes communicating over HTTP. After each training step, the trainer pushes updated student weights into the vLLM worker via NCCL (no checkpoint files involved).
 
-## The four training scripts
+## The training scripts
 
 ### `train_opd.py` — On-Policy Distillation with a separate teacher
 
@@ -39,6 +39,10 @@ The paper (Table 3) finds forward KL — `KL(p_teacher || p_student)` — consis
 Another self-teacher setup: the teacher is an EMA copy of the student (like SDPO), but instead of environment feedback, the teacher is conditioned on the question plus a worked demonstration pulled from a dataset (science Q&A or tool-use). Default loss is reverse KL.
 
 The demonstration-conditioned teacher tends to produce preamble artifacts (e.g. "Based on the text...") that the student would otherwise learn to mimic even without ever seeing the demonstration itself. `--num-loss-tokens-to-skip` masks the first few response tokens from the loss to suppress this ("Learned Artifacts", paper Section 5).
+
+### `train_dce.py` — Dynamic Co-Evolution + SRCL (OPSD extension)
+
+OPSD with three changes (arXiv 2609.30652): the teacher is re-synced to the student every `teacher_sync_every_n` steps (`HardSyncSyncer`, 1 = fully dynamic); the reference solution is prefilled in the **assistant** turn rather than the user turn; and SRCL adds a cross-entropy loss (weight `srcl_weight`) on greedy, gold-free, verified rewrites of the student's own rollouts (`opd/trainer/srcl_utils.py`). SRCL grads accumulate into the first optimizer step, so keep `epochs: 1`.
 
 ## Loss functions (`opd/loss.py`)
 
@@ -83,7 +87,7 @@ All losses operate on top-K truncated distributions, `[B, T, K]` where K = `dist
 
 ## Config
 
-Hyperparameters for each training script live in `opd/examples/{opd,sdpo,opsd,sdft}.yaml` (OmegaConf), not argparse. Edit the YAML directly to change a run; `opd/examples/train_*.sh` are thin launcher scripts that read the YAML and handle process orchestration (vLLM worker startup, GPU placement). See each YAML's header comment for CLI override syntax.
+Hyperparameters for each training script live in `opd/examples/{opd,sdpo,opsd,sdft,dce}.yaml` (OmegaConf), not argparse. Edit the YAML directly to change a run; `opd/examples/train_*.sh` are thin launcher scripts that read the YAML and handle process orchestration (vLLM worker startup, GPU placement). See each YAML's header comment for CLI override syntax.
 
 ## Files at a glance
 
@@ -94,6 +98,8 @@ Hyperparameters for each training script live in `opd/examples/{opd,sdpo,opsd,sd
 | `opd/trainer/train_sdpo.py` | SDPO training loop (EMA self-teacher, feedback conditioned) |
 | `opd/trainer/train_opsd.py` | OPSD training loop (frozen initial-policy teacher, reference-solution conditioned) |
 | `opd/trainer/train_sdft.py` | SDFT training loop (EMA self-teacher, demonstration conditioned) |
+| `opd/trainer/train_dce.py` | DCE+SRCL training loop (per-step synced teacher, assistant-side gold, SRCL loss) |
+| `opd/trainer/srcl_utils.py` | SRCL rewrite generation/filtering and cross-entropy backward |
 | `opd/trainer/setup_utils.py` | Distributed init, device/seed setup, model construction, vLLM weight-transfer setup, `load_config` |
 | `opd/trainer/distillation_utils.py` | Shared minibatch-exchange helpers (top-K exchange, PG exchange, response packing, broadcast utilities) |
 | `opd/trainer/sync_teacher.py` | Self-teacher sync strategies (EMA, trust-region, hard-sync, on-policy) |

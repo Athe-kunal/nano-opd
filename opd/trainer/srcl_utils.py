@@ -26,7 +26,7 @@ _REWRITE_TEMPLATE = (
     "mention the source rollout or omitted text. Do not add analysis about rewriting. "
     "End with exactly one final \\boxed{{...}} answer. Output only the clean solution."
 )
-_REFLECTION_RE = re.compile(r"wait|actually|reconsider|correction|double-check|start over", re.I)
+_REFLECTION_RE = re.compile(r"\b(wait|actually|reconsider|correction|double-check|start over)\b", re.I)
 _MIN_REWRITE_TOKENS = 32
 
 
@@ -58,6 +58,8 @@ def refine_rollouts(
             [{"role": "user", "content": _REWRITE_TEMPLATE.format(
                 rollout=r["response"], problem=ex.problem)}],
             tokenize=False, add_generation_prompt=True,
+            # Non-thinking mode, so the rewrite is a clean solution rather than a <think> trace.
+            enable_thinking=False,
         )
         for ex, r in zip(examples, rollouts)
     ]
